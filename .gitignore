@@ -4,5 +4,4 @@ target/
 registration.yaml
 certificate.yaml
 *.env
-# MuleSoft-internal contributor guidelines; not for redistribution
-blog/MuleSoftBlogGuidelines_*.docx
+blog/

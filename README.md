@@ -58,7 +58,6 @@ mcp-a2a-bridge-policy-flex/         Policy implementation (Rust/WASM): src/, uni
 mcp-schema/                         MCP tool metadata, for registering the proxy as an MCP asset in Exchange
 postman/                            Postman collection for MCP calls with context_id/task_id follow-ups
 docs/                               Customer guide (Markdown, Word, PDF)
-blog/                               Blog draft and diagrams
 ```
 
 ## Build and test
