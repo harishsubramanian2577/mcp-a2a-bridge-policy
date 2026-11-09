@@ -1,0 +1,4 @@
+# proxy-wasm host functions (e.g. proxy_call_foreign_function) are resolved by the gateway at
+# load time; recent Rust toolchains no longer pass --allow-undefined to wasm-ld by default.
+[target.wasm32-wasip1]
+rustflags = ["-C", "link-arg=--allow-undefined"]

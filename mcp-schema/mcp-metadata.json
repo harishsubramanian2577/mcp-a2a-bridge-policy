@@ -1,0 +1,30 @@
+{
+  "transport": {
+    "kind": "streamableHttp",
+    "path": "/mcp"
+  },
+  "tools": [
+    {
+      "name": "ask_agent",
+      "description": "Sends a natural-language message to the backing A2A agent and returns its answer. To continue a multi-turn conversation, pass back the context_id (and task_id when the agent asked for more input) returned by the previous call.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "The request, or the reply to the agent's question, in natural language."
+          },
+          "context_id": {
+            "type": "string",
+            "description": "context_id returned by a previous call. Pass it to continue that conversation; omit it to start a new one."
+          },
+          "task_id": {
+            "type": "string",
+            "description": "task_id returned by a previous call whose state was input-required or auth-required. Pass it with context_id to answer the agent's follow-up question."
+          }
+        },
+        "required": ["message"]
+      }
+    }
+  ]
+}

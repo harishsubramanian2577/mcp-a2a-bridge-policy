@@ -1,0 +1,71 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: MCP A2A Bridge Policy
+    description: Exposes an A2A agent as an MCP tool. Answers the MCP handshake locally, transcodes tools/call to A2A SendMessage and the A2A task result back to an MCP tool result.
+    category: Transformation
+    metadata/interfaceScope: api
+    metadata/capabilities/assetTypes: mcp,a2a,a2a_v1
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    toolName:
+      type: string
+      default: ask_agent
+      description: Name of the single MCP tool that fronts the A2A agent. Must match ^[a-zA-Z0-9_-]{1,64}$.
+    toolDescription:
+      type: string
+      default: Sends a natural-language message to the backing A2A agent and returns its answer. To continue a multi-turn conversation, pass back the context_id (and task_id when the agent asked for more input) returned by the previous call.
+      description: Description advertised for the tool in tools/list. This is what the client LLM reads to decide when to call the tool.
+    serverName:
+      type: string
+      default: mcp-a2a-bridge
+      description: serverInfo.name returned in the MCP initialize response.
+    serverInstructions:
+      type: string
+      default: ""
+      description: Optional instructions returned in the MCP initialize response. Leave empty to omit.
+    a2aProtocolVersion:
+      type: string
+      enum:
+        - "1.0"
+        - "0.3"
+      default: "1.0"
+      description: A2A wire version spoken by the upstream agent. 1.0 sends SendMessage with ROLE_USER parts and the A2A-Version header. 0.3 sends message/send with kind-tagged parts.
+    passThroughA2A:
+      type: boolean
+      default: false
+      description: Keep false when this policy runs on a dedicated MCP proxy (recommended); only MCP traffic is accepted and everything else is rejected. Set true only when MCP and A2A clients share one API instance, in which case native A2A traffic (A2A JSON-RPC methods, agent card GETs, non-JSON requests) is forwarded untouched.
+    a2aPath:
+      type: string
+      default: ""
+      description: Optional path, relative to this API instance's upstream URL, that transcoded calls are sent to (for example /a2a/my-agent, or / for the upstream URL itself). The request path is rewritten to the API base path plus this value, so the gateway forwards to upstream URL + a2aPath regardless of the path the MCP client used; the query string is kept. With passThroughA2A enabled, forwarded A2A JSON-RPC calls are rewritten too. Leave empty to forward the client path unchanged.
+    includeStructuredContent:
+      type: boolean
+      default: true
+      description: When true, tools/call results carry a structuredContent object (state, contextId, taskId, data parts) in addition to the text content.
+    sessionStoreMode:
+      type: string
+      enum:
+        - disabled
+        - local
+        - remote
+      default: disabled
+      description: Optional server-side map from MCP session to A2A contextId/taskId, used only when the client omits context_id. local is per-replica in-memory; remote requires Flex Gateway Shared Storage (Redis) and will fail policy startup if it is not configured.
+    sessionTtlSeconds:
+      type: integer
+      default: 1800
+      minimum: 60
+      maximum: 86400
+      description: Idle time after which a stored session-to-context mapping expires.
+    sessionKeyHeader:
+      type: string
+      default: ""
+      description: Optional request header (for example client_id or authorization) whose value is hashed into the session key, binding a stored conversation to the caller identity as well as the Mcp-Session-Id.
+  required:
+    - toolName
+    - a2aProtocolVersion

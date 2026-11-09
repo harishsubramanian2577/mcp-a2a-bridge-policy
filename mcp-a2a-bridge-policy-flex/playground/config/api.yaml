@@ -1,0 +1,26 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: ApiInstance
+metadata:
+  name: ingress-http
+spec:
+  # MCP clients connect to http://localhost:8081/agents-mcp
+  address: http://0.0.0.0:8081/agents-mcp
+  services:
+    upstream:
+      # Replace with the Agent Broker's internal ingress URL (an A2A JSON-RPC endpoint).
+      address: http://backend
+      routes:
+        - config:
+            destinationPath: /
+  policies:
+    - policyRef:
+        name: mcp-a2a-bridge-policy-flex-v1-0 # This value will be overriden during 'make run' execution
+      config:
+        toolName: ask_agent
+        a2aProtocolVersion: "1.0"
+        passThroughA2A: false
+        a2aPath: ""
+        includeStructuredContent: true
+        sessionStoreMode: disabled

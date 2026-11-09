@@ -1,0 +1,58 @@
+{
+  "result": {
+    "task": {
+      "id": "94da0605-5da3-4eaf-8aae-a34cea57ddb6",
+      "contextId": "59ec80cd-988c-47fd-8917-1f84dd3bd409",
+      "status": {
+        "state": "TASK_STATE_COMPLETED",
+        "message": {
+          "messageId": "52f54fb8-763a-4148-b4f1-418094d50caf",
+          "role": "ROLE_AGENT",
+          "parts": [
+            {
+              "data": {
+                "lastModifiedBy": "Doe, Jane",
+                "labels": [],
+                "id": "100200300",
+                "ancestors": [
+                  {
+                    "id": "100200100",
+                    "title": "Operations"
+                  },
+                  {
+                    "id": "100200200",
+                    "title": "Workflow Guides"
+                  }
+                ],
+                "lastModified": "2024-07-17T22:28:00.000-07:00",
+                "spaceName": "Sample Space",
+                "content": "Process Overview. Step 1: Create a request in the intake tool. Step 2: Assign an owner. Step 3: Schedule an informational meeting within 10 business days.",
+                "type": "page",
+                "spaceKey": "SAMPLE",
+                "url": "https://wiki.example.com/spaces/SAMPLE/pages/100200300/SOP+2.2+Sample+Intake+Guide",
+                "title": "SOP 2.2: Sample Intake Guide",
+                "version": 10.0
+              }
+            }
+          ]
+        },
+        "timestamp": "2026-11-05T19:57:43.441160Z"
+      },
+      "history": [
+        {
+          "messageId": "19f04ec3-cc73-48f3-b7f0-14327ca269ce",
+          "contextId": "59ec80cd-988c-47fd-8917-1f84dd3bd409",
+          "taskId": "94da0605-5da3-4eaf-8aae-a34cea57ddb6",
+          "role": "ROLE_USER",
+          "parts": [
+            {
+              "text": "Get me details of the wiki page with id 100200300"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "id": "broker-1",
+  "jsonrpc": "2.0"
+}

@@ -1,0 +1,16 @@
+{
+    "jsonrpc": "2.0",
+    "id": "broker-1",
+    "method": "SendMessage",
+    "params": {
+        "message": {
+            "messageId": "19f04ec3-cc73-48f3-b7f0-14327ca269ce",
+            "role": "ROLE_USER",
+            "parts": [
+                {
+                    "text": "Get me details of the wiki page with id 100200300"
+                }
+            ]
+        }
+    }
+}

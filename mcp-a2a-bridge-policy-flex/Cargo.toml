@@ -1,0 +1,31 @@
+[package]
+name = "mcp_a2a_bridge_policy"
+version = "1.0.3"
+rust-version = "1.88.0"
+edition = "2021"
+description = "Exposes an A2A agent as an MCP tool by transcoding MCP tools/call to A2A SendMessage and back."
+
+[package.metadata.anypoint]
+group_id = "<your-business-group-id>"
+definition_asset_id = { name = "mcp-a2a-bridge-policy", version = "1.0.3" }
+implementation_asset_id = "mcp-a2a-bridge-policy-flex"
+
+[dependencies]
+pdk = { version = "1.8.0" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+lto = true
+opt-level = 'z'
+strip = "debuginfo"
+
+[dev-dependencies]
+pdk-unit = { version = "=1.8.0" }
+pdk-test = { version = "=1.8.0" }
+httpmock = "0.6"
+reqwest = { version = "0.11", features = ["json"] }

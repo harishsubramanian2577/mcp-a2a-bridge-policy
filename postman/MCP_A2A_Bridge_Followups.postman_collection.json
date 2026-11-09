@@ -1,0 +1,719 @@
+{
+  "info": {
+    "name": "MCP A2A Bridge - contextId / taskId follow-ups",
+    "description": "Exercises multi-turn conversations through the MCP proxy that fronts your Agent Broker.\n\nEvery tools/call response carries result.structuredContent.{state, contextId, taskId}. The test script of each request stores them in the collection variables contextId / taskId / state, and the follow-up requests send them back as the ask_agent arguments context_id / task_id.\n\nRules:\n- state = input-required: the broker asked a question. Reply with BOTH context_id and task_id; the broker remembers the question.\n- state = completed: follow up with context_id only. This broker starts each new task without the earlier turns, so name the subject explicitly.\n- Unrelated question: send neither (the first request of each folder clears them).\n\nRun the folders top to bottom, one request at a time (the broker kit advises against parallel calls). Multi-system prompts take 25-50 s.\nOpen the Postman Console to see the agent's answer and the captured IDs.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "mcpUrl",
+      "value": "https://<gateway-host>/<mcp-base-path>/"
+    },
+    {
+      "key": "contextId",
+      "value": ""
+    },
+    {
+      "key": "taskId",
+      "value": ""
+    },
+    {
+      "key": "state",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "0. Handshake (answered by the policy)",
+      "item": [
+        {
+          "name": "0.1 initialize",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('serverInfo returned', () => pm.expect(pm.response.json().result.serverInfo.name).to.be.a('string'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "description": "Answered locally by the bridge policy, no broker call.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"1\",\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2025-06-18\",\n    \"capabilities\": {},\n    \"clientInfo\": {\n      \"name\": \"postman\",\n      \"version\": \"1\"\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{mcpUrl}}",
+              "host": [
+                "{{mcpUrl}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "0.2 tools/list",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('ask_agent listed', () => pm.expect(pm.response.json().result.tools[0].name).to.eql('ask_agent'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "description": "Shows the ask_agent tool and its message / context_id / task_id arguments.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"2\",\n  \"method\": \"tools/list\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{mcpUrl}}",
+              "host": [
+                "{{mcpUrl}}"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "A. Broker asks a question -> reply with context_id + task_id",
+      "item": [
+        {
+          "name": "A.1 Who reports to Sarah Johnson?",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('contextId',''); pm.collectionVariables.set('taskId','');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('HTTP 200 + JSON-RPC result', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body).to.have.property('result');",
+                  "});",
+                  "const r = body.result || {};",
+                  "const sc = r.structuredContent || {};",
+                  "pm.test('tool did not fail', () => pm.expect(r.isError).to.eql(false));",
+                  "if (sc.contextId) pm.collectionVariables.set('contextId', sc.contextId);",
+                  "pm.collectionVariables.set('taskId', sc.taskId || '');",
+                  "pm.collectionVariables.set('state', sc.state || '');",
+                  "console.log('state=' + sc.state + ' contextId=' + sc.contextId + ' taskId=' + sc.taskId);",
+                  "console.log((r.content || []).map(c => c.text).join('\\n\\n'));",
+                  "",
+                  "pm.test('state is one of ['input-required', 'completed']', () => pm.expect([\"input-required\", \"completed\"]).to.include(sc.state));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "description": "Name-based prompts usually come back as input-required: the broker asks which Sarah Johnson. Expect state=input-required (sometimes completed).",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"1\",\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"ask_agent\",\n    \"arguments\": {\n      \"message\": \"Who reports to Sarah Johnson?\"\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{mcpUrl}}",
+              "host": [
+                "{{mcpUrl}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "A.2 Answer the question (context_id + task_id)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.collectionVariables.get('state') !== 'input-required') {",
+                  "  console.warn('Previous step did not return input-required (state=' + pm.collectionVariables.get('state') + '). The broker answered directly, so this step is not needed; it will still run as a context_id follow-up.');",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('HTTP 200 + JSON-RPC result', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body).to.have.property('result');",
+                  "});",
+                  "const r = body.result || {};",
+                  "const sc = r.structuredContent || {};",
+                  "pm.test('tool did not fail', () => pm.expect(r.isError).to.eql(false));",
+                  "if (sc.contextId) pm.collectionVariables.set('contextId', sc.contextId);",
+                  "pm.collectionVariables.set('taskId', sc.taskId || '');",
+                  "pm.collectionVariables.set('state', sc.state || '');",
+                  "console.log('state=' + sc.state + ' contextId=' + sc.contextId + ' taskId=' + sc.taskId);",
+                  "console.log((r.content || []).map(c => c.text).join('\\n\\n'));",
+                  "",
+                  "pm.test('state is one of ['completed']', () => pm.expect([\"completed\"]).to.include(sc.state));",
+                  "",
+                  "pm.test('expected reports', () => { const t = JSON.stringify(r.content); ['David Jones','John Smith'].forEach(n => pm.expect(t).to.include(n)); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "description": "Continues the SAME task. Expected: completed - David Jones, John Smith, Thomas Taylor, William Hernandez. contextId and taskId stay the same as A.1.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"1\",\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"ask_agent\",\n    \"arguments\": {\n      \"message\": \"Sarah Johnson in IT EIA Integration Services (848066). Please list her direct reports.\",\n      \"context_id\": \"{{contextId}}\",\n      \"task_id\": \"{{taskId}}\"\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{mcpUrl}}",
+              "host": [
+                "{{mcpUrl}}"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "B. Completed answer -> follow up with context_id only",
+      "item": [
+        {
+          "name": "B.1 Who heads Human Resources, and where is their office?",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('contextId',''); pm.collectionVariables.set('taskId','');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('HTTP 200 + JSON-RPC result', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body).to.have.property('result');",
+                  "});",
+                  "const r = body.result || {};",
+                  "const sc = r.structuredContent || {};",
+                  "pm.test('tool did not fail', () => pm.expect(r.isError).to.eql(false));",
+                  "if (sc.contextId) pm.collectionVariables.set('contextId', sc.contextId);",
+                  "pm.collectionVariables.set('taskId', sc.taskId || '');",
+                  "pm.collectionVariables.set('state', sc.state || '');",
+                  "console.log('state=' + sc.state + ' contextId=' + sc.contextId + ' taskId=' + sc.taskId);",
+                  "console.log((r.content || []).map(c => c.text).join('\\n\\n'));",
+                  "",
+                  "pm.test('state is one of ['completed']', () => pm.expect([\"completed\"]).to.include(sc.state));",
+                  "",
+                  "pm.test('Thomas Taylor', () => pm.expect(JSON.stringify(r.content)).to.include('Thomas Taylor'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "description": "Three-system prompt (~40 s). Expected: Thomas Taylor, Surgery Pavilion B (2417), Floor 08, Room 171.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"1\",\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"ask_agent\",\n    \"arguments\": {\n      \"message\": \"Who heads Human Resources, and where is their office?\"\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{mcpUrl}}",
+              "host": [
+                "{{mcpUrl}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "B.2 Follow-up in the same conversation (context_id only)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('HTTP 200 + JSON-RPC result', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body).to.have.property('result');",
+                  "});",
+                  "const r = body.result || {};",
+                  "const sc = r.structuredContent || {};",
+                  "pm.test('tool did not fail', () => pm.expect(r.isError).to.eql(false));",
+                  "if (sc.contextId) pm.collectionVariables.set('contextId', sc.contextId);",
+                  "pm.collectionVariables.set('taskId', sc.taskId || '');",
+                  "pm.collectionVariables.set('state', sc.state || '');",
+                  "console.log('state=' + sc.state + ' contextId=' + sc.contextId + ' taskId=' + sc.taskId);",
+                  "console.log((r.content || []).map(c => c.text).join('\\n\\n'));",
+                  "",
+                  "pm.test('state is one of ['completed']', () => pm.expect([\"completed\"]).to.include(sc.state));",
+                  "",
+                  "pm.test('email', () => pm.expect(JSON.stringify(r.content)).to.include('thomas.taylor17@acme-org.edu'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "description": "New task in the same conversation: contextId stays the same, taskId changes. Names the person explicitly. Expected: thomas.taylor17@acme-org.edu.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"1\",\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"ask_agent\",\n    \"arguments\": {\n      \"message\": \"What is Thomas Taylor's email address?\",\n      \"context_id\": \"{{contextId}}\"\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{mcpUrl}}",
+              "host": [
+                "{{mcpUrl}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "B.3 Another follow-up (context_id only)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('HTTP 200 + JSON-RPC result', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body).to.have.property('result');",
+                  "});",
+                  "const r = body.result || {};",
+                  "const sc = r.structuredContent || {};",
+                  "pm.test('tool did not fail', () => pm.expect(r.isError).to.eql(false));",
+                  "if (sc.contextId) pm.collectionVariables.set('contextId', sc.contextId);",
+                  "pm.collectionVariables.set('taskId', sc.taskId || '');",
+                  "pm.collectionVariables.set('state', sc.state || '');",
+                  "console.log('state=' + sc.state + ' contextId=' + sc.contextId + ' taskId=' + sc.taskId);",
+                  "console.log((r.content || []).map(c => c.text).join('\\n\\n'));",
+                  "",
+                  "pm.test('state is one of ['completed']', () => pm.expect([\"completed\"]).to.include(sc.state));",
+                  "",
+                  "pm.test('address', () => pm.expect(JSON.stringify(r.content)).to.include('1170 Main Street'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "description": "Expected: Surgery Pavilion B, 1170 Main Street, Suite 17, San Jose, CA 94017.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"1\",\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"ask_agent\",\n    \"arguments\": {\n      \"message\": \"What is the address of building 2417?\",\n      \"context_id\": \"{{contextId}}\"\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{mcpUrl}}",
+              "host": [
+                "{{mcpUrl}}"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "C. Vague follow-up -> broker asks -> answer with task_id",
+      "item": [
+        {
+          "name": "C.1 What's the address of building 2414?",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('contextId',''); pm.collectionVariables.set('taskId','');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('HTTP 200 + JSON-RPC result', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body).to.have.property('result');",
+                  "});",
+                  "const r = body.result || {};",
+                  "const sc = r.structuredContent || {};",
+                  "pm.test('tool did not fail', () => pm.expect(r.isError).to.eql(false));",
+                  "if (sc.contextId) pm.collectionVariables.set('contextId', sc.contextId);",
+                  "pm.collectionVariables.set('taskId', sc.taskId || '');",
+                  "pm.collectionVariables.set('state', sc.state || '');",
+                  "console.log('state=' + sc.state + ' contextId=' + sc.contextId + ' taskId=' + sc.taskId);",
+                  "console.log((r.content || []).map(c => c.text).join('\\n\\n'));",
+                  "",
+                  "pm.test('state is one of ['completed']', () => pm.expect([\"completed\"]).to.include(sc.state));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "description": "Expected: Admin Building B, 1140 Main Street, Suite 14, Palo Alto, CA 94014.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"1\",\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"ask_agent\",\n    \"arguments\": {\n      \"message\": \"What's the address of building 2414?\"\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{mcpUrl}}",
+              "host": [
+                "{{mcpUrl}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "C.2 Vague follow-up (context_id only)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('HTTP 200 + JSON-RPC result', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body).to.have.property('result');",
+                  "});",
+                  "const r = body.result || {};",
+                  "const sc = r.structuredContent || {};",
+                  "pm.test('tool did not fail', () => pm.expect(r.isError).to.eql(false));",
+                  "if (sc.contextId) pm.collectionVariables.set('contextId', sc.contextId);",
+                  "pm.collectionVariables.set('taskId', sc.taskId || '');",
+                  "pm.collectionVariables.set('state', sc.state || '');",
+                  "console.log('state=' + sc.state + ' contextId=' + sc.contextId + ' taskId=' + sc.taskId);",
+                  "console.log((r.content || []).map(c => c.text).join('\\n\\n'));",
+                  "",
+                  "pm.test('state is one of ['input-required', 'completed']', () => pm.expect([\"input-required\", \"completed\"]).to.include(sc.state));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "description": "'that building' is not resolved: this broker starts each task without earlier turns, so it usually replies input-required asking which building.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"1\",\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"ask_agent\",\n    \"arguments\": {\n      \"message\": \"Who sits in that building?\",\n      \"context_id\": \"{{contextId}}\"\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{mcpUrl}}",
+              "host": [
+                "{{mcpUrl}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "C.3 Answer the broker's question (context_id + task_id)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.collectionVariables.get('state') !== 'input-required') {",
+                  "  console.warn('Previous step did not return input-required (state=' + pm.collectionVariables.get('state') + '). The broker answered directly, so this step is not needed; it will still run as a context_id follow-up.');",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('HTTP 200 + JSON-RPC result', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body).to.have.property('result');",
+                  "});",
+                  "const r = body.result || {};",
+                  "const sc = r.structuredContent || {};",
+                  "pm.test('tool did not fail', () => pm.expect(r.isError).to.eql(false));",
+                  "if (sc.contextId) pm.collectionVariables.set('contextId', sc.contextId);",
+                  "pm.collectionVariables.set('taskId', sc.taskId || '');",
+                  "pm.collectionVariables.set('state', sc.state || '');",
+                  "console.log('state=' + sc.state + ' contextId=' + sc.contextId + ' taskId=' + sc.taskId);",
+                  "console.log((r.content || []).map(c => c.text).join('\\n\\n'));",
+                  "",
+                  "pm.test('state is one of ['completed', 'input-required']', () => pm.expect([\"completed\", \"input-required\"]).to.include(sc.state));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "description": "Same task as C.2, so the broker combines this with 'who sits in...'. Expected: Barbara Wilson, Floor 05, Office 141.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"1\",\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"ask_agent\",\n    \"arguments\": {\n      \"message\": \"Building 2414.\",\n      \"context_id\": \"{{contextId}}\",\n      \"task_id\": \"{{taskId}}\"\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{mcpUrl}}",
+              "host": [
+                "{{mcpUrl}}"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "D. Fresh conversation (no IDs)",
+      "item": [
+        {
+          "name": "D.1 Which buildings does Finance & Accounting occupy?",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('contextId',''); pm.collectionVariables.set('taskId','');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('HTTP 200 + JSON-RPC result', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body).to.have.property('result');",
+                  "});",
+                  "const r = body.result || {};",
+                  "const sc = r.structuredContent || {};",
+                  "pm.test('tool did not fail', () => pm.expect(r.isError).to.eql(false));",
+                  "if (sc.contextId) pm.collectionVariables.set('contextId', sc.contextId);",
+                  "pm.collectionVariables.set('taskId', sc.taskId || '');",
+                  "pm.collectionVariables.set('state', sc.state || '');",
+                  "console.log('state=' + sc.state + ' contextId=' + sc.contextId + ' taskId=' + sc.taskId);",
+                  "console.log((r.content || []).map(c => c.text).join('\\n\\n'));",
+                  "",
+                  "pm.test('state is one of ['completed']', () => pm.expect([\"completed\"]).to.include(sc.state));",
+                  "",
+                  "pm.test('three buildings', () => { const t = JSON.stringify(r.content); ['2418','2419','2420'].forEach(b => pm.expect(t).to.include(b)); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "description": "No context_id: a new conversation, so the response has a new contextId. Expected: 2418, 2419, 2420.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"1\",\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"ask_agent\",\n    \"arguments\": {\n      \"message\": \"Which buildings does Finance & Accounting occupy?\"\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{mcpUrl}}",
+              "host": [
+                "{{mcpUrl}}"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
