@@ -4,7 +4,7 @@ A custom Omni Gateway (Flex Gateway) policy that lets MCP clients use an A2A age
 
 | | |
 |---|---|
-| Exchange asset | `mcp-a2a-bridge-policy` (definition), `mcp-a2a-bridge-policy-flex` (implementation) |
+| Exchange asset | `mcp-a2a-bridge-policy` (definition), `mcp-atoa-bridge-policy-flex` (implementation) |
 | Current version | 1.0.3 |
 | Category | Transformation |
 | Applies to API instance types | MCP, A2A (v0.3), A2A (v1.0) |
@@ -156,43 +156,38 @@ The API Manager form shows this field on a single line, so write the rules inlin
 
 ## 7. Publishing the policy to Anypoint Exchange
 
-The policy has two parts, each with its own folder. **Publish the definition first, then the implementation.**
+The project uses the PDK single-project layout. The definition (`definition/gcl.yaml`) and the implementation (`src/`) live in one project, and one command publishes both.
 
 ```
 mcp-a2a-bridge-policy/
-├── mcp-a2a-bridge-policy-definition/   # configuration schema: exchange.json, gcl.yaml
-└── mcp-a2a-bridge-policy-flex/         # implementation: Cargo.toml
+├── .project.yaml       # PDK project descriptor
+├── Makefile
+├── Cargo.toml          # crate and Exchange coordinates
+├── definition/gcl.yaml # configuration schema
+└── src/                # implementation
 ```
 
 ### 7.1 Prerequisites
-- **Anypoint CLI v4** with the PDK plugin (`anypoint-cli-v4 plugins:install anypoint-pdk-plugin`), plus the Rust toolchain. For first-time setup, run `make setup` in the implementation folder.
+- **Anypoint CLI v4** with the PDK plugin (`anypoint-cli-v4 plugins:install anypoint-pdk-plugin`), plus the Rust toolchain. For first-time setup, run `make setup`.
 - **A connected app** (client credentials) with the **Exchange Contributor** permission in the target business group.
 
 ### 7.2 Set the target business group and version
 
-**`mcp-a2a-bridge-policy-definition/exchange.json`**
-```json
-{
-  "groupId": "<business-group-id>",
-  "assetId": "mcp-a2a-bridge-policy",
-  "version": "<x.y.z>"
-}
-```
-
-**`mcp-a2a-bridge-policy-flex/Cargo.toml`**
+**`Cargo.toml`**
 ```toml
 [package]
 name = "mcp_a2a_bridge_policy"
-version = "<x.y.z>"                       # same version as exchange.json
+version = "<x.y.z>"
 
 [package.metadata.anypoint]
-group_id = "<business-group-id>"          # same as groupId in exchange.json
-definition_asset_id = { name = "mcp-a2a-bridge-policy", version = "<x.y.z>" }
-implementation_asset_id = "mcp-a2a-bridge-policy-flex"
+group_id = "<business-group-id>"
+definition_asset_id = "mcp-a2a-bridge-policy"
+implementation_asset_id = "mcp-atoa-bridge-policy-flex"
 ```
 
-- **Versions must match.** Use the same `<x.y.z>` in all three places.
+- **One version for both assets.** The definition and the implementation are published with the `version` in `Cargo.toml`.
 - **Released versions are permanent.** Exchange won't overwrite a released version, so bump the version for every change.
+- **Implementation asset ID.** It must not contain digits next to letters. PDK kebab-cases the ID, so `a2a` becomes `a-2-a` and the ID is rejected.
 
 ### 7.3 Credentials (environment variables)
 ```bash
@@ -203,17 +198,13 @@ export ANYPOINT_ORG=<business-group-id>
 
 ### 7.4 Publish
 
-| Command | Folder | Result |
-|---|---|---|
-| `make release` | `mcp-a2a-bridge-policy-definition` | Publishes the definition as version `<x.y.z>` |
-| `make release` | `mcp-a2a-bridge-policy-flex` | Builds the policy and publishes the implementation as version `<x.y.z>` |
-| `make publish` | either folder | Publishes a **development** version (`<x.y.z>-DEV`) for testing. When publishing the implementation this way, set `definition_asset_id` version to `<x.y.z>-DEV`. |
+| Command | Result |
+|---|---|
+| `make release` | Builds the policy and publishes the definition and implementation as version `<x.y.z>` |
+| `make publish` | Publishes a **development** version (`<x.y.z>-DEV`) for testing |
 
-```bash
-cd mcp-a2a-bridge-policy-definition && make release
-cd ../mcp-a2a-bridge-policy-flex   && make release
-```
+Run either command from the project root.
 
 ### 7.5 Verify
-1. **Exchange:** in the business group, both `mcp-a2a-bridge-policy` and `mcp-a2a-bridge-policy-flex` show version `<x.y.z>`.
+1. **Exchange:** in the business group, both `mcp-a2a-bridge-policy` and `mcp-atoa-bridge-policy-flex` show version `<x.y.z>`.
 2. **API Manager:** open an MCP or A2A API instance, then Policies → Add policy. **MCP A2A Bridge Policy** appears under **Transformation**.

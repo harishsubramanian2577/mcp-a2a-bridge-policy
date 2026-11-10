@@ -6,9 +6,9 @@ edition = "2021"
 description = "Exposes an A2A agent as an MCP tool by transcoding MCP tools/call to A2A SendMessage and back."
 
 [package.metadata.anypoint]
-group_id = "<your-business-group-id>"
-definition_asset_id = { name = "mcp-a2a-bridge-policy", version = "1.0.3" }
-implementation_asset_id = "mcp-a2a-bridge-policy-flex"
+group_id = "00000000-0000-4000-8000-000000000000"
+definition_asset_id = "mcp-a2a-bridge-policy"
+implementation_asset_id = "mcp-atoa-bridge-policy-flex"
 
 [dependencies]
 pdk = { version = "1.8.0" }

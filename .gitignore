@@ -5,3 +5,5 @@ registration.yaml
 certificate.yaml
 *.env
 blog/
+playground/config/custom-policies/*
+!playground/config/custom-policies/note.txt

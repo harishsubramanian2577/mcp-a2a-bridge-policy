@@ -4,7 +4,7 @@ A custom [Omni Gateway (Flex Gateway)](https://docs.mulesoft.com/gateway/latest/
 
 | | |
 |---|---|
-| Exchange assets | `mcp-a2a-bridge-policy` (definition), `mcp-a2a-bridge-policy-flex` (implementation) |
+| Exchange assets | `mcp-a2a-bridge-policy` (definition), `mcp-atoa-bridge-policy-flex` (implementation) |
 | Version | 1.0.3 |
 | Category | Transformation |
 | API instance types | MCP, A2A (v0.3), A2A (v1.0) |
@@ -53,12 +53,19 @@ The full guide, with diagrams, every property and policy-order tables, is in [do
 ## Repository layout
 
 ```
-mcp-a2a-bridge-policy-definition/   Policy definition: gcl.yaml (schema) and exchange.json
-mcp-a2a-bridge-policy-flex/         Policy implementation (Rust/WASM): src/, unit and integration tests, playground
-mcp-schema/                         MCP tool metadata, for registering the proxy as an MCP asset in Exchange
-postman/                            Postman collection for MCP calls with context_id/task_id follow-ups
-docs/                               Customer guide (Markdown, Word, PDF)
+.project.yaml      PDK project descriptor (unified layout)
+Makefile           setup, build, test, run, publish, release
+Cargo.toml         Crate and Exchange coordinates ([package.metadata.anypoint])
+definition/        Policy definition: gcl.yaml (configuration schema)
+src/               Policy implementation (Rust/WASM) and unit tests
+tests/             Integration tests (Docker)
+playground/        Local Flex Gateway playground
+mcp-schema/        MCP tool metadata, for registering the proxy as an MCP asset in Exchange
+postman/           Postman collection for MCP calls with context_id/task_id follow-ups
+docs/              Customer guide (Markdown, Word, PDF)
 ```
+
+This is a PDK 1.8 single-project (unified) layout: one `make release` publishes both the definition and the implementation.
 
 ## Build and test
 
@@ -68,7 +75,6 @@ Prerequisites:
 - Docker, for the playground and integration tests
 
 ```bash
-cd mcp-a2a-bridge-policy-flex
 make setup        # once
 make build        # builds the WASM binary
 cargo test --lib  # unit tests, no Docker needed
@@ -78,16 +84,15 @@ make run          # local playground; needs playground/config/registration.yaml 
 
 ## Publish to Anypoint Exchange
 
-1. Set your business group ID and version. The version must match in all three places, and a released version can't be overwritten.
-   - `mcp-a2a-bridge-policy-definition/exchange.json`: `groupId`, `version`.
-   - `mcp-a2a-bridge-policy-flex/Cargo.toml`: `version`, `group_id`, `definition_asset_id.version`.
+1. In `Cargo.toml`, set `group_id` to your business group ID and set `version`. A released version can't be overwritten, so bump it for every change.
 2. Authenticate with a connected app that has Exchange Contributor permission (`ANYPOINT_CLIENT_ID`, `ANYPOINT_CLIENT_SECRET`, `ANYPOINT_ORG`).
-3. Release the definition first, then the implementation:
+3. Release:
 
 ```bash
-cd mcp-a2a-bridge-policy-definition && make release   # or: make publish  (-DEV version)
-cd ../mcp-a2a-bridge-policy-flex   && make release   # or: make publish
+make release   # or: make publish  (-DEV version for testing)
 ```
+
+> The implementation asset ID is `mcp-atoa-bridge-policy-flex`, not `mcp-a2a-…`. PDK's `build-asset-files` kebab-cases the implementation ID and rejects any that change, and `a2a` becomes `a-2-a`.
 
 ## Quick test
 

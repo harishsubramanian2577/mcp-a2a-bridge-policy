@@ -16,7 +16,7 @@ spec:
             destinationPath: /
   policies:
     - policyRef:
-        name: mcp-a2a-bridge-policy-flex-v1-0 # This value will be overriden during 'make run' execution
+        name: mcp-atoa-bridge-policy-flex-v1-0 # This value will be overriden during 'make run' execution
       config:
         toolName: ask_agent
         a2aProtocolVersion: "1.0"
