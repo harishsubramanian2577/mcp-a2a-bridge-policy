@@ -1,0 +1,55 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+"""Mock A2A v1 agent. Records every SendMessage and answers with a completed task.
+
+A message without a contextId starts a new context ("ctx-1", "ctx-2", ...); a message with one
+continues it. GET /requests returns what was received; DELETE /requests clears it.
+"""
+import itertools
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+received = []
+contexts = itertools.count(1)
+
+
+class Agent(BaseHTTPRequestHandler):
+    def _send(self, status, body):
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        self._send(200, received)
+
+    def do_DELETE(self):
+        received.clear()
+        self._send(200, [])
+
+    def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))))
+        message = request.get("params", {}).get("message", {})
+        received.append({"path": self.path, "message": message})
+        context_id = message.get("contextId") or f"ctx-{next(contexts)}"
+        text = message.get("parts", [{}])[0].get("text", "")
+        self._send(200, {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {"task": {
+                "id": f"task-{len(received)}",
+                "contextId": context_id,
+                "status": {
+                    "state": "TASK_STATE_COMPLETED",
+                    "message": {"messageId": f"m-{len(received)}", "role": "ROLE_AGENT",
+                                "parts": [{"text": f"echo: {text}"}]},
+                },
+            }},
+        })
+
+    def log_message(self, *args):
+        pass
+
+
+ThreadingHTTPServer(("0.0.0.0", 8080), Agent).serve_forever()

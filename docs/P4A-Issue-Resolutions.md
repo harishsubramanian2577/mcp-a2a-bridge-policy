@@ -15,7 +15,7 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 |---|---|---|
 | #1 | Failed response rewrite returns raw A2A payload instead of an MCP error | Fixed in 1.1.0 |
 | #4 | Classify native A2A before MCP dispatch and preserve native version semantics | Fixed in 1.1.0 |
-| #12 | Session isolation, identity binding and token generation | Fixed in 1.1.0. A live multi-instance Redis test and the private reporting channel are still open (see below). |
+| #12 | Session isolation, identity binding and token generation | Fixed in 1.1.0. Private reporting is enabled. A two-replica Redis test is added; its live run is pending (see below). |
 
 ## How the fixes were verified
 
@@ -33,7 +33,8 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
    - Result: succeeded. The only new host import is WASI `random_get`, which Flex Gateway/Envoy provides.
 4. **Integration tests.**
    - `tests/requests.rs` compiles (`cargo test --no-run`).
-   - The Docker run (`make test`) was not executed in this environment because Docker was not available.
+   - `make test` needs a Flex registration: put a local-mode `registration.yaml` in `tests/config/` (gitignored), which is mounted into the gateway.
+5. **Shared-storage test.** `make test-shared-storage` (see issue #12 below).
 
 ---
 
@@ -132,8 +133,15 @@ The detailed reproductions in the issue were withheld pending a private channel.
   - The TTL is clamped to 60–86400 seconds. The same value sets the Redis TTL (`remote_ttl_millis`) and the liveness check.
   - Entries store `touched_at`, and liveness is judged against the TTL configured now. After a config change, a lower TTL takes effect on existing entries immediately.
 - [x] **Logs** carry only a short prefix of the hashed key, never the session ID or identity.
-- [ ] **Not covered here:** a live test with two gateway instances on one Redis. `pdk-unit` gives each test its own storage, so cross-instance isolation is proven at the namespace and key level, not against a real Redis. A Docker playground test with shared Redis is the next step.
-- [ ] **Private security reporting channel.** This is left for the repository owner: the repository settings are intentionally unchanged while the P4A team is still reviewing.
+- [x] **Two-replica shared Redis test added** (`make test-shared-storage`, in `tests/shared-storage/`). `pdk-test` 1.8.0 has no Redis service and its service traits are private, so this is a Docker Compose harness: Redis, two Flex Gateway replicas, two API instances (`hr`, bound to `x-client-id`, and `finance`) and a mock A2A agent that records what it receives. `check.py` verifies:
+  - a session issued on flex-1 continues on flex-2;
+  - another client, or a request without the identity header, gets no context from it on either replica;
+  - `hr` and `finance` can't use each other's session IDs, and their keys sit in different namespaces;
+  - Redis keys contain neither the session ID nor the identity, and their TTL matches `sessionTtlSeconds`;
+  - the session survives a restart of flex-1;
+  - only the owner can `DELETE` it, and once deleted on flex-2 it is gone on flex-1 too.
+- [ ] **Live run of that test.** Flex 1.10 loads no API without a registration, even in local mode. The harness mounts a **local-mode** registration read-only (`REGISTRATION=<path>`, default `playground/config/registration.yaml`) and refuses to run if Flex comes up in connected mode. The results will be added here once a local-mode registration is available.
+- [x] **Private security reporting channel.** GitHub private vulnerability reporting is enabled, and [`SECURITY.md`](../SECURITY.md) describes how to report. The repository visibility is unchanged.
 
 ### Files
 `src/session.rs` (rewritten), `src/lib.rs` (`Identity`, `issue_session`, `transcode_tool_call`, `DELETE` handling), `Cargo.toml` (`sha2`, `getrandom`), `definition/gcl.yaml`, docs.

@@ -52,6 +52,10 @@ endif
 test: build ## Run integration tests
 	@cargo test -- --nocapture
 
+.PHONY: test-shared-storage
+test-shared-storage: build ## Run the two-replica shared Redis session test (Docker)
+	@tests/shared-storage/run.sh
+
 FORMAT     ?=
 OUTPUT_PATH ?=
 

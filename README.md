@@ -34,7 +34,7 @@ A custom [Omni Gateway (Flex Gateway)](https://docs.mulesoft.com/gateway/latest/
 
 Put the bridge **after** authentication policies (Client ID enforcement, or OIDC with OAuth 2.0 Protected Resource Metadata). The bridge answers `initialize` and `tools/list` itself, so policies placed after it never run for those requests. Set the response timeout to about 120 s, because multi-agent answers can take 30–60 s.
 
-Fixes in 1.1.0 for the P4A review findings are tracked in [docs/P4A-Issue-Resolutions.md](docs/P4A-Issue-Resolutions.md).
+To report a security issue, see [SECURITY.md](SECURITY.md). Fixes in 1.1.0 for the P4A review findings are tracked in [docs/P4A-Issue-Resolutions.md](docs/P4A-Issue-Resolutions.md).
 
 The full guide, with diagrams, every property and policy-order tables, is in [docs/MCP-A2A-Bridge-Policy.md](docs/MCP-A2A-Bridge-Policy.md).
 
@@ -82,7 +82,8 @@ Prerequisites:
 make setup        # once
 make build        # builds the WASM binary
 cargo test --lib  # unit tests, no Docker needed
-make test         # integration tests (Docker)
+make test         # integration tests (Docker); needs a local-mode tests/config/registration.yaml
+make test-shared-storage  # two Flex replicas + Redis session test; REGISTRATION=<local-mode registration.yaml>
 make run          # local playground; needs playground/config/registration.yaml (gitignored)
 ```
 
