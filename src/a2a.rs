@@ -43,6 +43,62 @@ pub fn is_a2a_method(method: &str) -> bool {
     A2A_METHOD_NAMES.contains(&method)
 }
 
+/// Recognises the A2A v1.0 HTTP+JSON binding and the agent card from the verb and path alone, so
+/// native REST calls are classified before any MCP handling. The route may sit under the API
+/// base path and an optional tenant segment, so it is matched on the trailing segments.
+pub fn is_http_json_route(http_method: &str, path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let tail = |n: usize| segments.len().checked_sub(n).map(|start| &segments[start..]);
+
+    let action = segments.last().and_then(|last| last.rsplit_once(':'));
+    if let Some((target, verb)) = action {
+        let task_action = !target.is_empty()
+            && segments.len() >= 2
+            && segments[segments.len() - 2] == "tasks";
+        return match (http_method, target, verb) {
+            ("POST", "message", "send" | "stream") => true,
+            ("POST", _, "cancel") => task_action,
+            ("POST" | "GET", _, "subscribe") => task_action,
+            _ => false,
+        };
+    }
+    if path.ends_with("/.well-known/agent-card.json") || path.ends_with("/.well-known/agent.json") {
+        return http_method == "GET";
+    }
+    match http_method {
+        "GET" => {
+            matches!(segments.last(), Some(&"extendedAgentCard") | Some(&"tasks"))
+                || matches!(tail(2), Some(["tasks", _]))
+                || matches!(tail(3), Some(["tasks", _, "pushNotificationConfigs"]))
+                || matches!(tail(4), Some(["tasks", _, "pushNotificationConfigs", _]))
+        }
+        "POST" => matches!(tail(3), Some(["tasks", _, "pushNotificationConfigs"])),
+        "DELETE" => matches!(tail(4), Some(["tasks", _, "pushNotificationConfigs", _])),
+        _ => false,
+    }
+}
+
+/// Removes an `A2A-Version` query parameter (any case), which would otherwise contradict the
+/// version of a request the bridge generated itself.
+pub fn strip_version_query(path: &str) -> String {
+    let Some((base, query)) = path.split_once('?') else {
+        return path.to_string();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|kv| {
+            let key = kv.split_once('=').map_or(*kv, |(k, _)| k);
+            !kv.is_empty() && !key.eq_ignore_ascii_case(A2A_VERSION_HEADER)
+        })
+        .collect();
+    if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}?{}", base, kept.join("&"))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum A2aVersion {
     V1,
@@ -652,5 +708,49 @@ mod tests {
         assert!(is_a2a_method("SendMessage"));
         assert!(is_a2a_method("tasks/get"));
         assert!(!is_a2a_method("tools/call"));
+    }
+
+    #[test]
+    fn http_json_routes_are_recognised_under_any_prefix() {
+        for (verb, path) in [
+            ("POST", "/message:send"),
+            ("POST", "/base/message:stream"),
+            ("POST", "/base/tenant-1/message:send?A2A-Version=1.0"),
+            ("POST", "/base/tasks/t-1:cancel"),
+            ("POST", "/base/tasks/t-1:subscribe"),
+            ("GET", "/base/tasks/t-1:subscribe"),
+            ("GET", "/base/tasks"),
+            ("GET", "/base/tasks/t-1"),
+            ("POST", "/base/tasks/t-1/pushNotificationConfigs"),
+            ("GET", "/base/tasks/t-1/pushNotificationConfigs"),
+            ("GET", "/base/tasks/t-1/pushNotificationConfigs/c-1"),
+            ("DELETE", "/base/tasks/t-1/pushNotificationConfigs/c-1"),
+            ("GET", "/base/extendedAgentCard"),
+            ("GET", "/base/.well-known/agent-card.json"),
+        ] {
+            assert!(is_http_json_route(verb, path), "{} {}", verb, path);
+        }
+        for (verb, path) in [
+            ("POST", "/mcp"),
+            ("POST", "/"),
+            ("POST", "/base/tasks"),
+            ("POST", "/base/tasks/t-1"),
+            ("POST", "/base/:cancel"),
+            ("POST", "/base/x:cancel"),
+            ("DELETE", "/mcp"),
+            ("DELETE", "/base/tasks/t-1"),
+            ("PUT", "/base/message:send"),
+            ("GET", "/base/message:send"),
+        ] {
+            assert!(!is_http_json_route(verb, path), "{} {}", verb, path);
+        }
+    }
+
+    #[test]
+    fn version_query_is_stripped_case_insensitively() {
+        assert_eq!(strip_version_query("/a?A2A-Version=0.3"), "/a");
+        assert_eq!(strip_version_query("/a?x=1&a2a-version=1.0&y=2"), "/a?x=1&y=2");
+        assert_eq!(strip_version_query("/a?x=1"), "/a?x=1");
+        assert_eq!(strip_version_query("/a"), "/a");
     }
 }

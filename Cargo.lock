@@ -2195,9 +2195,10 @@ dependencies = [
 
 [[package]]
 name = "mcp_a2a_bridge_policy"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "anyhow",
+ "getrandom 0.2.17",
  "httpmock",
  "pdk",
  "pdk-test",
@@ -2205,6 +2206,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

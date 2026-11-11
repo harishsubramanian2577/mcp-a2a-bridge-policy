@@ -39,11 +39,11 @@ spec:
     passThroughA2A:
       type: boolean
       default: false
-      description: Keep false when this policy runs on a dedicated MCP proxy (recommended); only MCP traffic is accepted and everything else is rejected. Set true only when MCP and A2A clients share one API instance, in which case native A2A traffic (A2A JSON-RPC methods, agent card GETs, non-JSON requests) is forwarded untouched.
+      description: Keep false when this policy runs on a dedicated MCP proxy (recommended); only MCP traffic is accepted and everything else is rejected. Set true only when MCP and A2A clients share one API instance, in which case native A2A traffic is classified first and forwarded untouched (path, headers and body) - A2A JSON-RPC in both v1.0 and v0.3 vocabularies, the v1.0 HTTP+JSON binding (for example POST /message:send, POST /tasks/{id}:cancel, GET /tasks/{id}), agent card GETs and non-JSON requests such as gRPC.
     a2aPath:
       type: string
       default: ""
-      description: Optional path, relative to this API instance's upstream URL, that transcoded calls are sent to (for example /a2a/my-agent, or / for the upstream URL itself). The request path is rewritten to the API base path plus this value, so the gateway forwards to upstream URL + a2aPath regardless of the path the MCP client used; the query string is kept. With passThroughA2A enabled, forwarded A2A JSON-RPC calls are rewritten too. Leave empty to forward the client path unchanged.
+      description: Optional path, relative to this API instance's upstream URL, that transcoded calls are sent to (for example /a2a/my-agent, or / for the upstream URL itself). The request path is rewritten to the API base path plus this value, so the gateway forwards to upstream URL + a2aPath regardless of the path the MCP client used; the query string is kept. Only calls translated from MCP are rewritten; native A2A traffic keeps its own path. Leave empty to forward the client path unchanged.
     includeStructuredContent:
       type: boolean
       default: true
@@ -55,7 +55,7 @@ spec:
         - local
         - remote
       default: disabled
-      description: Optional server-side map from MCP session to A2A contextId/taskId, used only when the client omits context_id. local is per-replica in-memory; remote requires Flex Gateway Shared Storage (Redis) and will fail policy startup if it is not configured.
+      description: Optional server-side map from MCP session to A2A contextId/taskId, used only when the client omits context_id. Session ids are random, issued at initialize and scoped to this API instance and policy. local is per-replica in-memory; remote shares sessions across replicas and requires Flex Gateway Shared Storage (Redis) and will fail policy startup if it is not configured.
     sessionTtlSeconds:
       type: integer
       default: 1800
@@ -65,7 +65,7 @@ spec:
     sessionKeyHeader:
       type: string
       default: ""
-      description: Optional request header (for example client_id or authorization) whose value is hashed into the session key, binding a stored conversation to the caller identity as well as the Mcp-Session-Id.
+      description: Optional request header (for example client_id or authorization) whose value is hashed into the session key, binding a stored conversation to the caller identity as well as the Mcp-Session-Id. When set, the binding is enforced - a request without this header gets no session and cannot use or end one.
   required:
     - toolName
     - a2aProtocolVersion

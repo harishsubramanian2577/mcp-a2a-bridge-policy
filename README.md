@@ -5,7 +5,7 @@ A custom [Omni Gateway (Flex Gateway)](https://docs.mulesoft.com/gateway/latest/
 | | |
 |---|---|
 | Exchange assets | `mcp-a2a-bridge-policy` (definition), `mcp-atoa-bridge-policy-flex` (implementation) |
-| Version | 1.0.3 |
+| Version | 1.1.0 |
 | Category | Transformation |
 | API instance types | MCP, A2A (v0.3), A2A (v1.0) |
 | PDK | 1.8.0 |
@@ -16,12 +16,14 @@ A custom [Omni Gateway (Flex Gateway)](https://docs.mulesoft.com/gateway/latest/
 |---|---|
 | `initialize`, `ping`, `tools/list`, notifications | Answers them at the gateway; nothing reaches the broker |
 | `tools/call` for the bridge tool (default `ask_agent`) | Converts the call into an A2A `SendMessage` (v1.0) or `message/send` (v0.3), and converts the A2A task or message reply back into an MCP `CallToolResult` |
-| Native A2A traffic (only with `passThroughA2A: true`) | Forwards it to the broker unchanged |
+| Native A2A traffic (only with `passThroughA2A: true`): JSON-RPC v1.0/v0.3, HTTP+JSON (`/message:send`, `/tasks/{id}:cancel`, ...), agent card, gRPC | Recognises it before any MCP handling and forwards it unchanged (same path, headers and body) |
 
 **Multi-turn conversations.** Every tool result carries `structuredContent.{state, contextId, taskId}`.
 - To continue a conversation, the client passes `context_id`.
 - To answer an `input-required` question from the broker, the client passes `context_id` and `task_id`.
-- An optional session store (`local`, or `remote` via Redis) can remember the last context for each `Mcp-Session-Id`. This helps clients that never send `context_id` back.
+- An optional session store (`local`, or `remote` via Redis) can remember the last context for each `Mcp-Session-Id`. This helps clients that never send `context_id` back. Session IDs are random, issued at `initialize`, scoped to the API instance and policy, and bound to `sessionKeyHeader` when it is set.
+
+**Size limit.** Converted answers always fit the gateway's 1 MB body limit. The policy drops duplicated data, truncates the text, or as a last resort returns a tool error, so the client never gets the raw A2A reply.
 
 ## Deployment modes
 
@@ -31,6 +33,8 @@ A custom [Omni Gateway (Flex Gateway)](https://docs.mulesoft.com/gateway/latest/
 | **2. Shared A2A proxy** | Directly on the broker's A2A API instance | `passThroughA2A: true`, `a2aPath: ""` | `https://<gateway-host>/<a2a-base-path>/` (MCP and A2A clients) |
 
 Put the bridge **after** authentication policies (Client ID enforcement, or OIDC with OAuth 2.0 Protected Resource Metadata). The bridge answers `initialize` and `tools/list` itself, so policies placed after it never run for those requests. Set the response timeout to about 120 s, because multi-agent answers can take 30–60 s.
+
+Fixes in 1.1.0 for the P4A review findings are tracked in [docs/P4A-Issue-Resolutions.md](docs/P4A-Issue-Resolutions.md).
 
 The full guide, with diagrams, every property and policy-order tables, is in [docs/MCP-A2A-Bridge-Policy.md](docs/MCP-A2A-Bridge-Policy.md).
 
@@ -44,11 +48,11 @@ The full guide, with diagrams, every property and policy-order tables, is in [do
 | `serverInstructions` | empty | Optional `instructions` in the `initialize` reply |
 | `a2aProtocolVersion` | `1.0` | `1.0` or `0.3` (required) |
 | `passThroughA2A` | `false` | Forward native A2A traffic (Mode 2) |
-| `a2aPath` | empty | Path, relative to the upstream URL, that converted calls are sent to |
+| `a2aPath` | empty | Path, relative to the upstream URL, that converted calls are sent to (native A2A traffic is never rewritten) |
 | `includeStructuredContent` | `true` | Add `state`, `contextId`, `taskId` and data parts to tool results |
 | `sessionStoreMode` | `disabled` | `disabled`, `local` or `remote` |
 | `sessionTtlSeconds` | `1800` | Session store TTL (60–86400) |
-| `sessionKeyHeader` | empty | Header hashed into the session key, for example `client_id` |
+| `sessionKeyHeader` | empty | Header hashed into the session key, for example `client_id`. Enforced: without it, a request gets no session |
 
 ## Repository layout
 
