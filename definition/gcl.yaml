@@ -7,7 +7,7 @@ metadata:
     description: Exposes an A2A agent as an MCP tool. Answers the MCP handshake locally, transcodes tools/call to A2A SendMessage and the A2A task result back to an MCP tool result.
     category: Transformation
     metadata/interfaceScope: api
-    metadata/capabilities/assetTypes: mcp,a2a,a2a_v1
+    metadata/capabilities/assetTypes: mcp,a2a,a2av1
 spec:
   extends:
     - name: extension-definition

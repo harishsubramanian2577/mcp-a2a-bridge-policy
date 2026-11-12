@@ -66,12 +66,16 @@ _COVERAGE_OUTPUT = $(if $(OUTPUT_PATH),--output-path $(OUTPUT_PATH),)
 test-coverage: build ## Run tests with coverage. Opts: FORMAT=json|html, OUTPUT_PATH=/my/path
 	cargo llvm-cov test $(_COVERAGE_FORMAT) $(_COVERAGE_OUTPUT) --ignore-filename-regex config.rs -- --nocapture
 
+.PHONY: validate-definition
+validate-definition: ## Check the definition metadata against Exchange's rules before publishing
+	@python3 scripts/validate-definition.py "$(DEFINITION_SRC_GCL_PATH)" Cargo.toml
+
 .PHONY: publish
-publish: build ## Publish a development version of the policy
+publish: validate-definition build ## Publish a development version of the policy
 	anypoint-cli-v4 pdk policy-project publish --binary-path $(TARGET_DIR)/$(CRATE_NAME).wasm --implementation-gcl-path $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml
 
 .PHONY: release
-release: build ## Publish a release version
+release: validate-definition build ## Publish a release version
 	anypoint-cli-v4 pdk policy-project release --binary-path $(TARGET_DIR)/$(CRATE_NAME).wasm --implementation-gcl-path $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml
 
 .PHONY: build-asset-files

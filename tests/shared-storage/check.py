@@ -6,6 +6,7 @@ Run by run.sh after `docker compose up`. Exits non-zero on the first failed chec
 import json
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -49,24 +50,38 @@ def headers(session=None, client=None):
 
 def initialize(url, client=None):
     status, h, _ = http("POST", url, {"jsonrpc": "2.0", "id": 0, "method": "initialize",
-                                      "params": {"protocolVersion": "2025-06-18"}}, headers(client=client))
+                                      "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                                 "clientInfo": {"name": "check", "version": "1"}}},
+                          headers(client=client))
     sid = {k.lower(): v for k, v in h.items()}.get("mcp-session-id")
     return status, sid
 
 
 def ask(url, message, session=None, client=None):
     """tools/call; returns (contextId the agent received, contextId in the MCP result)."""
-    global calls
-    calls += 1
     http("DELETE", AGENT)
-    status, _, body = http("POST", url, {"jsonrpc": "2.0", "id": calls, "method": "tools/call",
-                                         "params": {"name": "ask_agent", "arguments": {"message": message}}},
-                           headers(session, client))
+    status, _, body = tool_call(url, message, session, client)
     if status != 200 or body is None or "structuredContent" not in body.get("result", {}):
         check(f"tools/call {message!r} answered", False, f"status {status}, body {body}")
     _, _, received = http("GET", AGENT)
     sent = received[-1]["message"].get("contextId") if received else None
     return sent, body["result"]["structuredContent"]["contextId"]
+
+
+def tool_call(url, message, session=None, client=None):
+    global calls
+    calls += 1
+    return http("POST", url, {"jsonrpc": "2.0", "id": calls, "method": "tools/call",
+                              "params": {"name": "ask_agent", "arguments": {"message": message}}},
+                headers(session, client))
+
+
+def not_found(url, message, session=None, client=None):
+    """tools/call that must get 404 without reaching the agent; returns a detail string."""
+    http("DELETE", AGENT)
+    status, _, _ = tool_call(url, message, session, client)
+    _, _, received = http("GET", AGENT)
+    return status == 404 and not received, f"{status}, agent called {len(received)} times"
 
 
 def wait_ready(urls, timeout=180):
@@ -100,21 +115,17 @@ def main():
     check("flex-2 continues the context stored by flex-1", sent == ctx, f"agent got {sent}")
 
     print("Identity binding across replicas")
-    sent, _ = ask(FLEX_2["hr"], "as bob", sid, "bob")
-    check("another client with the same session id gets no context", sent is None, f"agent got {sent}")
-    sent, _ = ask(FLEX_2["hr"], "no identity", sid)
-    check("a request without x-client-id gets no context", sent is None, f"agent got {sent}")
+    check("another client with the same session id gets 404", *not_found(FLEX_2["hr"], "as bob", sid, "bob"))
+    check("a request without x-client-id gets 404", *not_found(FLEX_2["hr"], "no identity", sid))
 
     print("Isolation between API instances on the same Redis")
-    sent, _ = ask(FLEX_1["finance"], "hr session on finance", sid)
-    check("hr's session id is unknown to finance", sent is None, f"agent got {sent}")
+    check("hr's session id is unknown to finance", *not_found(FLEX_1["finance"], "hr session on finance", sid))
     status, fsid = initialize(FLEX_2["finance"])
     check("finance issues its own session", status == 200 and fsid and fsid != sid, fsid)
     _, fctx = ask(FLEX_2["finance"], "finance first", fsid)
     sent, _ = ask(FLEX_1["finance"], "finance second", fsid)
     check("finance continues across replicas", sent == fctx, f"agent got {sent}")
-    sent, _ = ask(FLEX_1["hr"], "finance session on hr", fsid, "alice")
-    check("finance's session id is unknown to hr", sent is None, f"agent got {sent}")
+    check("finance's session id is unknown to hr", *not_found(FLEX_1["hr"], "finance session on hr", fsid, "alice"))
 
     print("What is stored in Redis")
     keys = [k for k in redis("--scan") if "mcp-a2a-sessions" in k]
@@ -145,8 +156,20 @@ def main():
     check("another client cannot delete the session", status == 404, str(status))
     status, _, _ = http("DELETE", FLEX_2["hr"], headers=headers(sid, "alice"))
     check("the owner deletes the session on flex-2", status == 204, str(status))
-    sent, _ = ask(FLEX_1["hr"], "after delete", sid, "alice")
-    check("flex-1 no longer uses the deleted session", sent is None, f"agent got {sent}")
+    check("flex-1 returns 404 for the deleted session", *not_found(FLEX_1["hr"], "after delete", sid, "alice"))
+
+    print("Late answer after delete")
+    _, lsid = initialize(FLEX_1["hr"], "alice")
+    in_flight = {}
+    worker = threading.Thread(target=lambda: in_flight.update(
+        zip(("status", "headers", "body"), tool_call(FLEX_1["hr"], "slow answer", lsid, "alice"))))
+    worker.start()
+    time.sleep(1.5)
+    status, _, _ = http("DELETE", FLEX_2["hr"], headers=headers(lsid, "alice"))
+    check("the owner deletes the session while a call is in flight", status == 204, str(status))
+    worker.join()
+    check("the in-flight call still gets its answer", in_flight.get("status") == 200, str(in_flight.get("status")))
+    check("the late answer does not revive the session", *not_found(FLEX_2["hr"], "after late answer", lsid, "alice"))
 
     print("All shared-storage checks passed.")
 

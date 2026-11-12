@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use crate::a2a::A2aVersion;
 use crate::generated::config::Config;
 use crate::mcp::ToolCall;
-use crate::session::SessionStore;
+use crate::session::{SessionEntry, SessionStore};
 
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const JSON_CONTENT_TYPE: &str = "application/json";
@@ -55,6 +55,10 @@ impl Bridge {
         let base_path = metadata.api_metadata.base_path.as_deref();
         let ttl = config.session_ttl_seconds.unwrap_or(1800).max(0) as u64;
         let mode = config.session_store_mode.as_deref().unwrap_or("disabled");
+        let forward_path = resolve_forward_path(base_path, config.a_2_a_path.as_deref());
+        if forward_path.is_none() && base_path.is_none() && config.a_2_a_path.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+            logger::warn!("a2aPath is set but the API base path is unknown; paths will not be rewritten.");
+        }
         let policy = &metadata.policy_metadata;
         let session_scope = session::namespace(
             metadata.api_metadata.id.as_deref(),
@@ -78,7 +82,7 @@ impl Bridge {
                 .session_key_header
                 .map(|h| h.trim().to_ascii_lowercase())
                 .filter(|h| !h.is_empty()),
-            forward_path: resolve_forward_path(base_path, config.a_2_a_path.as_deref()),
+            forward_path,
             id_counter: Cell::new(0),
         }
     }
@@ -105,11 +109,7 @@ impl Bridge {
 /// upstream root keeps its trailing slash because the gateway route is `<base path>/`.
 fn resolve_forward_path(base_path: Option<&str>, a2a_path: Option<&str>) -> Option<String> {
     let a2a_path = a2a_path.map(str::trim).filter(|p| !p.is_empty())?;
-    let Some(base_path) = base_path else {
-        logger::warn!("a2aPath is set but the API base path is unknown; paths will not be rewritten.");
-        return None;
-    };
-    let base = base_path.trim_end_matches('*').trim_end_matches('/');
+    let base = base_path?.trim_end_matches('*').trim_end_matches('/');
     let rest = a2a_path.trim_matches('/');
     Some(if rest.is_empty() {
         format!("{}/", base)
@@ -170,6 +170,7 @@ impl Identity {
 struct RequestHeaders {
     session_id: Option<String>,
     identity: Identity,
+    protocol_version: Option<String>,
     path: String,
 }
 
@@ -191,6 +192,24 @@ fn rpc_error(id: &Value, code: i64, message: &str) -> Flow<Option<Transcoded>> {
 
 fn rpc_result(id: &Value, result: Value) -> Flow<Option<Transcoded>> {
     Flow::Break(json_response(200, &mcp::result_envelope(id, result), vec![]))
+}
+
+/// An HTTP-level rejection with a JSON-RPC error body; the id is included when one was read.
+fn http_error(status: u32, id: Option<&Value>, code: i64, message: &str) -> Flow<Option<Transcoded>> {
+    Flow::Break(json_response(status, &mcp::error_body(id, code, message), vec![]))
+}
+
+fn invalid_message(invalid: mcp::Invalid) -> Flow<Option<Transcoded>> {
+    match &invalid.id {
+        Some(id) => rpc_error(id, invalid.code, &invalid.message),
+        None => http_error(400, None, invalid.code, &invalid.message),
+    }
+}
+
+/// Streamable HTTP answers a request for an unknown or terminated session with 404, which tells
+/// the client to start a new session with `initialize`.
+fn session_not_found(id: Option<&Value>) -> Flow<Option<Transcoded>> {
+    http_error(404, id, mcp::SESSION_NOT_FOUND, "Session not found")
 }
 
 fn plain_status(status: u32) -> Flow<Option<Transcoded>> {
@@ -232,6 +251,10 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
                 let Some(store) = &bridge.sessions else {
                     return method_not_allowed();
                 };
+                let version = handler.header(mcp::PROTOCOL_VERSION_HEADER);
+                if let Err(message) = mcp::check_protocol_version_header(version.as_deref()) {
+                    return http_error(400, None, mcp::INVALID_REQUEST, &message);
+                }
                 let key = Identity::of(bridge, handler).session_key(bridge, &session_id);
                 return match key {
                     Some(key) if store.load(&key).await.is_some() => {
@@ -254,11 +277,12 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
         return pass_or_reject_media(bridge);
     }
     if !headers_state.contains_body() {
-        return rpc_error(&Value::Null, mcp::INVALID_REQUEST, "Empty JSON-RPC request body");
+        return http_error(400, None, mcp::INVALID_REQUEST, "Empty JSON-RPC request body");
     }
     let headers = RequestHeaders {
         session_id: handler.header(mcp::SESSION_ID_HEADER),
         identity: Identity::of(bridge, handler),
+        protocol_version: handler.header(mcp::PROTOCOL_VERSION_HEADER),
         path,
     };
 
@@ -273,46 +297,74 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
             logger::debug!("Body is not JSON; passing through untouched.");
             return Flow::Continue(None);
         }
-        Err(_) => return rpc_error(&Value::Null, mcp::PARSE_ERROR, "Parse error"),
+        Err(_) => return http_error(400, None, mcp::PARSE_ERROR, "Parse error"),
     };
     let Some(envelope) = rpc.as_object() else {
-        return rpc_error(
-            &Value::Null,
+        return http_error(
+            400,
+            None,
             mcp::INVALID_REQUEST,
             "JSON-RPC batch requests are not supported",
         );
     };
-    let id = envelope.get("id").cloned().unwrap_or(Value::Null);
 
-    if envelope.get("jsonrpc").and_then(Value::as_str) != Some(mcp::JSONRPC_VERSION) {
-        // A bare A2A HTTP+JSON payload on a route not recognised above.
-        if bridge.pass_through_a2a {
-            return Flow::Continue(None);
-        }
-        return rpc_error(&id, mcp::INVALID_REQUEST, "Not a JSON-RPC 2.0 request");
+    // Native A2A is recognised before any MCP validation: a bare HTTP+JSON payload on a route not
+    // recognised above, or an A2A JSON-RPC method, keeps its own path, version header and body.
+    let method = envelope.get("method").and_then(Value::as_str);
+    let native_a2a = !envelope.contains_key("jsonrpc") || method.map_or(false, a2a::is_a2a_method);
+    if bridge.pass_through_a2a && native_a2a {
+        return Flow::Continue(None);
     }
-    let Some(method) = envelope.get("method").and_then(Value::as_str) else {
-        // A client response to a server request; this server never sends any.
-        if envelope.contains_key("result") || envelope.contains_key("error") {
-            return plain_status(202);
-        }
-        return rpc_error(&id, mcp::INVALID_REQUEST, "Missing JSON-RPC method");
-    };
 
-    if a2a::is_a2a_method(method) {
-        // Native A2A JSON-RPC keeps its own path, version header and body.
-        if bridge.pass_through_a2a {
-            return Flow::Continue(None);
+    // Nothing below reaches the agent unless the message is a valid MCP request.
+    let incoming = match mcp::classify(envelope) {
+        Ok(incoming) => incoming,
+        Err(invalid) => return invalid_message(invalid),
+    };
+    let request_id = match &incoming {
+        mcp::Incoming::Request { id, .. } => Some(*id),
+        _ => None,
+    };
+    let is_initialize = matches!(
+        incoming,
+        mcp::Incoming::Request { method: mcp::INITIALIZE_METHOD_NAME, .. }
+    );
+    if !is_initialize {
+        if let Err(message) = mcp::check_protocol_version_header(headers.protocol_version.as_deref()) {
+            return http_error(400, request_id, mcp::INVALID_REQUEST, &message);
         }
+    }
+
+    // A session id must name a live session of this caller; `initialize` starts a new one.
+    let mut session = None;
+    if let (Some(store), Some(session_id), false) = (&bridge.sessions, &headers.session_id, is_initialize) {
+        let key = headers.identity.session_key(bridge, session_id);
+        let entry = match &key {
+            Some(key) => store.load(key).await,
+            None => None,
+        };
+        match (key, entry) {
+            (Some(key), Some(entry)) => session = Some((key, entry)),
+            _ => {
+                logger::debug!("Mcp-Session-Id is unknown, expired or not this caller's.");
+                return session_not_found(request_id);
+            }
+        }
+    }
+
+    let (id, method, params) = match incoming {
+        mcp::Incoming::Request { id, method, params } => (id.clone(), method, params),
+        // Accepted notifications and client responses get 202 with no body.
+        mcp::Incoming::Notification { .. } | mcp::Incoming::Response => return plain_status(202),
+    };
+    if a2a::is_a2a_method(method) {
         return rpc_error(&id, mcp::METHOD_NOT_FOUND, "A2A methods are not accepted on this MCP endpoint");
     }
-    if mcp::is_notification(method) {
-        return plain_status(202);
-    }
-
-    let params = envelope.get("params");
     match method {
-        mcp::INITIALIZE_METHOD_NAME => initialize(bridge, &id, params, &headers).await,
+        mcp::INITIALIZE_METHOD_NAME => match mcp::initialize_protocol_version(params) {
+            Ok(requested) => initialize(bridge, &id, requested, &headers).await,
+            Err(message) => rpc_error(&id, mcp::INVALID_PARAMS, message),
+        },
         mcp::PING_METHOD_NAME => rpc_result(&id, json!({})),
         mcp::TOOLS_LIST_METHOD_NAME => rpc_result(
             &id,
@@ -335,7 +387,7 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
                 Ok(call) => call,
                 Err(message) => return rpc_error(&id, mcp::INVALID_PARAMS, &message),
             };
-            transcode_tool_call(bridge, id, call, &headers, handler).await
+            transcode_tool_call(bridge, id, call, session, &headers, handler).await
         }
         _ => rpc_error(&id, mcp::METHOD_NOT_FOUND, &format!("Method not found: {}", method)),
     }
@@ -360,14 +412,11 @@ fn pass_or_reject_media(bridge: &Bridge) -> Flow<Option<Transcoded>> {
 async fn initialize(
     bridge: &Bridge,
     id: &Value,
-    params: Option<&Value>,
+    requested: &str,
     headers: &RequestHeaders,
 ) -> Flow<Option<Transcoded>> {
-    let requested = params
-        .and_then(|p| p.get("protocolVersion"))
-        .and_then(Value::as_str);
     let result = mcp::initialize_result(
-        requested,
+        Some(requested),
         &bridge.server_name,
         SERVER_VERSION,
         bridge.server_instructions.as_deref(),
@@ -399,21 +448,15 @@ async fn transcode_tool_call(
     bridge: &Bridge,
     id: Value,
     call: ToolCall,
+    session: Option<(String, SessionEntry)>,
     headers: &RequestHeaders,
     handler: &dyn HeadersBodyHandler,
 ) -> Flow<Option<Transcoded>> {
-    // Only a live session issued by this policy, for this caller, is used.
-    let mut session_key = match (&bridge.sessions, &headers.session_id) {
-        (Some(_), Some(sid)) => headers.identity.session_key(bridge, sid),
-        _ => None,
+    // `session` is the caller's live session, already resolved by the request filter.
+    let (session_key, entry) = match session {
+        Some((key, entry)) => (Some(key), Some(entry)),
+        None => (None, None),
     };
-    let entry = match (&bridge.sessions, &session_key) {
-        (Some(store), Some(key)) => store.load(key).await,
-        _ => None,
-    };
-    if entry.is_none() && session_key.take().is_some() {
-        logger::debug!("Mcp-Session-Id is unknown or expired for this caller; ignoring it.");
-    }
 
     // Explicit arguments win; the store only fills in a missing context.
     let (context_id, task_id) = match (&call.context_id, entry) {
@@ -505,7 +548,8 @@ async fn response_filter(
     let body_state = headers_state.into_body_state().await;
     let body = body_state.handler().body();
 
-    let (result, reply) = match a2a::parse_agent_response(status, &content_type, &body) {
+    let parsed = a2a::parse_agent_response(status, &content_type, &body, &transcoded.rpc_id);
+    let (result, reply) = match parsed {
         Ok(reply) => (
             a2a::tool_result_from_reply(&reply, &bridge.tool_name, bridge.structured_content),
             Some(reply),
@@ -533,17 +577,20 @@ async fn response_filter(
     }
 }
 
+/// Records the reply's context and, while the agent waits on the caller, its task. A task-only
+/// reply is remembered too, since the agent infers the context from the task id.
 async fn remember(bridge: &Bridge, transcoded: &Transcoded, reply: &a2a::AgentReply) {
-    let (Some(store), Some(key), Some(context_id)) =
-        (&bridge.sessions, &transcoded.session_key, &reply.context_id)
-    else {
+    let (Some(store), Some(key)) = (&bridge.sessions, &transcoded.session_key) else {
         return;
     };
     let pending_task = reply
         .task_id
         .clone()
         .filter(|_| reply.state.awaits_client());
-    store.update(key, context_id.clone(), pending_task).await;
+    if reply.context_id.is_none() && pending_task.is_none() {
+        return;
+    }
+    store.update(key, reply.context_id.clone(), pending_task).await;
 }
 
 #[entrypoint]

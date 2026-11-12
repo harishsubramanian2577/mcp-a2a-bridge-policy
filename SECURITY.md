@@ -18,5 +18,6 @@ Reports are acknowledged within 5 business days. Fixes are released as a new pol
 
 | Version | Supported |
 |---|---|
-| 1.1.x | Yes |
+| 1.2.x | Yes |
+| 1.1.x | No. Upgrade to 1.2.0, in which an ended or unknown session gets `404` and can't be revived ([#5](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/5)). |
 | 1.0.x | No. Upgrade to 1.1.0, which fixes the session isolation findings in [#12](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/12). |

@@ -31,7 +31,7 @@ pub const MAX_TTL_SECONDS: u64 = 86_400;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEntry {
-    /// `None` until the agent returned the first context of this session.
+    /// `None` until the agent returned a context in this session.
     pub context_id: Option<String>,
     /// Only set while the agent is waiting on the caller (input-required / auth-required).
     pub task_id: Option<String>,
@@ -129,14 +129,15 @@ impl SessionStore {
         self.get(key).await.map(|(entry, _)| entry)
     }
 
-    /// Remembers the latest context. A session deleted (or expired) while the call was in flight
-    /// stays deleted: the compare-and-swap only updates the entry that is still there.
-    pub async fn update(&self, key: &str, context_id: String, task_id: Option<String>) {
+    /// Remembers the latest context and pending task. A session deleted (or expired) while the
+    /// call was in flight stays deleted: the compare-and-swap only updates the entry that is still
+    /// there, so a late answer cannot bring a terminated session back.
+    pub async fn update(&self, key: &str, context_id: Option<String>, task_id: Option<String>) {
         let Some((_, cas)) = self.get(key).await else {
             logger::debug!("Session {} ended before the agent answered; not remembered.", key_hint(key));
             return;
         };
-        let entry = self.fresh_entry(Some(context_id), task_id);
+        let entry = self.fresh_entry(context_id, task_id);
         self.put(key, &StoreMode::Cas(cas), &entry).await;
     }
 

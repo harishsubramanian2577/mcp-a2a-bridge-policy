@@ -13,6 +13,7 @@ pub const TOOLS_CALL_METHOD_NAME: &str = "tools/call";
 pub const NOTIFICATION_METHOD_PREFIX: &str = "notifications/";
 
 pub const SESSION_ID_HEADER: &str = "mcp-session-id";
+pub const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
 /// Newest first. An unknown client version is answered with the newest one, per the MCP
 /// version-negotiation rules; the client decides whether it can proceed.
@@ -23,6 +24,8 @@ pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
+/// Body code of the HTTP 404 for an unknown or terminated session, as the MCP SDKs use it.
+pub const SESSION_NOT_FOUND: i64 = -32001;
 
 pub const ARG_MESSAGE: &str = "message";
 pub const ARG_CONTEXT_ID: &str = "context_id";
@@ -33,12 +36,145 @@ pub fn is_notification(method: &str) -> bool {
     method.starts_with(NOTIFICATION_METHOD_PREFIX)
 }
 
+/// A JSON-RPC message from the MCP client, classified by its structure rather than its method.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Incoming<'a> {
+    Request {
+        id: &'a Value,
+        method: &'a str,
+        params: Option<&'a Map<String, Value>>,
+    },
+    Notification { method: &'a str },
+    /// The client's answer to a server request.
+    Response,
+}
+
+/// A message that cannot be processed. `id` is set only when a valid request id was read; the
+/// answer is then an in-band JSON-RPC error, otherwise an HTTP 400 with an id-less error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Invalid {
+    pub id: Option<Value>,
+    pub code: i64,
+    pub message: String,
+}
+
+impl Invalid {
+    fn new(id: Option<&Value>, code: i64, message: &str) -> Self {
+        Invalid {
+            id: id.cloned(),
+            code,
+            message: message.to_string(),
+        }
+    }
+}
+
+/// MCP request ids are strings or integers; `null`, fractions, booleans, objects and arrays are not.
+fn is_valid_id(id: &Value) -> bool {
+    match id {
+        Value::String(_) => true,
+        Value::Number(n) => n.is_i64() || n.is_u64(),
+        _ => false,
+    }
+}
+
+/// Classifies a JSON-RPC 2.0 message: a request has a method and an id, a notification a method
+/// and no id, a response an id and exactly one of `result` / `error`. Params, when present, must
+/// be an object. Only `notifications/*` methods are accepted as notifications: any other method
+/// sent without an id is a request missing its id.
+pub fn classify(envelope: &Map<String, Value>) -> Result<Incoming<'_>, Invalid> {
+    let id = envelope.get("id");
+    let request_id = id.filter(|id| is_valid_id(id));
+    if envelope.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION) {
+        return Err(Invalid::new(request_id, INVALID_REQUEST, "Not a JSON-RPC 2.0 message"));
+    }
+    if id.is_some() && request_id.is_none() && envelope.contains_key("method") {
+        return Err(Invalid::new(None, INVALID_REQUEST, "The id must be a string or an integer"));
+    }
+
+    let Some(method) = envelope.get("method") else {
+        let has_result = envelope.contains_key("result");
+        let has_error = envelope.contains_key("error");
+        if !has_result && !has_error {
+            return Err(Invalid::new(request_id, INVALID_REQUEST, "Missing JSON-RPC method"));
+        }
+        // An error may answer a request whose id the client could not read.
+        let id_ok = request_id.is_some() || (has_error && id == Some(&Value::Null));
+        if has_result == has_error || !id_ok {
+            return Err(Invalid::new(None, INVALID_REQUEST, "Invalid JSON-RPC response"));
+        }
+        return Ok(Incoming::Response);
+    };
+    let Some(method) = method.as_str() else {
+        return Err(Invalid::new(request_id, INVALID_REQUEST, "The method must be a string"));
+    };
+    let params = match envelope.get("params") {
+        None => None,
+        Some(Value::Object(params)) => Some(params),
+        Some(_) => return Err(Invalid::new(request_id, INVALID_PARAMS, "Params must be an object")),
+    };
+    match request_id {
+        Some(id) => Ok(Incoming::Request { id, method, params }),
+        None if is_notification(method) => Ok(Incoming::Notification { method }),
+        None => Err(Invalid::new(None, INVALID_REQUEST, "Requests must have an id")),
+    }
+}
+
+/// Streamable HTTP: every message after `initialize` names the negotiated version in
+/// `MCP-Protocol-Version`. An absent header is accepted (the server then assumes 2025-03-26);
+/// an unsupported or malformed one is rejected with HTTP 400.
+pub fn check_protocol_version_header(value: Option<&str>) -> Result<(), String> {
+    match value {
+        None => Ok(()),
+        Some(v) if SUPPORTED_PROTOCOL_VERSIONS.contains(&v.trim()) => Ok(()),
+        Some(_) => Err(format!(
+            "Unsupported MCP-Protocol-Version header. Supported versions: {}",
+            SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+        )),
+    }
+}
+
+/// Checks the `initialize` parameters and returns the requested protocol version. Missing or
+/// mistyped fields are invalid params; a well-formed but unknown version is negotiated instead.
+pub fn initialize_protocol_version(
+    params: Option<&Map<String, Value>>,
+) -> Result<&str, &'static str> {
+    let params = params.ok_or("initialize requires params")?;
+    let version = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+        .ok_or("initialize params.protocolVersion must be a non-empty string")?;
+    if !params.get("capabilities").map_or(false, Value::is_object) {
+        return Err("initialize params.capabilities must be an object");
+    }
+    let client_info = params
+        .get("clientInfo")
+        .and_then(Value::as_object)
+        .ok_or("initialize params.clientInfo must be an object")?;
+    if !client_info.get("name").map_or(false, Value::is_string) {
+        return Err("initialize params.clientInfo.name must be a string");
+    }
+    if !client_info.get("version").map_or(false, Value::is_string) {
+        return Err("initialize params.clientInfo.version must be a string");
+    }
+    Ok(version)
+}
+
 pub fn result_envelope(id: &Value, result: Value) -> Value {
     json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "result": result })
 }
 
 pub fn error_envelope(id: &Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "error": { "code": code, "message": message } })
+}
+
+/// The JSON-RPC error body of an HTTP-level rejection. Without a request id the `id` member is
+/// left out, as Streamable HTTP allows for errors that answer no particular request.
+pub fn error_body(id: Option<&Value>, code: i64, message: &str) -> Value {
+    match id {
+        Some(id) => error_envelope(id, code, message),
+        None => json!({ "jsonrpc": JSONRPC_VERSION, "error": { "code": code, "message": message } }),
+    }
 }
 
 pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
@@ -78,7 +214,7 @@ pub fn tool_definition(name: &str, description: &str, session_store_enabled: boo
         },
         ARG_TASK_ID: {
             "type": "string",
-            "description": "task_id returned by a previous call whose state was input-required or auth-required. Pass it with context_id to answer the agent's follow-up question."
+            "description": "task_id returned by a previous call whose state was input-required or auth-required. Pass it, together with context_id when one was returned, to answer the agent's follow-up question."
         }
     });
     if session_store_enabled {
@@ -236,6 +372,108 @@ mod tests {
         assert_eq!(negotiate_protocol_version(Some("2025-03-26")), "2025-03-26");
         assert_eq!(negotiate_protocol_version(Some("1999-01-01")), "2025-06-18");
         assert_eq!(negotiate_protocol_version(None), "2025-06-18");
+    }
+
+    fn classify_json(value: Value) -> Result<String, Invalid> {
+        let envelope = value.as_object().expect("an object").clone();
+        classify(&envelope).map(|incoming| format!("{:?}", incoming))
+    }
+
+    #[test]
+    fn classifies_requests_notifications_and_responses_structurally() {
+        let ok = classify_json(json!({ "jsonrpc": "2.0", "id": "a", "method": "ping" })).unwrap();
+        assert!(ok.starts_with("Request"), "{}", ok);
+        let ok = classify_json(json!({ "jsonrpc": "2.0", "id": 0, "method": "tools/list", "params": {} })).unwrap();
+        assert!(ok.starts_with("Request"), "{}", ok);
+        let ok = classify_json(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).unwrap();
+        assert!(ok.starts_with("Notification"), "{}", ok);
+        assert_eq!(classify_json(json!({ "jsonrpc": "2.0", "id": 4, "result": {} })).unwrap(), "Response");
+        assert_eq!(
+            classify_json(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": 1, "message": "x" } })).unwrap(),
+            "Response"
+        );
+        // A notification method that carries an id is a request, and gets a JSON-RPC reply.
+        let ok = classify_json(json!({ "jsonrpc": "2.0", "id": 9, "method": "notifications/initialized" })).unwrap();
+        assert!(ok.starts_with("Request"), "{}", ok);
+    }
+
+    #[test]
+    fn rejects_invalid_envelopes_ids_and_params() {
+        // (message, expected id, expected code)
+        let cases: Vec<(Value, Option<Value>, i64)> = vec![
+            (json!({ "jsonrpc": "1.0", "id": 1, "method": "tools/call" }), Some(json!(1)), INVALID_REQUEST),
+            (json!({ "jsonrpc": 2, "id": 1, "method": "ping" }), Some(json!(1)), INVALID_REQUEST),
+            (json!({ "id": 1, "method": "ping" }), Some(json!(1)), INVALID_REQUEST),
+            (json!({ "jsonrpc": "2.0", "method": "ping" }), None, INVALID_REQUEST),
+            (json!({ "jsonrpc": "2.0", "method": "tools/call", "params": {} }), None, INVALID_REQUEST),
+            (json!({ "jsonrpc": "2.0", "id": null, "method": "ping" }), None, INVALID_REQUEST),
+            (json!({ "jsonrpc": "2.0", "id": { "a": 1 }, "method": "ping" }), None, INVALID_REQUEST),
+            (json!({ "jsonrpc": "2.0", "id": [1], "method": "ping" }), None, INVALID_REQUEST),
+            (json!({ "jsonrpc": "2.0", "id": true, "method": "ping" }), None, INVALID_REQUEST),
+            (json!({ "jsonrpc": "2.0", "id": 1.5, "method": "ping" }), None, INVALID_REQUEST),
+            (json!({ "jsonrpc": "2.0", "id": 1, "method": 7 }), Some(json!(1)), INVALID_REQUEST),
+            (json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": 3 }), Some(json!(1)), INVALID_PARAMS),
+            (json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": [1] }), Some(json!(1)), INVALID_PARAMS),
+            (json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": null }), Some(json!(1)), INVALID_PARAMS),
+            (json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": "x" }), None, INVALID_PARAMS),
+            (json!({ "jsonrpc": "2.0", "id": 1 }), Some(json!(1)), INVALID_REQUEST),
+            (json!({ "jsonrpc": "2.0", "id": 1, "result": {}, "error": {} }), None, INVALID_REQUEST),
+            (json!({ "jsonrpc": "2.0", "result": {} }), None, INVALID_REQUEST),
+            (json!({ "jsonrpc": "2.0", "id": null, "result": {} }), None, INVALID_REQUEST),
+        ];
+        for (message, id, code) in cases {
+            let invalid = classify_json(message.clone()).expect_err(&message.to_string());
+            assert_eq!(invalid.id, id, "{}", message);
+            assert_eq!(invalid.code, code, "{}", message);
+        }
+    }
+
+    #[test]
+    fn initialize_params_are_validated() {
+        let valid = json!({ "protocolVersion": "1999-01-01", "capabilities": {},
+                            "clientInfo": { "name": "c", "version": "1" } });
+        let params = valid.as_object().unwrap();
+        // A well-formed unknown version is negotiated, not rejected.
+        assert_eq!(initialize_protocol_version(Some(params)), Ok("1999-01-01"));
+
+        assert!(initialize_protocol_version(None).is_err());
+        for (key, bad) in [
+            ("protocolVersion", Value::Null),
+            ("protocolVersion", json!(20250618)),
+            ("protocolVersion", json!("")),
+            ("capabilities", Value::Null),
+            ("capabilities", json!([])),
+            ("clientInfo", Value::Null),
+            ("clientInfo", json!("c")),
+            ("clientInfo", json!({ "name": "c" })),
+            ("clientInfo", json!({ "version": "1" })),
+            ("clientInfo", json!({ "name": 1, "version": "1" })),
+        ] {
+            let mut params = valid.as_object().unwrap().clone();
+            if bad.is_null() {
+                params.remove(key);
+            } else {
+                params.insert(key.to_string(), bad.clone());
+            }
+            assert!(initialize_protocol_version(Some(&params)).is_err(), "{} = {}", key, bad);
+        }
+    }
+
+    #[test]
+    fn protocol_version_header_must_be_supported_when_present() {
+        assert!(check_protocol_version_header(None).is_ok());
+        for version in SUPPORTED_PROTOCOL_VERSIONS {
+            assert!(check_protocol_version_header(Some(version)).is_ok());
+        }
+        assert!(check_protocol_version_header(Some("1999-01-01")).is_err());
+        assert!(check_protocol_version_header(Some("garbage")).is_err());
+        assert!(check_protocol_version_header(Some("")).is_err());
+    }
+
+    #[test]
+    fn error_body_omits_a_missing_id() {
+        assert!(error_body(None, INVALID_REQUEST, "x").get("id").is_none());
+        assert_eq!(error_body(Some(&json!(3)), INVALID_REQUEST, "x")["id"], 3);
     }
 
     #[test]

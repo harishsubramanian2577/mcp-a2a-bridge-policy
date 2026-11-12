@@ -22,12 +22,56 @@ fn config(store: &str) -> String {
     .to_string()
 }
 
-fn agent(body: &str) -> Rc<TraceBackend<UnitHttpResponse>> {
-    Rc::new(TraceBackend::new(
-        UnitHttpResponse::new(200)
-            .with_header("content-type", "application/json")
-            .with_body(body.as_bytes().to_vec()),
-    ))
+type Agent = Rc<TraceBackend<Box<dyn Fn(UnitHttpRequest) -> UnitHttpResponse>>>;
+
+/// A mock agent that answers with `body`, relabelled with the JSON-RPC id of the request it
+/// receives, as a real agent would. The bridge checks that the answer matches its request.
+fn agent(body: &str) -> Agent {
+    agent_with("application/json", body.as_bytes().to_vec())
+}
+
+fn agent_with(content_type: &str, body: Vec<u8>) -> Agent {
+    let content_type = content_type.to_string();
+    Rc::new(TraceBackend::new(Box::new(move |request: UnitHttpRequest| {
+        let id = serde_json::from_slice::<Value>(request.body()).ok().and_then(|r| r.get("id").cloned());
+        let body = match id {
+            Some(id) if content_type.contains("event-stream") => relabel_sse(&body, &id),
+            Some(id) => relabel(&body, &id).unwrap_or_else(|| body.clone()),
+            None => body.clone(),
+        };
+        UnitHttpResponse::new(200).with_header("content-type", content_type.as_str()).with_body(body)
+    })))
+}
+
+/// A mock agent that always answers with exactly `body`.
+fn fixed_agent(body: &str) -> Agent {
+    let body = body.as_bytes().to_vec();
+    Rc::new(TraceBackend::new(Box::new(move |_| {
+        UnitHttpResponse::new(200).with_header("content-type", "application/json").with_body(body.clone())
+    })))
+}
+
+fn relabel(json: &[u8], id: &Value) -> Option<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(json).ok()?;
+    value.as_object_mut()?.get_mut("id").map(|old| *old = id.clone())?;
+    serde_json::to_vec(&value).ok()
+}
+
+fn relabel_sse(sse: &[u8], id: &Value) -> Vec<u8> {
+    let text = String::from_utf8_lossy(sse);
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(|line| match line.strip_prefix("data: ").and_then(|data| relabel(data.as_bytes(), id)) {
+            Some(json) => format!("data: {}", String::from_utf8(json).unwrap()),
+            None => line.to_string(),
+        })
+        .collect();
+    lines.join("\n").into_bytes()
+}
+
+fn initialize(id: i64) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "t", "version": "1" } } })
 }
 
 fn mcp_post(body: Value) -> UnitHttpRequest {
@@ -177,7 +221,7 @@ fn agent_json_rpc_error_becomes_tool_error() {
 
 #[test]
 fn a2a_requests_pass_through_untouched() {
-    let backend = agent(SAMPLE_RESPONSE);
+    let backend = fixed_agent(SAMPLE_RESPONSE);
     let mut tester = UnitTestBuilder::default()
         .with_config(config("disabled"))
         .with_backend(Rc::clone(&backend))
@@ -199,7 +243,7 @@ fn local_store_remembers_context_per_session() {
         .with_backend(Rc::clone(&backend))
         .with_entrypoint(crate::configure);
 
-    let init = tester.request(mcp_post(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} })));
+    let init = tester.request(mcp_post(initialize(1)));
     let session = init.header("mcp-session-id").expect("session issued").to_string();
 
     let call = |id| {
@@ -306,14 +350,6 @@ fn forward_path_joins_base_and_a2a_path() {
 }
 
 // ---- Issue #1: the converted answer always fits, and is the only thing the client receives.
-
-fn agent_with(content_type: &str, body: Vec<u8>) -> Rc<TraceBackend<UnitHttpResponse>> {
-    Rc::new(TraceBackend::new(
-        UnitHttpResponse::new(200)
-            .with_header("content-type", content_type)
-            .with_body(body),
-    ))
-}
 
 fn task_reply(context_id: &str, parts: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": "broker", "result": { "task": {
@@ -422,7 +458,7 @@ fn shared_config(version: &str, extra: Value) -> String {
     config.to_string()
 }
 
-fn shared_tester(version: &str, extra: Value, backend: &Rc<TraceBackend<UnitHttpResponse>>) -> pdk_unit::UnitTest {
+fn shared_tester(version: &str, extra: Value, backend: &Agent) -> pdk_unit::UnitTest {
     UnitTestBuilder::default()
         .metadata(|m| m.api_metadata.base_path = Some("/agent".to_string()))
         .with_config(shared_config(version, extra))
@@ -479,7 +515,7 @@ fn native_http_json_is_rejected_when_pass_through_is_off() {
 
 #[test]
 fn native_json_rpc_keeps_its_version_semantics() {
-    let backend = agent(SAMPLE_RESPONSE);
+    let backend = fixed_agent(SAMPLE_RESPONSE);
     // Bridge configured for v1 with an a2aPath; native calls must ignore both.
     let mut tester = shared_tester("1.0", json!({ "a2aPath": "/a2a" }), &backend);
 
@@ -538,7 +574,7 @@ fn translated_v03_call_drops_a_conflicting_client_version() {
 
 fn start_session(tester: &mut pdk_unit::UnitTest, headers: &[(&str, &str)]) -> String {
     let init = tester.request(with_headers(
-        mcp_post(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} })),
+        mcp_post(initialize(1)),
         headers,
     ));
     init.header("mcp-session-id").expect("session issued").to_string()
@@ -552,11 +588,22 @@ fn bound_config() -> String {
 
 fn call_context(
     tester: &mut pdk_unit::UnitTest,
-    backend: &Rc<TraceBackend<UnitHttpResponse>>,
+    backend: &Agent,
     headers: &[(&str, &str)],
 ) -> Value {
     tester.request(with_headers(mcp_post(tools_call(5, json!({ "message": "next" }))), headers));
     json_body(&backend.next().unwrap())["params"]["message"]["contextId"].clone()
+}
+
+/// Asserts that a `tools/call` with these headers gets `404 Session not found` and never reaches
+/// the agent.
+fn assert_session_not_found(tester: &mut pdk_unit::UnitTest, backend: &Agent, headers: &[(&str, &str)], why: &str) {
+    let response = tester.request(with_headers(mcp_post(tools_call(5, json!({ "message": "next" }))), headers));
+    assert_eq!(response.status_code(), 404, "{}", why);
+    let body = json_body(&response);
+    assert_eq!(body["id"], 5, "{}", why);
+    assert_eq!(body["error"]["code"], -32001, "{}", why);
+    assert!(backend.next().is_none(), "{}: the agent must not be called", why);
 }
 
 #[test]
@@ -567,7 +614,7 @@ fn identity_binding_is_enforced_not_relaxed() {
         .with_backend(Rc::clone(&backend))
         .with_entrypoint(crate::configure);
 
-    let anonymous = tester.request(mcp_post(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} })));
+    let anonymous = tester.request(mcp_post(initialize(1)));
     assert!(anonymous.header("mcp-session-id").is_none(), "no session without the identity header");
 
     let session = start_session(&mut tester, &[("client_id", "client-a")]);
@@ -576,13 +623,14 @@ fn identity_binding_is_enforced_not_relaxed() {
     assert_eq!(call_context(&mut tester, &backend, &owner), "59ec80cd-988c-47fd-8917-1f84dd3bd409");
 
     let omitted = [("mcp-session-id", session.as_str())];
-    assert_eq!(call_context(&mut tester, &backend, &omitted), Value::Null, "identity omitted");
+    assert_session_not_found(&mut tester, &backend, &omitted, "identity omitted");
     let changed = [("mcp-session-id", session.as_str()), ("client_id", "client-b")];
-    assert_eq!(call_context(&mut tester, &backend, &changed), Value::Null, "identity changed");
+    assert_session_not_found(&mut tester, &backend, &changed, "identity changed");
+    assert_eq!(call_context(&mut tester, &backend, &owner), "59ec80cd-988c-47fd-8917-1f84dd3bd409", "owner unaffected");
 }
 
 #[test]
-fn unissued_session_ids_are_ignored() {
+fn unissued_session_ids_are_not_found() {
     let backend = agent(SAMPLE_RESPONSE);
     let mut tester = UnitTestBuilder::default()
         .with_config(config("local"))
@@ -590,8 +638,9 @@ fn unissued_session_ids_are_ignored() {
         .with_entrypoint(crate::configure);
 
     let planted = [("mcp-session-id", "chosen-by-the-caller")];
-    assert_eq!(call_context(&mut tester, &backend, &planted), Value::Null);
-    assert_eq!(call_context(&mut tester, &backend, &planted), Value::Null, "nothing was stored for it");
+    assert_session_not_found(&mut tester, &backend, &planted, "never issued");
+    assert_session_not_found(&mut tester, &backend, &planted, "nothing was stored for it");
+    assert_eq!(call_context(&mut tester, &backend, &[]), Value::Null, "calls without a session still work");
 }
 
 #[test]
@@ -612,7 +661,7 @@ fn delete_ends_a_session_only_for_its_owner() {
     assert_eq!(call_context(&mut tester, &backend, &owner), "59ec80cd-988c-47fd-8917-1f84dd3bd409", "still alive");
 
     assert_eq!(tester.request(delete(&owner)).status_code(), 204);
-    assert_eq!(call_context(&mut tester, &backend, &owner), Value::Null, "ended");
+    assert_session_not_found(&mut tester, &backend, &owner, "ended");
     assert_eq!(tester.request(delete(&owner)).status_code(), 404);
 }
 
@@ -635,4 +684,287 @@ fn session_ids_are_random_and_ignore_tracing_headers() {
     tester.request(with_headers(mcp_post(tools_call(1, json!({ "message": "hi" }))), &fixed));
     let message_id = json_body(&backend.next().unwrap())["params"]["message"]["messageId"].clone();
     assert!(!message_id.as_str().unwrap().contains("same-request-id"));
+}
+
+fn config_with(store: &str, extra: Value) -> String {
+    let mut config: Value = serde_json::from_str(&config(store)).unwrap();
+    config.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    config.to_string()
+}
+
+fn tester_for(config: String, backend: &Agent) -> pdk_unit::UnitTest {
+    UnitTestBuilder::default()
+        .with_config(config)
+        .with_backend(Rc::clone(backend))
+        .with_entrypoint(crate::configure)
+}
+
+// ---- Issue #2: envelopes, ids, params and initialize are validated before anything runs.
+
+#[test]
+fn invalid_envelopes_get_errors_and_never_reach_the_agent() {
+    let backend = agent(SAMPLE_RESPONSE);
+    let mut tester = tester_for(config("local"), &backend);
+    let call = |extra: Value| {
+        let mut message = tools_call(1, json!({ "message": "hi" }));
+        message.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        message
+    };
+
+    // (message, HTTP status, JSON-RPC code, id in the error)
+    let cases = [
+        (call(json!({ "jsonrpc": "1.0" })), 200, -32600, json!(1)),
+        (call(json!({ "id": { "a": 1 } })), 400, -32600, Value::Null),
+        (call(json!({ "id": null })), 400, -32600, Value::Null),
+        (call(json!({ "id": 1.5 })), 400, -32600, Value::Null),
+        (call(json!({ "params": [1] })), 200, -32602, json!(1)),
+        (json!({ "jsonrpc": "2.0", "id": 2, "method": "ping", "params": 5 }), 200, -32602, json!(2)),
+        (json!({ "jsonrpc": "2.0", "id": 3, "method": 7 }), 200, -32600, json!(3)),
+        (json!({ "jsonrpc": "2.0", "method": "ping" }), 400, -32600, Value::Null),
+        (json!({ "jsonrpc": "2.0", "method": "tools/call", "params": { "name": "ask_agent" } }), 400, -32600, Value::Null),
+        (json!({ "jsonrpc": "2.0", "id": 4 }), 200, -32600, json!(4)),
+        (json!({ "jsonrpc": "2.0", "id": 5, "result": {}, "error": { "code": 1, "message": "x" } }), 400, -32600, Value::Null),
+    ];
+    for (message, status, code, id) in cases {
+        let response = tester.request(mcp_post(message.clone()));
+        assert_eq!(response.status_code(), status, "{}", message);
+        let body = json_body(&response);
+        assert_eq!(body["jsonrpc"], "2.0", "{}", message);
+        assert_eq!(body["error"]["code"], code, "{}", message);
+        assert_eq!(body.get("id").cloned().unwrap_or(Value::Null), id, "{}", message);
+        if id.is_null() {
+            assert!(body.get("id").is_none(), "an unknown id is omitted: {}", message);
+        }
+    }
+    assert!(backend.next().is_none(), "invalid input has no upstream side effects");
+}
+
+#[test]
+fn notifications_and_responses_are_told_apart_by_structure() {
+    let backend = agent("{}");
+    let mut tester = tester_for(config("disabled"), &backend);
+
+    // A notification-method message with an id is a request: it gets a reply.
+    let with_id = tester.request(mcp_post(json!({ "jsonrpc": "2.0", "id": 4, "method": "notifications/initialized" })));
+    assert_eq!(with_id.status_code(), 200);
+    assert_eq!(json_body(&with_id)["id"], 4);
+    assert_eq!(json_body(&with_id)["error"]["code"], -32601);
+
+    // Notifications and client responses get a bodyless 202.
+    for message in [
+        json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 1 } }),
+        json!({ "jsonrpc": "2.0", "id": "srv-1", "result": {} }),
+        json!({ "jsonrpc": "2.0", "id": "srv-2", "error": { "code": -1, "message": "declined" } }),
+    ] {
+        let response = tester.request(mcp_post(message.clone()));
+        assert_eq!(response.status_code(), 202, "{}", message);
+        assert!(response.body().is_empty(), "{}", message);
+    }
+    assert!(backend.next().is_none());
+}
+
+#[test]
+fn initialize_requires_well_formed_params_but_negotiates_unknown_versions() {
+    let backend = agent("{}");
+    let mut tester = tester_for(config("local"), &backend);
+    let init = |params: Value| mcp_post(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params }));
+    let client = json!({ "name": "t", "version": "1" });
+
+    for params in [
+        json!({}),
+        json!({ "protocolVersion": 20250618, "capabilities": {}, "clientInfo": client }),
+        json!({ "protocolVersion": "", "capabilities": {}, "clientInfo": client }),
+        json!({ "protocolVersion": "2025-06-18", "clientInfo": client }),
+        json!({ "protocolVersion": "2025-06-18", "capabilities": [], "clientInfo": client }),
+        json!({ "protocolVersion": "2025-06-18", "capabilities": {} }),
+        json!({ "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "t" } }),
+    ] {
+        let response = tester.request(init(params.clone()));
+        assert_eq!(json_body(&response)["error"]["code"], -32602, "{}", params);
+        assert!(response.header("mcp-session-id").is_none(), "no session for {}", params);
+    }
+
+    // A well-formed but unsupported version is negotiated, not rejected.
+    let response = tester.request(init(json!({ "protocolVersion": "1999-01-01", "capabilities": {}, "clientInfo": client })));
+    assert_eq!(json_body(&response)["result"]["protocolVersion"], "2025-06-18");
+    assert!(response.header("mcp-session-id").is_some());
+    assert!(backend.next().is_none());
+}
+
+// ---- Issue #3: an unsupported MCP-Protocol-Version header is rejected with 400.
+
+#[test]
+fn unsupported_protocol_version_header_is_rejected_and_the_client_can_recover() {
+    let backend = agent(SAMPLE_RESPONSE);
+    let mut tester = tester_for(config("disabled"), &backend);
+    let list = json!({ "jsonrpc": "2.0", "id": "l", "method": "tools/list" });
+    let version = |message: &Value, v: &str| with_headers(mcp_post(message.clone()), &[("mcp-protocol-version", v)]);
+
+    for bad in ["1999-01-01", "2025-06-18, 2025-03-26", "latest", ""] {
+        let response = tester.request(version(&list, bad));
+        assert_eq!(response.status_code(), 400, "{:?}", bad);
+        assert_eq!(json_body(&response)["error"]["code"], -32600);
+        assert_eq!(json_body(&response)["id"], "l");
+    }
+    let call = tester.request(version(&tools_call(1, json!({ "message": "hi" })), "1999-01-01"));
+    assert_eq!(call.status_code(), 400);
+    assert!(backend.next().is_none(), "the tool call did not run");
+
+    // Supported or absent headers are accepted, so the client recovers by retrying.
+    for good in ["2025-06-18", "2025-03-26", "2024-11-05"] {
+        assert_eq!(tester.request(version(&list, good)).status_code(), 200, "{}", good);
+    }
+    assert_eq!(tester.request(mcp_post(list.clone())).status_code(), 200);
+    let retried = tester.request(version(&tools_call(2, json!({ "message": "hi" })), "2025-06-18"));
+    assert_eq!(json_body(&retried)["result"]["isError"], false);
+    assert!(backend.next().is_some());
+
+    // initialize negotiates in its body, and native A2A has no MCP header semantics.
+    let init = tester.request(version(&initialize(3), "1999-01-01"));
+    assert_eq!(json_body(&init)["result"]["protocolVersion"], "2025-06-18");
+    let native = json!({ "jsonrpc": "2.0", "id": 9, "method": "SendMessage", "params": {} });
+    tester.request(version(&native, "1999-01-01"));
+    assert_eq!(json_body(&backend.next().expect("native A2A passes through")), native);
+}
+
+#[test]
+fn delete_checks_the_protocol_version_header() {
+    let backend = agent(SAMPLE_RESPONSE);
+    let mut tester = tester_for(config("local"), &backend);
+    let session = start_session(&mut tester, &[]);
+    let delete = |version: &str| {
+        with_headers(UnitHttpRequest::delete().with_path("/mcp"), &[("mcp-session-id", session.as_str()), ("mcp-protocol-version", version)])
+    };
+
+    assert_eq!(tester.request(delete("1999-01-01")).status_code(), 400);
+    assert_eq!(tester.request(delete("2025-06-18")).status_code(), 204, "the session was still live");
+}
+
+// ---- Issue #5: a terminated session is gone: 404, and it is not revived.
+
+#[test]
+fn terminated_session_gets_404_and_initialize_starts_a_new_one() {
+    let backend = agent(SAMPLE_RESPONSE);
+    let mut tester = tester_for(config("local"), &backend);
+    let session = start_session(&mut tester, &[]);
+    let headers = [("mcp-session-id", session.as_str())];
+
+    assert_eq!(call_context(&mut tester, &backend, &headers), Value::Null);
+    let delete = with_headers(UnitHttpRequest::delete().with_path("/mcp"), &headers);
+    assert_eq!(tester.request(delete).status_code(), 204);
+
+    assert_session_not_found(&mut tester, &backend, &headers, "after DELETE");
+    for method in ["ping", "tools/list"] {
+        let response = tester.request(with_headers(mcp_post(json!({ "jsonrpc": "2.0", "id": 8, "method": method })), &headers));
+        assert_eq!(response.status_code(), 404, "{}", method);
+    }
+    let notified = tester.request(with_headers(
+        mcp_post(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })),
+        &headers,
+    ));
+    assert_eq!(notified.status_code(), 404);
+    assert_eq!(json_body(&notified).get("id"), None);
+
+    let fresh = start_session(&mut tester, &headers);
+    assert_ne!(fresh, session);
+    assert_eq!(call_context(&mut tester, &backend, &[("mcp-session-id", fresh.as_str())]), Value::Null);
+    assert_session_not_found(&mut tester, &backend, &headers, "the old id stays ended");
+}
+
+#[test]
+fn session_ids_are_ignored_without_a_session_store() {
+    let backend = agent(SAMPLE_RESPONSE);
+    let mut tester = tester_for(config("disabled"), &backend);
+
+    let response = tester.request(with_headers(
+        mcp_post(tools_call(1, json!({ "message": "hi" }))),
+        &[("mcp-session-id", "from-another-server")],
+    ));
+    assert_eq!(response.status_code(), 200);
+    assert!(backend.next().is_some());
+}
+
+// ---- Issue #6: an answer that is not a valid, correlated A2A result is a tool error.
+
+#[test]
+fn malformed_or_uncorrelated_agent_answers_are_tool_errors() {
+    let task = |id: Value| json!({ "jsonrpc": "2.0", "id": id, "result": { "task": {
+        "id": "t-1", "contextId": "ctx-wrong", "status": { "state": "TASK_STATE_COMPLETED" } } } });
+    let answers = [
+        task(json!("another-request")).to_string(),
+        task(json!(2)).to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":42}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"message":null}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":null}}"#.to_string(),
+        r#"{"jsonrpc":"1.0","id":1,"result":{"message":{"messageId":"m","role":"ROLE_AGENT","parts":[]}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":1,"message":"x"}}"#.to_string(),
+    ];
+    for answer in answers {
+        let backend = fixed_agent(&answer);
+        let mut tester = tester_for(config("local"), &backend);
+        let session = start_session(&mut tester, &[]);
+        let headers = [("mcp-session-id", session.as_str())];
+
+        let response = tester.request(with_headers(mcp_post(tools_call(1, json!({ "message": "hi" }))), &headers));
+        let mcp = json_body(&response);
+        assert_eq!(mcp["id"], 1, "{}", answer);
+        assert_eq!(mcp["result"]["isError"], true, "{}", answer);
+        assert!(mcp["result"]["content"][0]["text"].as_str().unwrap().contains("invalid response"), "{}", answer);
+        backend.next();
+
+        // Nothing from the invalid answer is remembered.
+        tester.request(with_headers(mcp_post(tools_call(1, json!({ "message": "again" }))), &headers));
+        assert!(json_body(&backend.next().unwrap())["params"]["message"].get("contextId").is_none(), "{}", answer);
+    }
+}
+
+// ---- Issue #9: a task without a context id can still be continued.
+
+#[test]
+fn input_required_task_without_context_keeps_its_continuation() {
+    let reply = json!({ "jsonrpc": "2.0", "id": 0, "result": { "task": { "id": "t9",
+        "status": { "state": "TASK_STATE_INPUT_REQUIRED",
+                    "message": { "messageId": "m", "role": "ROLE_AGENT", "parts": [{ "text": "Which account?" }] } } } } });
+    let backend = agent(&reply.to_string());
+    let mut tester = tester_for(config_with("local", json!({ "includeStructuredContent": false })), &backend);
+    let session = start_session(&mut tester, &[]);
+    let headers = [("mcp-session-id", session.as_str())];
+
+    let response = tester.request(with_headers(mcp_post(tools_call(1, json!({ "message": "pay the bill" }))), &headers));
+    let mcp = json_body(&response);
+    assert!(mcp["result"].get("structuredContent").is_none());
+    let text: Vec<&str> = mcp["result"]["content"].as_array().unwrap().iter().filter_map(|c| c["text"].as_str()).collect();
+    assert_eq!(text[0], "Which account?");
+    assert!(text[1].contains("input-required") && text[1].contains("task_id=\"t9\""), "{}", text[1]);
+    assert!(!text[1].contains("context_id"), "{}", text[1]);
+    backend.next();
+
+    // The client answers with the task id alone.
+    tester.request(mcp_post(tools_call(2, json!({ "message": "Checking", "task_id": "t9" }))));
+    let outbound = json_body(&backend.next().unwrap());
+    assert_eq!(outbound["params"]["message"]["taskId"], "t9");
+    assert!(outbound["params"]["message"].get("contextId").is_none());
+
+    // Or relies on the session, which remembered the pending task.
+    tester.request(with_headers(mcp_post(tools_call(3, json!({ "message": "Checking" }))), &headers));
+    let outbound = json_body(&backend.next().unwrap());
+    assert_eq!(outbound["params"]["message"]["taskId"], "t9");
+}
+
+#[test]
+fn auth_required_task_without_context_is_not_answered_with_secrets() {
+    let reply = json!({ "jsonrpc": "2.0", "id": 0, "result": { "task": { "id": "t-auth",
+        "status": { "state": "TASK_STATE_AUTH_REQUIRED",
+                    "message": { "messageId": "m", "role": "ROLE_AGENT", "parts": [{ "text": "Sign in to the CRM." }] } } } } });
+    let backend = agent(&reply.to_string());
+    let mut tester = tester_for(config("disabled"), &backend);
+
+    let mcp = json_body(&tester.request(mcp_post(tools_call(1, json!({ "message": "show my deals" })))));
+    assert_eq!(mcp["result"]["structuredContent"]["state"], "auth-required");
+    assert_eq!(mcp["result"]["structuredContent"]["taskId"], "t-auth");
+    let hint = mcp["result"]["content"][1]["text"].as_str().unwrap();
+    assert!(hint.contains("task_id=\"t-auth\""), "{}", hint);
+    assert!(hint.contains("never send passwords, tokens or other secrets"), "{}", hint);
+    assert!(hint.contains("replying does not grant authorization"), "{}", hint);
 }

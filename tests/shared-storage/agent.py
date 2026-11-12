@@ -2,14 +2,18 @@
 """Mock A2A v1 agent. Records every SendMessage and answers with a completed task.
 
 A message without a contextId starts a new context ("ctx-1", "ctx-2", ...); a message with one
-continues it. GET /requests returns what was received; DELETE /requests clears it.
+continues it. A message whose text starts with "slow" is answered after SLOW_SECONDS, so a test can
+end the session while the call is in flight. GET /requests returns what was received; DELETE
+/requests clears it.
 """
 import itertools
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 received = []
 contexts = itertools.count(1)
+SLOW_SECONDS = 4
 
 
 class Agent(BaseHTTPRequestHandler):
@@ -45,6 +49,8 @@ class Agent(BaseHTTPRequestHandler):
         received.append({"path": self.path, "message": message})
         context_id = message.get("contextId") or f"ctx-{next(contexts)}"
         text = message.get("parts", [{}])[0].get("text", "")
+        if text.startswith("slow"):
+            time.sleep(SLOW_SECONDS)
         self._send(200, {
             "jsonrpc": "2.0",
             "id": request.get("id"),

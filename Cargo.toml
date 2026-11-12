@@ -1,6 +1,6 @@
 [package]
 name = "mcp_a2a_bridge_policy"
-version = "1.1.0"
+version = "1.2.0"
 rust-version = "1.88.0"
 edition = "2021"
 description = "Exposes an A2A agent as an MCP tool by transcoding MCP tools/call to A2A SendMessage and back."
