@@ -49,13 +49,17 @@ pub fn is_a2a_method(method: &str) -> bool {
 pub fn is_http_json_route(http_method: &str, path: &str) -> bool {
     let path = path.split(['?', '#']).next().unwrap_or("");
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let tail = |n: usize| segments.len().checked_sub(n).map(|start| &segments[start..]);
+    let tail = |n: usize| {
+        segments
+            .len()
+            .checked_sub(n)
+            .map(|start| &segments[start..])
+    };
 
     let action = segments.last().and_then(|last| last.rsplit_once(':'));
     if let Some((target, verb)) = action {
-        let task_action = !target.is_empty()
-            && segments.len() >= 2
-            && segments[segments.len() - 2] == "tasks";
+        let task_action =
+            !target.is_empty() && segments.len() >= 2 && segments[segments.len() - 2] == "tasks";
         return match (http_method, target, verb) {
             ("POST", "message", "send" | "stream") => true,
             ("POST", _, "cancel") => task_action,
@@ -307,7 +311,10 @@ fn optional_string(
 fn parts(obj: &Map<String, Value>, what: &str) -> Result<Vec<Value>, String> {
     match obj.get("parts") {
         Some(Value::Array(parts)) if parts.iter().all(Value::is_object) => Ok(parts.clone()),
-        Some(Value::Array(_)) => Err(invalid(format!("{} has a part that is not an object", what))),
+        Some(Value::Array(_)) => Err(invalid(format!(
+            "{} has a part that is not an object",
+            what
+        ))),
         _ => Err(invalid(format!("{} has no parts array", what))),
     }
 }
@@ -322,8 +329,8 @@ fn task_status(obj: &Map<String, Value>, what: &str) -> Result<(TaskState, Vec<V
         .get("state")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid(format!("the {} status has no state", what)))?;
-    let state =
-        TaskState::parse(raw).ok_or_else(|| invalid(format!("unrecognised task state {:?}", raw)))?;
+    let state = TaskState::parse(raw)
+        .ok_or_else(|| invalid(format!("unrecognised task state {:?}", raw)))?;
     let message_parts = match status.get("message") {
         None | Some(Value::Null) => Vec::new(),
         Some(message) => parts(object(message, "the status message")?, "the status message")?,
@@ -409,10 +416,11 @@ impl Snapshot {
             Some(Value::Bool(append)) => *append,
             Some(_) => return Err(invalid("artifact update append is not a boolean")),
         };
-        let existing = new
-            .id
-            .as_ref()
-            .and_then(|id| self.artifacts.iter().position(|a| a.id.as_ref() == Some(id)));
+        let existing = new.id.as_ref().and_then(|id| {
+            self.artifacts
+                .iter()
+                .position(|a| a.id.as_ref() == Some(id))
+        });
         match existing {
             Some(i) if append => self.artifacts[i].parts.extend(new.parts),
             Some(i) => self.artifacts[i] = new,
@@ -436,8 +444,8 @@ impl Snapshot {
 
 fn task_snapshot(value: &Value) -> Result<Snapshot, String> {
     let task = object(value, "the task")?;
-    let task_id = optional_string(task, "id", "the task")?
-        .ok_or_else(|| invalid("the task has no id"))?;
+    let task_id =
+        optional_string(task, "id", "the task")?.ok_or_else(|| invalid("the task has no id"))?;
     let (state, status_parts) = task_status(task, "task")?;
     let artifacts = match task.get("artifacts") {
         None | Some(Value::Null) => Vec::new(),
@@ -587,7 +595,11 @@ fn sse_event_data(body: &[u8]) -> Result<Vec<String>, String> {
     let mut data = String::new();
     while let Some(end) = rest.find(['\r', '\n']) {
         let line = &rest[..end];
-        let next = if rest[end..].starts_with("\r\n") { end + 2 } else { end + 1 };
+        let next = if rest[end..].starts_with("\r\n") {
+            end + 2
+        } else {
+            end + 1
+        };
         rest = &rest[next..];
         if line.is_empty() {
             if !data.is_empty() {
@@ -736,9 +748,7 @@ fn continuation_hint(reply: &AgentReply, tool_name: &str) -> Option<String> {
         },
         _ => format!(
             "[a2a state={}] To continue this conversation, call {} with context_id=\"{}\".",
-            state,
-            tool_name,
-            context?
+            state, tool_name, context?
         ),
     })
 }
@@ -747,10 +757,16 @@ fn continuation_hint(reply: &AgentReply, tool_name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    const SAMPLE_RESPONSE: &str = include_str!("../tests/fixtures/a2a_v1_send_message_response.json");
+    const SAMPLE_RESPONSE: &str =
+        include_str!("../tests/fixtures/a2a_v1_send_message_response.json");
 
     fn parse_json(body: &Value, expected_id: &Value) -> Result<AgentReply, String> {
-        parse_agent_response(200, "application/json", body.to_string().as_bytes(), expected_id)
+        parse_agent_response(
+            200,
+            "application/json",
+            body.to_string().as_bytes(),
+            expected_id,
+        )
     }
 
     fn parse_sse(body: &str) -> Result<AgentReply, String> {
@@ -759,7 +775,10 @@ mod tests {
 
     /// One SSE event carrying a JSON-RPC result with id 1.
     fn event(result: Value) -> String {
-        format!("data: {}\n\n", json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+        format!(
+            "data: {}\n\n",
+            json!({ "jsonrpc": "2.0", "id": 1, "result": result })
+        )
     }
 
     #[test]
@@ -789,7 +808,14 @@ mod tests {
 
     #[test]
     fn builds_v03_request_with_continuation_ids() {
-        let req = build_send_message(A2aVersion::V03, &json!(7), "m1", "yes", Some("c1"), Some("t1"));
+        let req = build_send_message(
+            A2aVersion::V03,
+            &json!(7),
+            "m1",
+            "yes",
+            Some("c1"),
+            Some("t1"),
+        );
         assert_eq!(req["method"], "message/send");
         assert_eq!(req["id"], 7);
         let message = &req["params"]["message"];
@@ -810,11 +836,22 @@ mod tests {
 
     #[test]
     fn parses_broker_sample_completed_task_with_data_part() {
-        let reply =
-            parse_agent_response(200, "application/json", SAMPLE_RESPONSE.as_bytes(), &json!("broker-1")).unwrap();
+        let reply = parse_agent_response(
+            200,
+            "application/json",
+            SAMPLE_RESPONSE.as_bytes(),
+            &json!("broker-1"),
+        )
+        .unwrap();
         assert_eq!(reply.state, TaskState::Completed);
-        assert_eq!(reply.context_id.as_deref(), Some("59ec80cd-988c-47fd-8917-1f84dd3bd409"));
-        assert_eq!(reply.task_id.as_deref(), Some("94da0605-5da3-4eaf-8aae-a34cea57ddb6"));
+        assert_eq!(
+            reply.context_id.as_deref(),
+            Some("59ec80cd-988c-47fd-8917-1f84dd3bd409")
+        );
+        assert_eq!(
+            reply.task_id.as_deref(),
+            Some("94da0605-5da3-4eaf-8aae-a34cea57ddb6")
+        );
         assert_eq!(reply.data.len(), 1);
         assert_eq!(reply.data[0]["id"], "100200300");
         assert!(reply.texts[0].contains("SOP 2.2"));
@@ -822,12 +859,20 @@ mod tests {
 
     #[test]
     fn maps_sample_to_mcp_tool_result() {
-        let reply =
-            parse_agent_response(200, "application/json", SAMPLE_RESPONSE.as_bytes(), &json!("broker-1")).unwrap();
+        let reply = parse_agent_response(
+            200,
+            "application/json",
+            SAMPLE_RESPONSE.as_bytes(),
+            &json!("broker-1"),
+        )
+        .unwrap();
         let result = tool_result_from_reply(&reply, "ask_agent", true);
         assert_eq!(result["isError"], false);
         assert_eq!(result["structuredContent"]["state"], "completed");
-        assert_eq!(result["structuredContent"]["contextId"], "59ec80cd-988c-47fd-8917-1f84dd3bd409");
+        assert_eq!(
+            result["structuredContent"]["contextId"],
+            "59ec80cd-988c-47fd-8917-1f84dd3bd409"
+        );
         assert_eq!(result["structuredContent"]["data"][0]["spaceKey"], "SAMPLE");
         let hint = result["content"][1]["text"].as_str().unwrap();
         assert!(hint.contains("context_id=\"59ec80cd-988c-47fd-8917-1f84dd3bd409\""));
@@ -849,7 +894,11 @@ mod tests {
         let result = tool_result_from_reply(&reply, "ask_agent", true);
         assert_eq!(result["isError"], false);
         let hint = result["content"][1]["text"].as_str().unwrap();
-        assert!(hint.contains("context_id=\"c9\" and task_id=\"t9\""), "{}", hint);
+        assert!(
+            hint.contains("context_id=\"c9\" and task_id=\"t9\""),
+            "{}",
+            hint
+        );
     }
 
     #[test]
@@ -875,7 +924,10 @@ mod tests {
 
         let v03 = json!({ "jsonrpc": "2.0", "id": 1, "result": {
             "kind": "message", "role": "agent", "parts": [{ "kind": "text", "text": "hi" }] }});
-        assert_eq!(parse_json(&v03, &json!(1)).unwrap().texts, vec!["hi".to_string()]);
+        assert_eq!(
+            parse_json(&v03, &json!(1)).unwrap().texts,
+            vec!["hi".to_string()]
+        );
     }
 
     #[test]
@@ -885,7 +937,9 @@ mod tests {
             "status": { "state": "TASK_STATE_FAILED", "message": { "parts": [{ "text": "boom" }] } }
         }}});
         let reply = parse_json(&body, &json!(1)).unwrap();
-        assert!(tool_result_from_reply(&reply, "ask_agent", true)["isError"].as_bool().unwrap());
+        assert!(tool_result_from_reply(&reply, "ask_agent", true)["isError"]
+            .as_bool()
+            .unwrap());
     }
 
     #[test]
@@ -894,11 +948,21 @@ mod tests {
         let err = parse_json(&body, &json!(1)).unwrap_err();
         assert_eq!(err, "A2A error -32001: Task not found");
 
-        let err = parse_agent_response(401, "application/json", body.to_string().as_bytes(), &json!(1)).unwrap_err();
+        let err = parse_agent_response(
+            401,
+            "application/json",
+            body.to_string().as_bytes(),
+            &json!(1),
+        )
+        .unwrap_err();
         assert!(err.starts_with("A2A error -32001"));
 
-        let err = parse_agent_response(502, "text/html", b"<html>Bad gateway</html>", &json!(1)).unwrap_err();
-        assert_eq!(err, "The A2A agent returned HTTP 502: <html>Bad gateway</html>");
+        let err = parse_agent_response(502, "text/html", b"<html>Bad gateway</html>", &json!(1))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "The A2A agent returned HTTP 502: <html>Bad gateway</html>"
+        );
     }
 
     // Issue #6: malformed results are tool errors, not completed answers.
@@ -927,11 +991,15 @@ mod tests {
             task(json!({ "id": "t", "status": { "state": "TASK_STATE_UNSPECIFIED" } })),
             task(json!({ "id": "t", "status": { "state": "done" } })),
             task(json!({ "id": "t", "status": { "state": "completed", "message": "hi" } })),
-            task(json!({ "id": "t", "status": { "state": "completed", "message": { "parts": null } } })),
+            task(
+                json!({ "id": "t", "status": { "state": "completed", "message": { "parts": null } } }),
+            ),
             task(json!({ "id": "t", "contextId": 5, "status": { "state": "completed" } })),
             task(json!({ "id": "t", "status": { "state": "completed" }, "artifacts": {} })),
             task(json!({ "id": "t", "status": { "state": "completed" }, "artifacts": [{}] })),
-            task(json!({ "id": "t", "status": { "state": "completed" }, "artifacts": [{ "parts": [null] }] })),
+            task(
+                json!({ "id": "t", "status": { "state": "completed" }, "artifacts": [{ "parts": [null] }] }),
+            ),
         ] {
             let body = json!({ "jsonrpc": "2.0", "id": 1, "result": result });
             let err = parse_json(&body, &json!(1)).expect_err(&result.to_string());
@@ -960,7 +1028,10 @@ mod tests {
         }
         // An error the agent could not correlate may carry a null id.
         let body = json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "Parse error" } });
-        assert_eq!(parse_json(&body, &json!(1)).unwrap_err(), "A2A error -32700: Parse error");
+        assert_eq!(
+            parse_json(&body, &json!(1)).unwrap_err(),
+            "A2A error -32700: Parse error"
+        );
         // String ids are compared exactly.
         let body = json!({ "jsonrpc": "2.0", "id": "abc", "result": ok });
         assert!(parse_json(&body, &json!("abc")).is_ok());
@@ -1008,7 +1079,10 @@ mod tests {
         assert_eq!(reply.data, vec![json!({ "approved": false })]);
         assert_eq!(reply.texts, vec![json!({ "approved": false }).to_string()]);
         let result = tool_result_from_reply(&reply, "ask_agent", true);
-        assert_eq!(result["structuredContent"]["data"], json!([{ "approved": false }]));
+        assert_eq!(
+            result["structuredContent"]["data"],
+            json!([{ "approved": false }])
+        );
 
         // append: true extends; interleaved ids keep their own parts and order of first sight.
         let body = [
@@ -1023,13 +1097,21 @@ mod tests {
         let reply = parse_sse(&body).unwrap();
         assert_eq!(
             reply.data,
-            vec![json!({ "approved": "initial" }), json!("a2"), json!("a3"), json!("b1"), json!("b2")]
+            vec![
+                json!({ "approved": "initial" }),
+                json!("a2"),
+                json!("a3"),
+                json!("b1"),
+                json!("b2")
+            ]
         );
 
         // v0.3 kinds follow the same rules.
         let v03 = |id: &str, text: &str, append: bool| {
-            event(json!({ "kind": "artifact-update", "taskId": "t", "contextId": "c", "append": append,
-                "artifact": { "artifactId": id, "parts": [{ "kind": "text", "text": text }] } }))
+            event(
+                json!({ "kind": "artifact-update", "taskId": "t", "contextId": "c", "append": append,
+                "artifact": { "artifactId": id, "parts": [{ "kind": "text", "text": text }] } }),
+            )
         };
         let body = [
             event(json!({ "kind": "task", "id": "t", "contextId": "c", "status": { "state": "working" } })),
@@ -1041,7 +1123,10 @@ mod tests {
         ]
         .concat();
         let reply = parse_sse(&body).unwrap();
-        assert_eq!(reply.texts, vec!["final".to_string(), " answer".to_string()]);
+        assert_eq!(
+            reply.texts,
+            vec!["final".to_string(), " answer".to_string()]
+        );
     }
 
     #[test]
@@ -1061,9 +1146,10 @@ mod tests {
     // Issue #8: SSE framing and corrupt events.
     #[test]
     fn sse_accepts_every_line_ending_bom_comments_and_multiline_data() {
-        let task = json!({ "jsonrpc": "2.0", "id": 1, "result": { "task": { "id": "t", "contextId": "c",
+        let task =
+            json!({ "jsonrpc": "2.0", "id": 1, "result": { "task": { "id": "t", "contextId": "c",
             "status": { "state": "TASK_STATE_WORKING" } } } })
-        .to_string();
+            .to_string();
         let artifact = json!({ "jsonrpc": "2.0", "id": 1, "result": { "artifactUpdate": {
             "artifact": { "artifactId": "a", "parts": [{ "text": "answer" }] } } } })
         .to_string();
@@ -1095,23 +1181,53 @@ mod tests {
             "artifacts": [{ "parts": [{ "text": "earlier answer" }] }] } }));
         for (case, tail) in [
             ("malformed JSON", "data: {not json\n\n".to_string()),
-            ("non-JSON-RPC envelope", "data: {\"result\":{}}\n\n".to_string()),
-            ("event without result or error", "data: {\"jsonrpc\":\"2.0\",\"id\":1}\n\n".to_string()),
-            ("result for another request", "data: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"message\":{\"parts\":[]}}}\n\n".to_string()),
-            ("malformed status update", event(json!({ "statusUpdate": { "status": {} } }))),
-            ("malformed artifact update", event(json!({ "artifactUpdate": { "artifact": { "parts": "x" } } }))),
-            ("unterminated last event", "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"message\":{\"parts\":[]}}}".to_string()),
-            ("event without its blank line", "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"message\":{\"parts\":[]}}}\n".to_string()),
+            (
+                "non-JSON-RPC envelope",
+                "data: {\"result\":{}}\n\n".to_string(),
+            ),
+            (
+                "event without result or error",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1}\n\n".to_string(),
+            ),
+            (
+                "result for another request",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"message\":{\"parts\":[]}}}\n\n"
+                    .to_string(),
+            ),
+            (
+                "malformed status update",
+                event(json!({ "statusUpdate": { "status": {} } })),
+            ),
+            (
+                "malformed artifact update",
+                event(json!({ "artifactUpdate": { "artifact": { "parts": "x" } } })),
+            ),
+            (
+                "unterminated last event",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"message\":{\"parts\":[]}}}"
+                    .to_string(),
+            ),
+            (
+                "event without its blank line",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"message\":{\"parts\":[]}}}\n"
+                    .to_string(),
+            ),
         ] {
             let err = parse_sse(&format!("{}{}", valid, tail)).expect_err(case);
             assert!(err.starts_with(INVALID_RESPONSE), "{}: {}", case, err);
         }
 
         let error = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}\n\n";
-        assert_eq!(parse_sse(&format!("{}{}", valid, error)).unwrap_err(), "A2A error -32603: Internal error");
+        assert_eq!(
+            parse_sse(&format!("{}{}", valid, error)).unwrap_err(),
+            "A2A error -32603: Internal error"
+        );
         // A trailing comment without a line end is not an event.
         assert!(parse_sse(&format!("{}: bye", valid)).is_ok());
-        assert_eq!(parse_sse(": only comments\n\n").unwrap_err(), "The A2A agent stream contained no result events");
+        assert_eq!(
+            parse_sse(": only comments\n\n").unwrap_err(),
+            "The A2A agent stream contained no result events"
+        );
     }
 
     // Issue #9: an interrupted task without a contextId is still continuable.
@@ -1125,13 +1241,22 @@ mod tests {
 
         let plain = tool_result_from_reply(&reply, "ask_agent", false);
         assert_eq!(plain["content"][0]["text"], "Which account?");
-        let hint = plain["content"][1]["text"].as_str().expect("a continuation hint");
+        let hint = plain["content"][1]["text"]
+            .as_str()
+            .expect("a continuation hint");
         assert!(hint.starts_with("[a2a state=input-required]"), "{}", hint);
-        assert!(hint.contains("Call ask_agent again with task_id=\"t9\"."), "{}", hint);
+        assert!(
+            hint.contains("Call ask_agent again with task_id=\"t9\"."),
+            "{}",
+            hint
+        );
         assert!(!hint.contains("context_id"), "{}", hint);
 
         let structured = tool_result_from_reply(&reply, "ask_agent", true);
-        assert_eq!(structured["structuredContent"], json!({ "state": "input-required", "taskId": "t9" }));
+        assert_eq!(
+            structured["structuredContent"],
+            json!({ "state": "input-required", "taskId": "t9" })
+        );
     }
 
     #[test]
@@ -1143,10 +1268,23 @@ mod tests {
             let hint = continuation_hint(&reply, "ask_agent").unwrap();
             assert!(hint.starts_with("[a2a state=auth-required]"), "{}", hint);
             assert!(hint.contains("outside this conversation"), "{}", hint);
-            assert!(hint.contains("never send passwords, tokens or other secrets"), "{}", hint);
-            assert!(hint.contains("replying does not grant authorization"), "{}", hint);
+            assert!(
+                hint.contains("never send passwords, tokens or other secrets"),
+                "{}",
+                hint
+            );
+            assert!(
+                hint.contains("replying does not grant authorization"),
+                "{}",
+                hint
+            );
             assert!(hint.contains("task_id=\"t1\""), "{}", hint);
-            assert_eq!(hint.contains("context_id=\"c1\""), context.is_some(), "{}", hint);
+            assert_eq!(
+                hint.contains("context_id=\"c1\""),
+                context.is_some(),
+                "{}",
+                hint
+            );
         }
     }
 
@@ -1159,7 +1297,9 @@ mod tests {
             "[a2a state=working] The agent is still working on task_id=\"t2\"."
         );
         reply.context_id = Some("c2".to_string());
-        assert!(continuation_hint(&reply, "ask_agent").unwrap().contains("context_id=\"c2\""));
+        assert!(continuation_hint(&reply, "ask_agent")
+            .unwrap()
+            .contains("context_id=\"c2\""));
 
         // A finished task without a context has nothing to continue.
         let mut done = AgentReply::empty(TaskState::Completed);
@@ -1175,15 +1315,27 @@ mod tests {
             json!({ "url": "https://x/b.png", "mediaType": "image/png", "filename": "b.png" }),
             json!({ "raw": "AAAA", "mediaType": "image/png" }),
         ]);
-        assert_eq!(reply.texts[0], "[file a.pdf (application/pdf): https://x/a.pdf]");
+        assert_eq!(
+            reply.texts[0],
+            "[file a.pdf (application/pdf): https://x/a.pdf]"
+        );
         assert_eq!(reply.texts[1], "[file b.png (image/png): https://x/b.png]");
-        assert_eq!(reply.texts[2], "[file file (image/png): inline content omitted]");
+        assert_eq!(
+            reply.texts[2],
+            "[file file (image/png): inline content omitted]"
+        );
     }
 
     #[test]
     fn task_state_accepts_both_spellings_and_rejects_others() {
-        assert_eq!(TaskState::parse("TASK_STATE_AUTH_REQUIRED"), Some(TaskState::AuthRequired));
-        assert_eq!(TaskState::parse("input-required"), Some(TaskState::InputRequired));
+        assert_eq!(
+            TaskState::parse("TASK_STATE_AUTH_REQUIRED"),
+            Some(TaskState::AuthRequired)
+        );
+        assert_eq!(
+            TaskState::parse("input-required"),
+            Some(TaskState::InputRequired)
+        );
         assert_eq!(TaskState::parse("cancelled"), Some(TaskState::Canceled));
         assert_eq!(TaskState::parse("unknown"), Some(TaskState::Unknown));
         assert_eq!(TaskState::parse("TASK_STATE_UNSPECIFIED"), None);
@@ -1236,7 +1388,10 @@ mod tests {
     #[test]
     fn version_query_is_stripped_case_insensitively() {
         assert_eq!(strip_version_query("/a?A2A-Version=0.3"), "/a");
-        assert_eq!(strip_version_query("/a?x=1&a2a-version=1.0&y=2"), "/a?x=1&y=2");
+        assert_eq!(
+            strip_version_query("/a?x=1&a2a-version=1.0&y=2"),
+            "/a?x=1&y=2"
+        );
         assert_eq!(strip_version_query("/a?x=1"), "/a?x=1");
         assert_eq!(strip_version_query("/a"), "/a");
     }

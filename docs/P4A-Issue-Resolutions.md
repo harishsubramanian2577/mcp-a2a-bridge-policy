@@ -50,7 +50,12 @@ This section covers 1.1.0. For 1.3.0, see [Verification of 1.3.0](#verification-
    - The first live run found a bug in the test itself. pdk-test puts the API path in the upstream `destinationPath`, so the gateway has no base path in local mode and `a2aPath` can't be applied. The test now calls the agent's path with `a2aPath` empty. The `a2aPath` rewrite is covered by unit tests.
    - `make test` needs a Flex registration: put a local-mode `registration.yaml` in `tests/config/` (gitignored), which is mounted into the gateway.
 5. **Shared-storage test.** `make test-shared-storage` passes on Flex 1.11.0, 1.12.0 and 1.13.0 (see issue #12 below).
-6. **Minimum gateway version.** The same harness on Flex 1.10.6 fails at load time with `FlexAbiHandler: command 'flex_enable_stop_iteration' unknown`. The request filter needs PDK's stop-iteration feature (the #4 fix), so 1.1.0 requires Flex Gateway 1.11.0 or later. The README and customer guide say so, and both integration tests are pinned to 1.11.0.
+6. **Minimum gateway version.** The same harness on Flex 1.10.6 fails at load time with `FlexAbiHandler: command 'flex_enable_stop_iteration' unknown`. The request filter needs PDK's stop-iteration feature (the #4 fix), so 1.1.0 requires Flex Gateway 1.11.0 or later. The README and customer guide say so, and both integration tests and the playground are pinned to 1.11.0.
+7. **Published runtime metadata.**
+   - PDK's `build-asset-files` always writes `minRuntimeVersion: 1.6.1` into `target/implementation/metadata.yaml` and `target/implementation-dev/metadata.yaml`, and `publish`/`release` upload those files as they are.
+   - The Makefile pins `MIN_RUNTIME_VERSION := 1.11.0`. Right after `build-asset-files`, `scripts/check-min-runtime.py --write` sets that version in both files.
+   - The same script then fails the build if the pin, either metadata file, or the playground image is below the version the enabled `pdk` features need. It reads the features from `Cargo.toml`; `enable_stop_iteration` needs 1.11.0. Because `publish` and `release` depend on `build`, they can't upload understated metadata.
+   - Verified from a clean build (`rm -rf target && make build`): both files say `minRuntimeVersion: 1.11.0`. Lowering the pin (`make build MIN_RUNTIME_VERSION=1.6.1`), putting 1.6.1 back in a metadata file, or setting the playground to 1.10.0 each makes the check fail.
 
 ---
 
@@ -147,7 +152,7 @@ The detailed reproductions in the issue were withheld pending a private channel.
 - [x] **Scoped shared storage.** The namespace is `mcp-a2a-sessions/<api-id>/<policy-name>.<policy-namespace>`, falling back to the base path when the API ID is unknown in local mode. The same scope is hashed into each key. Two API instances that share Redis are isolated, while replicas of one instance share the same namespace, so sessions continue across replicas.
 - [x] **Configured expiry.**
   - The TTL is clamped to 60–86400 seconds. The same value sets the Redis TTL (`remote_ttl_millis`) and the liveness check.
-  - Entries store `touched_at`, and liveness is judged against the TTL configured now. After a config change, a lower TTL takes effect on existing entries immediately.
+  - Entries store `touched_at`, and the liveness check compares it with the TTL in the current configuration rather than the TTL used when the entry was written. A unit test covers this: an entry written under a long TTL is treated as expired once the configured TTL is lowered. Changing the TTL on a running gateway has not been tested live.
 - [x] **Logs** carry only a short prefix of the hashed key, never the session ID or identity.
 - [x] **Two-replica shared Redis test added** (`make test-shared-storage`, in `tests/shared-storage/`). `pdk-test` 1.8.0 has no Redis service and its service traits are private, so this is a Docker Compose harness: Redis, two Flex Gateway replicas, two API instances (`hr`, bound to `x-client-id`, and `finance`) and a mock A2A agent that records what it receives. `check.py` verifies:
   - a session issued on flex-1 continues on flex-2;
@@ -215,7 +220,7 @@ The detailed reproductions in the issue were withheld pending a private channel.
 | `session::tests::random_uuids_are_unique_v4` | 1,000 unique RFC 4122 v4 IDs (covers replica and restart uniqueness) | n/a | Passes |
 | `session::tests::namespace_is_per_api_instance_and_policy` | Two API instances or policies get different namespaces | n/a | Passes |
 | `session::tests::ttl_is_clamped_and_matches_the_remote_backend` | Redis TTL in milliseconds matches the configured TTL | n/a | Passes |
-| `session::tests::expiry_follows_the_configured_ttl` | Expiry, including a lower TTL after a config change | n/a | Passes |
+| `session::tests::expiry_follows_the_configured_ttl` | Expiry is judged against the configured TTL, including a lower TTL than the one the entry was written with (unit level only) | n/a | Passes |
 | `session::tests::session_ids_must_be_visible_ascii_and_bounded` | Session ID validation | n/a | Passes |
 
 ### Upgrade note

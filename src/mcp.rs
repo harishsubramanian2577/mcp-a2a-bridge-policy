@@ -45,7 +45,9 @@ pub enum Incoming<'a> {
         method: &'a str,
         params: Option<&'a Map<String, Value>>,
     },
-    Notification { method: &'a str },
+    Notification {
+        method: &'a str,
+    },
     /// The client's answer to a server request.
     Response,
 }
@@ -86,37 +88,67 @@ pub fn classify(envelope: &Map<String, Value>) -> Result<Incoming<'_>, Invalid> 
     let id = envelope.get("id");
     let request_id = id.filter(|id| is_valid_id(id));
     if envelope.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION) {
-        return Err(Invalid::new(request_id, INVALID_REQUEST, "Not a JSON-RPC 2.0 message"));
+        return Err(Invalid::new(
+            request_id,
+            INVALID_REQUEST,
+            "Not a JSON-RPC 2.0 message",
+        ));
     }
     if id.is_some() && request_id.is_none() && envelope.contains_key("method") {
-        return Err(Invalid::new(None, INVALID_REQUEST, "The id must be a string or an integer"));
+        return Err(Invalid::new(
+            None,
+            INVALID_REQUEST,
+            "The id must be a string or an integer",
+        ));
     }
 
     let Some(method) = envelope.get("method") else {
         let has_result = envelope.contains_key("result");
         let has_error = envelope.contains_key("error");
         if !has_result && !has_error {
-            return Err(Invalid::new(request_id, INVALID_REQUEST, "Missing JSON-RPC method"));
+            return Err(Invalid::new(
+                request_id,
+                INVALID_REQUEST,
+                "Missing JSON-RPC method",
+            ));
         }
         // An error may answer a request whose id the client could not read.
         let id_ok = request_id.is_some() || (has_error && id == Some(&Value::Null));
         if has_result == has_error || !id_ok {
-            return Err(Invalid::new(None, INVALID_REQUEST, "Invalid JSON-RPC response"));
+            return Err(Invalid::new(
+                None,
+                INVALID_REQUEST,
+                "Invalid JSON-RPC response",
+            ));
         }
         return Ok(Incoming::Response);
     };
     let Some(method) = method.as_str() else {
-        return Err(Invalid::new(request_id, INVALID_REQUEST, "The method must be a string"));
+        return Err(Invalid::new(
+            request_id,
+            INVALID_REQUEST,
+            "The method must be a string",
+        ));
     };
     let params = match envelope.get("params") {
         None => None,
         Some(Value::Object(params)) => Some(params),
-        Some(_) => return Err(Invalid::new(request_id, INVALID_PARAMS, "Params must be an object")),
+        Some(_) => {
+            return Err(Invalid::new(
+                request_id,
+                INVALID_PARAMS,
+                "Params must be an object",
+            ))
+        }
     };
     match request_id {
         Some(id) => Ok(Incoming::Request { id, method, params }),
         None if is_notification(method) => Ok(Incoming::Notification { method }),
-        None => Err(Invalid::new(None, INVALID_REQUEST, "Requests must have an id")),
+        None => Err(Invalid::new(
+            None,
+            INVALID_REQUEST,
+            "Requests must have an id",
+        )),
     }
 }
 
@@ -145,17 +177,17 @@ pub fn initialize_protocol_version(
         .and_then(Value::as_str)
         .filter(|v| !v.trim().is_empty())
         .ok_or("initialize params.protocolVersion must be a non-empty string")?;
-    if !params.get("capabilities").map_or(false, Value::is_object) {
+    if !params.get("capabilities").is_some_and(Value::is_object) {
         return Err("initialize params.capabilities must be an object");
     }
     let client_info = params
         .get("clientInfo")
         .and_then(Value::as_object)
         .ok_or("initialize params.clientInfo must be an object")?;
-    if !client_info.get("name").map_or(false, Value::is_string) {
+    if !client_info.get("name").is_some_and(Value::is_string) {
         return Err("initialize params.clientInfo.name must be a string");
     }
-    if !client_info.get("version").map_or(false, Value::is_string) {
+    if !client_info.get("version").is_some_and(Value::is_string) {
         return Err("initialize params.clientInfo.version must be a string");
     }
     Ok(version)
@@ -174,13 +206,20 @@ pub fn error_envelope(id: &Value, code: i64, message: &str) -> Value {
 pub fn error_body(id: Option<&Value>, code: i64, message: &str) -> Value {
     match id {
         Some(id) => error_envelope(id, code, message),
-        None => json!({ "jsonrpc": JSONRPC_VERSION, "error": { "code": code, "message": message } }),
+        None => {
+            json!({ "jsonrpc": JSONRPC_VERSION, "error": { "code": code, "message": message } })
+        }
     }
 }
 
 pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
     requested
-        .and_then(|r| SUPPORTED_PROTOCOL_VERSIONS.iter().find(|v| **v == r).copied())
+        .and_then(|r| {
+            SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .find(|v| **v == r)
+                .copied()
+        })
         .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
 }
 
@@ -384,17 +423,30 @@ mod tests {
     fn classifies_requests_notifications_and_responses_structurally() {
         let ok = classify_json(json!({ "jsonrpc": "2.0", "id": "a", "method": "ping" })).unwrap();
         assert!(ok.starts_with("Request"), "{}", ok);
-        let ok = classify_json(json!({ "jsonrpc": "2.0", "id": 0, "method": "tools/list", "params": {} })).unwrap();
+        let ok = classify_json(
+            json!({ "jsonrpc": "2.0", "id": 0, "method": "tools/list", "params": {} }),
+        )
+        .unwrap();
         assert!(ok.starts_with("Request"), "{}", ok);
-        let ok = classify_json(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).unwrap();
+        let ok = classify_json(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+            .unwrap();
         assert!(ok.starts_with("Notification"), "{}", ok);
-        assert_eq!(classify_json(json!({ "jsonrpc": "2.0", "id": 4, "result": {} })).unwrap(), "Response");
         assert_eq!(
-            classify_json(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": 1, "message": "x" } })).unwrap(),
+            classify_json(json!({ "jsonrpc": "2.0", "id": 4, "result": {} })).unwrap(),
+            "Response"
+        );
+        assert_eq!(
+            classify_json(
+                json!({ "jsonrpc": "2.0", "id": null, "error": { "code": 1, "message": "x" } })
+            )
+            .unwrap(),
             "Response"
         );
         // A notification method that carries an id is a request, and gets a JSON-RPC reply.
-        let ok = classify_json(json!({ "jsonrpc": "2.0", "id": 9, "method": "notifications/initialized" })).unwrap();
+        let ok = classify_json(
+            json!({ "jsonrpc": "2.0", "id": 9, "method": "notifications/initialized" }),
+        )
+        .unwrap();
         assert!(ok.starts_with("Request"), "{}", ok);
     }
 
@@ -402,25 +454,101 @@ mod tests {
     fn rejects_invalid_envelopes_ids_and_params() {
         // (message, expected id, expected code)
         let cases: Vec<(Value, Option<Value>, i64)> = vec![
-            (json!({ "jsonrpc": "1.0", "id": 1, "method": "tools/call" }), Some(json!(1)), INVALID_REQUEST),
-            (json!({ "jsonrpc": 2, "id": 1, "method": "ping" }), Some(json!(1)), INVALID_REQUEST),
-            (json!({ "id": 1, "method": "ping" }), Some(json!(1)), INVALID_REQUEST),
-            (json!({ "jsonrpc": "2.0", "method": "ping" }), None, INVALID_REQUEST),
-            (json!({ "jsonrpc": "2.0", "method": "tools/call", "params": {} }), None, INVALID_REQUEST),
-            (json!({ "jsonrpc": "2.0", "id": null, "method": "ping" }), None, INVALID_REQUEST),
-            (json!({ "jsonrpc": "2.0", "id": { "a": 1 }, "method": "ping" }), None, INVALID_REQUEST),
-            (json!({ "jsonrpc": "2.0", "id": [1], "method": "ping" }), None, INVALID_REQUEST),
-            (json!({ "jsonrpc": "2.0", "id": true, "method": "ping" }), None, INVALID_REQUEST),
-            (json!({ "jsonrpc": "2.0", "id": 1.5, "method": "ping" }), None, INVALID_REQUEST),
-            (json!({ "jsonrpc": "2.0", "id": 1, "method": 7 }), Some(json!(1)), INVALID_REQUEST),
-            (json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": 3 }), Some(json!(1)), INVALID_PARAMS),
-            (json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": [1] }), Some(json!(1)), INVALID_PARAMS),
-            (json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": null }), Some(json!(1)), INVALID_PARAMS),
-            (json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": "x" }), None, INVALID_PARAMS),
-            (json!({ "jsonrpc": "2.0", "id": 1 }), Some(json!(1)), INVALID_REQUEST),
-            (json!({ "jsonrpc": "2.0", "id": 1, "result": {}, "error": {} }), None, INVALID_REQUEST),
-            (json!({ "jsonrpc": "2.0", "result": {} }), None, INVALID_REQUEST),
-            (json!({ "jsonrpc": "2.0", "id": null, "result": {} }), None, INVALID_REQUEST),
+            (
+                json!({ "jsonrpc": "1.0", "id": 1, "method": "tools/call" }),
+                Some(json!(1)),
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "jsonrpc": 2, "id": 1, "method": "ping" }),
+                Some(json!(1)),
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "id": 1, "method": "ping" }),
+                Some(json!(1)),
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "method": "ping" }),
+                None,
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "method": "tools/call", "params": {} }),
+                None,
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "id": null, "method": "ping" }),
+                None,
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "id": { "a": 1 }, "method": "ping" }),
+                None,
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "id": [1], "method": "ping" }),
+                None,
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "id": true, "method": "ping" }),
+                None,
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "id": 1.5, "method": "ping" }),
+                None,
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "id": 1, "method": 7 }),
+                Some(json!(1)),
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": 3 }),
+                Some(json!(1)),
+                INVALID_PARAMS,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": [1] }),
+                Some(json!(1)),
+                INVALID_PARAMS,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": null }),
+                Some(json!(1)),
+                INVALID_PARAMS,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": "x" }),
+                None,
+                INVALID_PARAMS,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "id": 1 }),
+                Some(json!(1)),
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "id": 1, "result": {}, "error": {} }),
+                None,
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "result": {} }),
+                None,
+                INVALID_REQUEST,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "id": null, "result": {} }),
+                None,
+                INVALID_REQUEST,
+            ),
         ];
         for (message, id, code) in cases {
             let invalid = classify_json(message.clone()).expect_err(&message.to_string());
@@ -456,7 +584,12 @@ mod tests {
             } else {
                 params.insert(key.to_string(), bad.clone());
             }
-            assert!(initialize_protocol_version(Some(&params)).is_err(), "{} = {}", key, bad);
+            assert!(
+                initialize_protocol_version(Some(&params)).is_err(),
+                "{} = {}",
+                key,
+                bad
+            );
         }
     }
 
@@ -487,9 +620,13 @@ mod tests {
     #[test]
     fn tool_definition_advertises_reset_only_with_store() {
         let without = tool_definition("ask_agent", "d", false);
-        assert!(without["inputSchema"]["properties"].get(ARG_NEW_CONVERSATION).is_none());
+        assert!(without["inputSchema"]["properties"]
+            .get(ARG_NEW_CONVERSATION)
+            .is_none());
         let with = tool_definition("ask_agent", "d", true);
-        assert!(with["inputSchema"]["properties"].get(ARG_NEW_CONVERSATION).is_some());
+        assert!(with["inputSchema"]["properties"]
+            .get(ARG_NEW_CONVERSATION)
+            .is_some());
         assert_eq!(with["inputSchema"]["required"], json!([ARG_MESSAGE]));
     }
 
@@ -543,13 +680,20 @@ mod tests {
         // A 600,000-character data part appears twice (text + structuredContent): ~1.2 MB.
         let big = "x".repeat(600_000);
         let data = json!(big);
-        let (bytes, fit) = bounded_result_envelope(&json!(1), answer(&data.to_string(), Some(data)), MAX_BODY_BYTES);
+        let (bytes, fit) = bounded_result_envelope(
+            &json!(1),
+            answer(&data.to_string(), Some(data)),
+            MAX_BODY_BYTES,
+        );
         assert_eq!(fit, Fit::Reduced);
         assert!(bytes.len() < MAX_BODY_BYTES);
         let env = parse(&bytes);
         assert!(env["result"]["structuredContent"].get("data").is_none());
         assert_eq!(env["result"]["structuredContent"]["contextId"], "ctx");
-        assert_eq!(env["result"]["content"][0]["text"].as_str().unwrap().len(), 600_002);
+        assert_eq!(
+            env["result"]["content"][0]["text"].as_str().unwrap().len(),
+            600_002
+        );
         assert_eq!(env["result"]["content"][1]["text"], "hint");
     }
 
@@ -557,10 +701,17 @@ mod tests {
     fn escaped_text_expansion_is_truncated_under_the_limit() {
         // 600,000 quotes serialise to 1,200,000 bytes even after the data copy is dropped.
         let quotes = "\"".repeat(600_000);
-        let (bytes, fit) = bounded_result_envelope(&json!(1), answer(&quotes, Some(json!(quotes.clone()))), MAX_BODY_BYTES);
+        let (bytes, fit) = bounded_result_envelope(
+            &json!(1),
+            answer(&quotes, Some(json!(quotes.clone()))),
+            MAX_BODY_BYTES,
+        );
         assert_eq!(fit, Fit::Reduced);
         assert!(bytes.len() < MAX_BODY_BYTES, "{} bytes", bytes.len());
-        let text = parse(&bytes)["result"]["content"][0]["text"].as_str().unwrap().to_string();
+        let text = parse(&bytes)["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(text.ends_with("Ask for a shorter answer.]"));
         assert!(text.len() < 600_000);
     }

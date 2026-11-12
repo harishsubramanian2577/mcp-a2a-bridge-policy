@@ -36,9 +36,11 @@ pub const MAX_QUESTION_BYTES: usize = 32 * 1024;
 const ANSWER_FIELD: &str = "answer";
 const DEFAULT_QUESTION: &str = "The agent needs more information to continue.";
 
-const DECLINED_TEXT: &str = "The user declined to answer the agent's question, so this conversation \
+const DECLINED_TEXT: &str =
+    "The user declined to answer the agent's question, so this conversation \
      with the agent was ended. Start a new conversation to try again.";
-const CANCELLED_TEXT: &str = "The user cancelled the agent's question, so this conversation with the \
+const CANCELLED_TEXT: &str =
+    "The user cancelled the agent's question, so this conversation with the \
      agent was ended. Start a new conversation to try again.";
 const TIMEOUT_TEXT: &str = "The user did not answer the agent's question in time, so this \
      conversation with the agent was ended. Start a new conversation to try again.";
@@ -95,7 +97,10 @@ pub struct Pending {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Step {
     /// `elicitation/create` with this id is (or is about to be) on the stream.
-    Asked { request_id: String, question: String },
+    Asked {
+        request_id: String,
+        question: String,
+    },
     /// The answer was sent to the agent; its reply is not in yet.
     Answering,
     /// The serialised JSON-RPC response to the `tools/call`.
@@ -104,7 +109,12 @@ pub enum Step {
 
 impl Pending {
     /// The first question of a `tools/call`; `None` unless the agent named the task to continue.
-    pub fn first(stream: String, call_id: &Value, reply: &AgentReply, deadline: u64) -> Option<Self> {
+    pub fn first(
+        stream: String,
+        call_id: &Value,
+        reply: &AgentReply,
+        deadline: u64,
+    ) -> Option<Self> {
         let task_id = reply.task_id.clone()?;
         let request_id = request_id(&stream, 1);
         Some(Pending {
@@ -115,7 +125,10 @@ impl Pending {
             round: 1,
             deadline,
             seq: 1,
-            step: Step::Asked { request_id, question: question_text(reply) },
+            step: Step::Asked {
+                request_id,
+                question: question_text(reply),
+            },
         })
     }
 
@@ -171,7 +184,7 @@ pub fn client_declares(initialize_params: Option<&Map<String, Value>>) -> bool {
     initialize_params
         .and_then(|p| p.get("capabilities"))
         .and_then(|c| c.get("elicitation"))
-        .map_or(false, Value::is_object)
+        .is_some_and(Value::is_object)
 }
 
 /// Elicitation exists from 2025-06-18; dates compare correctly as strings.
@@ -233,7 +246,10 @@ pub fn parse_answer(envelope: &Map<String, Value>) -> Result<Answer, String> {
     if envelope.contains_key("error") {
         return Ok(Answer::Failed);
     }
-    let result = envelope.get("result").and_then(Value::as_object).ok_or("The elicitation result must be an object")?;
+    let result = envelope
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or("The elicitation result must be an object")?;
     match result.get("action").and_then(Value::as_str) {
         Some("accept") => result
             .get("content")
@@ -242,7 +258,12 @@ pub fn parse_answer(envelope: &Map<String, Value>) -> Result<Answer, String> {
             .map(str::trim)
             .filter(|a| !a.is_empty())
             .map(|a| Answer::Accept(a.to_string()))
-            .ok_or_else(|| format!("An accepted elicitation must carry a non-empty content.{}", ANSWER_FIELD)),
+            .ok_or_else(|| {
+                format!(
+                    "An accepted elicitation must carry a non-empty content.{}",
+                    ANSWER_FIELD
+                )
+            }),
         Some("decline") => Ok(Answer::Decline),
         Some("cancel") => Ok(Answer::Cancel),
         _ => Err("The elicitation action must be accept, decline or cancel".to_string()),
@@ -273,7 +294,11 @@ fn retry_field() -> Vec<u8> {
 
 /// The question, then a `retry` hint; the stream then ends and the client resumes with GET.
 pub fn question_stream(pending: &Pending) -> Option<Vec<u8>> {
-    let Step::Asked { request_id, question } = &pending.step else {
+    let Step::Asked {
+        request_id,
+        question,
+    } = &pending.step
+    else {
         return None;
     };
     let request = create_request(request_id, question).to_string();
@@ -357,23 +382,35 @@ mod tests {
         assert_eq!(Settings::from_config(true, false, None, None, 1800), None);
         assert_eq!(
             Settings::from_config(true, true, None, None, 1800),
-            Some(Settings { timeout_seconds: 300, max_rounds: 3 })
+            Some(Settings {
+                timeout_seconds: 300,
+                max_rounds: 3
+            })
         );
         let s = Settings::from_config(true, true, Some(1), Some(0), 1800).unwrap();
         assert_eq!((s.timeout_seconds, s.max_rounds), (30, 1));
         let s = Settings::from_config(true, true, Some(99_999), Some(99), 1800).unwrap();
         assert_eq!((s.timeout_seconds, s.max_rounds), (1800, 10));
         // An expired session cannot be resumed, so the TTL caps the wait.
-        assert_eq!(Settings::from_config(true, true, Some(900), None, 120).unwrap().timeout_seconds, 120);
+        assert_eq!(
+            Settings::from_config(true, true, Some(900), None, 120)
+                .unwrap()
+                .timeout_seconds,
+            120
+        );
     }
 
     #[test]
     fn capability_and_version_gate_elicitation() {
         let params = |caps: Value| envelope(json!({ "capabilities": caps }));
         assert!(client_declares(Some(&params(json!({ "elicitation": {} })))));
-        assert!(client_declares(Some(&params(json!({ "elicitation": { "form": {} } })))));
+        assert!(client_declares(Some(&params(
+            json!({ "elicitation": { "form": {} } })
+        ))));
         assert!(!client_declares(Some(&params(json!({})))));
-        assert!(!client_declares(Some(&params(json!({ "elicitation": true })))));
+        assert!(!client_declares(Some(&params(
+            json!({ "elicitation": true })
+        ))));
         assert!(!client_declares(None));
         assert!(version_supports("2025-06-18"));
         assert!(version_supports("2025-11-25"));
@@ -383,12 +420,32 @@ mod tests {
 
     #[test]
     fn only_input_required_tasks_are_elicited() {
-        assert!(is_elicitable(&reply(TaskState::InputRequired, Some("t"), &["Which city?"])));
-        assert!(!is_elicitable(&reply(TaskState::InputRequired, None, &["Which city?"])));
-        assert!(!is_elicitable(&reply(TaskState::AuthRequired, Some("t"), &["Sign in"])));
-        assert!(!is_elicitable(&reply(TaskState::Completed, Some("t"), &["Done"])));
+        assert!(is_elicitable(&reply(
+            TaskState::InputRequired,
+            Some("t"),
+            &["Which city?"]
+        )));
+        assert!(!is_elicitable(&reply(
+            TaskState::InputRequired,
+            None,
+            &["Which city?"]
+        )));
+        assert!(!is_elicitable(&reply(
+            TaskState::AuthRequired,
+            Some("t"),
+            &["Sign in"]
+        )));
+        assert!(!is_elicitable(&reply(
+            TaskState::Completed,
+            Some("t"),
+            &["Done"]
+        )));
         let long = "x".repeat(MAX_QUESTION_BYTES + 1);
-        assert!(!is_elicitable(&reply(TaskState::InputRequired, Some("t"), &[&long])));
+        assert!(!is_elicitable(&reply(
+            TaskState::InputRequired,
+            Some("t"),
+            &[&long]
+        )));
     }
 
     #[test]
@@ -402,14 +459,27 @@ mod tests {
         assert_eq!(schema["required"], json!(["answer"]));
         assert_eq!(schema["properties"]["answer"]["type"], "string");
         assert!(schema["properties"]["answer"].get("format").is_none());
-        assert!(schema["properties"]["answer"]["description"].as_str().unwrap().contains("Never enter passwords"));
-        assert!(request["params"].get("mode").is_none(), "2025-06-18 has no mode field");
+        assert!(schema["properties"]["answer"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Never enter passwords"));
+        assert!(
+            request["params"].get("mode").is_none(),
+            "2025-06-18 has no mode field"
+        );
     }
 
     #[test]
     fn answers_are_read_strictly() {
-        let ok = |result: Value| parse_answer(&envelope(json!({ "jsonrpc": "2.0", "id": "q", "result": result })));
-        assert_eq!(ok(json!({ "action": "accept", "content": { "answer": " Paris " } })), Ok(Answer::Accept("Paris".into())));
+        let ok = |result: Value| {
+            parse_answer(&envelope(
+                json!({ "jsonrpc": "2.0", "id": "q", "result": result }),
+            ))
+        };
+        assert_eq!(
+            ok(json!({ "action": "accept", "content": { "answer": " Paris " } })),
+            Ok(Answer::Accept("Paris".into()))
+        );
         assert_eq!(ok(json!({ "action": "decline" })), Ok(Answer::Decline));
         assert_eq!(ok(json!({ "action": "cancel" })), Ok(Answer::Cancel));
         assert!(ok(json!({ "action": "accept", "content": {} })).is_err());
@@ -417,7 +487,9 @@ mod tests {
         assert!(ok(json!({ "action": "accept", "content": { "answer": 5 } })).is_err());
         assert!(ok(json!({ "action": "maybe" })).is_err());
         assert!(ok(json!("accept")).is_err());
-        let failed = envelope(json!({ "jsonrpc": "2.0", "id": "q", "error": { "code": -32602, "message": "no" } }));
+        let failed = envelope(
+            json!({ "jsonrpc": "2.0", "id": "q", "error": { "code": -32602, "message": "no" } }),
+        );
         assert_eq!(parse_answer(&failed), Ok(Answer::Failed));
     }
 
@@ -442,18 +514,27 @@ mod tests {
         let text = String::from_utf8(question_stream(&pending).unwrap()).unwrap();
         assert!(text.starts_with("id: s-1\ndata: {"), "{}", text);
         assert!(text.ends_with("\n\nretry: 2000\n\n"), "{}", text);
-        let data: Value = serde_json::from_str(text.lines().nth(1).unwrap().strip_prefix("data: ").unwrap()).unwrap();
+        let data: Value =
+            serde_json::from_str(text.lines().nth(1).unwrap().strip_prefix("data: ").unwrap())
+                .unwrap();
         assert_eq!(data["id"], "s-q1");
 
         pending.ask_again(&reply(TaskState::InputRequired, Some("t1"), &[]), 200);
         assert_eq!((pending.round, pending.seq, pending.deadline), (2, 2, 200));
         assert_eq!(pending.asked_request_id(), Some("s-q2"));
-        assert!(matches!(&pending.step, Step::Asked { question, .. } if question == DEFAULT_QUESTION));
+        assert!(
+            matches!(&pending.step, Step::Asked { question, .. } if question == DEFAULT_QUESTION)
+        );
 
         pending.finish("{\"id\":7}".into());
         assert!(!pending.is_open());
-        assert_eq!(String::from_utf8(result_stream(&pending).unwrap()).unwrap(), "id: s-3\ndata: {\"id\":7}\n\n");
-        assert!(String::from_utf8(waiting_stream()).unwrap().ends_with("retry: 2000\n\n"));
+        assert_eq!(
+            String::from_utf8(result_stream(&pending).unwrap()).unwrap(),
+            "id: s-3\ndata: {\"id\":7}\n\n"
+        );
+        assert!(String::from_utf8(waiting_stream())
+            .unwrap()
+            .ends_with("retry: 2000\n\n"));
     }
 
     #[test]
@@ -462,6 +543,8 @@ mod tests {
         assert_eq!(declined["isError"], false);
         assert_eq!(declined["structuredContent"]["reason"], "declined");
         assert_eq!(ended_result(Ending::TimedOut, false)["isError"], true);
-        assert!(ended_result(Ending::TimedOut, false).get("structuredContent").is_none());
+        assert!(ended_result(Ending::TimedOut, false)
+            .get("structuredContent")
+            .is_none());
     }
 }

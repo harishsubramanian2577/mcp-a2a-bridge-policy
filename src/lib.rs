@@ -63,8 +63,16 @@ impl Bridge {
         let mode = config.session_store_mode.as_deref().unwrap_or("disabled");
         let enable_elicitation = config.enable_elicitation.unwrap_or(false);
         let forward_path = resolve_forward_path(base_path, config.a_2_a_path.as_deref());
-        if forward_path.is_none() && base_path.is_none() && config.a_2_a_path.as_deref().is_some_and(|p| !p.trim().is_empty()) {
-            logger::warn!("a2aPath is set but the API base path is unknown; paths will not be rewritten.");
+        if forward_path.is_none()
+            && base_path.is_none()
+            && config
+                .a_2_a_path
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty())
+        {
+            logger::warn!(
+                "a2aPath is set but the API base path is unknown; paths will not be rewritten."
+            );
         }
         let policy = &metadata.policy_metadata;
         let session_scope = session::namespace(
@@ -72,7 +80,8 @@ impl Bridge {
             base_path,
             &format!("{}.{}", policy.policy_name, policy.policy_namespace),
         );
-        let sessions = SessionStore::from_config(builder, mode, ttl, &session_scope, enable_elicitation);
+        let sessions =
+            SessionStore::from_config(builder, mode, ttl, &session_scope, enable_elicitation);
         let elicitation = Settings::from_config(
             enable_elicitation,
             sessions.is_some(),
@@ -81,7 +90,9 @@ impl Bridge {
             session::clamp_ttl(ttl),
         );
         if enable_elicitation && elicitation.is_none() {
-            logger::warn!("enableElicitation needs a session store; questions are returned as tool results.");
+            logger::warn!(
+                "enableElicitation needs a session store; questions are returned as tool results."
+            );
         }
         Bridge {
             tool_name: config.tool_name,
@@ -193,7 +204,11 @@ impl Identity {
             Identity::Present(value) => Some(value.as_str()),
             Identity::Missing => return None,
         };
-        Some(session::session_key(&bridge.session_scope, session_id, identity))
+        Some(session::session_key(
+            &bridge.session_scope,
+            session_id,
+            identity,
+        ))
     }
 }
 
@@ -209,7 +224,10 @@ struct RequestHeaders {
 fn accepts_sse(handler: &dyn HeadersHandler) -> bool {
     handler
         .header("accept")
-        .map(|a| a.to_ascii_lowercase().contains(elicitation::SSE_CONTENT_TYPE))
+        .map(|a| {
+            a.to_ascii_lowercase()
+                .contains(elicitation::SSE_CONTENT_TYPE)
+        })
         .unwrap_or(false)
 }
 
@@ -230,12 +248,25 @@ fn rpc_error(id: &Value, code: i64, message: &str) -> Flow<Option<Transcoded>> {
 }
 
 fn rpc_result(id: &Value, result: Value) -> Flow<Option<Transcoded>> {
-    Flow::Break(json_response(200, &mcp::result_envelope(id, result), vec![]))
+    Flow::Break(json_response(
+        200,
+        &mcp::result_envelope(id, result),
+        vec![],
+    ))
 }
 
 /// An HTTP-level rejection with a JSON-RPC error body; the id is included when one was read.
-fn http_error(status: u32, id: Option<&Value>, code: i64, message: &str) -> Flow<Option<Transcoded>> {
-    Flow::Break(json_response(status, &mcp::error_body(id, code, message), vec![]))
+fn http_error(
+    status: u32,
+    id: Option<&Value>,
+    code: i64,
+    message: &str,
+) -> Flow<Option<Transcoded>> {
+    Flow::Break(json_response(
+        status,
+        &mcp::error_body(id, code, message),
+        vec![],
+    ))
 }
 
 fn invalid_message(invalid: mcp::Invalid) -> Flow<Option<Transcoded>> {
@@ -261,13 +292,20 @@ fn method_not_allowed() -> Flow<Option<Transcoded>> {
 
 fn sse_headers() -> Vec<(String, String)> {
     vec![
-        ("content-type".to_string(), elicitation::SSE_CONTENT_TYPE.to_string()),
+        (
+            "content-type".to_string(),
+            elicitation::SSE_CONTENT_TYPE.to_string(),
+        ),
         ("cache-control".to_string(), "no-cache".to_string()),
     ]
 }
 
 fn sse_response(body: Vec<u8>) -> Flow<Option<Transcoded>> {
-    Flow::Break(Response::new(200).with_headers(sse_headers()).with_body(body))
+    Flow::Break(
+        Response::new(200)
+            .with_headers(sse_headers())
+            .with_body(body),
+    )
 }
 
 async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Option<Transcoded>> {
@@ -332,7 +370,12 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
         return pass_or_reject_media(bridge);
     }
     if !headers_state.contains_body() {
-        return http_error(400, None, mcp::INVALID_REQUEST, "Empty JSON-RPC request body");
+        return http_error(
+            400,
+            None,
+            mcp::INVALID_REQUEST,
+            "Empty JSON-RPC request body",
+        );
     }
     let headers = RequestHeaders {
         session_id: handler.header(mcp::SESSION_ID_HEADER),
@@ -367,7 +410,7 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
     // Native A2A is recognised before any MCP validation: a bare HTTP+JSON payload on a route not
     // recognised above, or an A2A JSON-RPC method, keeps its own path, version header and body.
     let method = envelope.get("method").and_then(Value::as_str);
-    let native_a2a = !envelope.contains_key("jsonrpc") || method.map_or(false, a2a::is_a2a_method);
+    let native_a2a = !envelope.contains_key("jsonrpc") || method.is_some_and(a2a::is_a2a_method);
     if bridge.pass_through_a2a && native_a2a {
         return Flow::Continue(None);
     }
@@ -383,17 +426,24 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
     };
     let is_initialize = matches!(
         incoming,
-        mcp::Incoming::Request { method: mcp::INITIALIZE_METHOD_NAME, .. }
+        mcp::Incoming::Request {
+            method: mcp::INITIALIZE_METHOD_NAME,
+            ..
+        }
     );
     if !is_initialize {
-        if let Err(message) = mcp::check_protocol_version_header(headers.protocol_version.as_deref()) {
+        if let Err(message) =
+            mcp::check_protocol_version_header(headers.protocol_version.as_deref())
+        {
             return http_error(400, request_id, mcp::INVALID_REQUEST, &message);
         }
     }
 
     // A session id must name a live session of this caller; `initialize` starts a new one.
     let mut session = None;
-    if let (Some(store), Some(session_id), false) = (&bridge.sessions, &headers.session_id, is_initialize) {
+    if let (Some(store), Some(session_id), false) =
+        (&bridge.sessions, &headers.session_id, is_initialize)
+    {
         let key = headers.identity.session_key(bridge, session_id);
         let entry = match &key {
             Some(key) => store.load(key).await,
@@ -414,25 +464,36 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
         // elicitation goes on to the agent.
         mcp::Incoming::Response => {
             if let (Some(settings), Some((key, _))) = (&bridge.elicitation, session) {
-                return answer_elicitation(bridge, settings, envelope, key, &headers, handler).await;
+                return answer_elicitation(bridge, settings, envelope, key, &headers, handler)
+                    .await;
             }
             return plain_status(202);
         }
         mcp::Incoming::Notification { method } => {
-            if let (true, Some(_), Some((key, _))) = (method == mcp::CANCELLED_NOTIFICATION, &bridge.elicitation, &session) {
+            if let (true, Some(_), Some((key, _))) = (
+                method == mcp::CANCELLED_NOTIFICATION,
+                &bridge.elicitation,
+                &session,
+            ) {
                 cancel_elicitation(bridge, key, envelope.get("params")).await;
             }
             return plain_status(202);
         }
     };
     if a2a::is_a2a_method(method) {
-        return rpc_error(&id, mcp::METHOD_NOT_FOUND, "A2A methods are not accepted on this MCP endpoint");
+        return rpc_error(
+            &id,
+            mcp::METHOD_NOT_FOUND,
+            "A2A methods are not accepted on this MCP endpoint",
+        );
     }
     match method {
         mcp::INITIALIZE_METHOD_NAME => match mcp::initialize_protocol_version(params) {
             Ok(requested) => {
                 let elicit = bridge.elicitation.is_some()
-                    && elicitation::version_supports(mcp::negotiate_protocol_version(Some(requested)))
+                    && elicitation::version_supports(mcp::negotiate_protocol_version(Some(
+                        requested,
+                    )))
                     && elicitation::client_declares(params);
                 initialize(bridge, &id, requested, &headers, elicit).await
             }
@@ -462,7 +523,11 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
             };
             transcode_tool_call(bridge, id, call, session, &headers, handler).await
         }
-        _ => rpc_error(&id, mcp::METHOD_NOT_FOUND, &format!("Method not found: {}", method)),
+        _ => rpc_error(
+            &id,
+            mcp::METHOD_NOT_FOUND,
+            &format!("Method not found: {}", method),
+        ),
     }
 }
 
@@ -551,12 +616,17 @@ async fn transcode_tool_call(
     )
     .to_string();
     if a2a_request.len() >= mcp::MAX_BODY_BYTES {
-        return rpc_error(&id, mcp::INVALID_PARAMS, "The message is too large to forward to the agent");
+        return rpc_error(
+            &id,
+            mcp::INVALID_PARAMS,
+            "The message is too large to forward to the agent",
+        );
     }
 
     // A new call supersedes any question still open in this session.
     let mut mode = Mode::Plain;
-    if let (Some(store), Some(key), Some(_)) = (&bridge.sessions, &session_key, &bridge.elicitation) {
+    if let (Some(store), Some(key), Some(_)) = (&bridge.sessions, &session_key, &bridge.elicitation)
+    {
         if store.load_elicitation(key).await.is_some() {
             store
                 .update_elicitation(key, |entry| entry.pending.take().is_some())
@@ -568,7 +638,11 @@ async fn transcode_tool_call(
     }
 
     if forward_to_agent(bridge, handler, headers, &a2a_request).is_err() {
-        return rpc_error(&id, mcp::INTERNAL_ERROR, "Failed to forward the call to the A2A agent");
+        return rpc_error(
+            &id,
+            mcp::INTERNAL_ERROR,
+            "Failed to forward the call to the A2A agent",
+        );
     }
     logger::debug!(
         "tools/call -> A2A {:?} (context: {:?}, task: {:?})",
@@ -592,7 +666,10 @@ fn forward_to_agent(
     a2a_request: &str,
 ) -> Result<(), ()> {
     if let Err(err) = handler.set_body(a2a_request.as_bytes()) {
-        logger::error!("Failed to rewrite the request into an A2A request: {:?}", err);
+        logger::error!(
+            "Failed to rewrite the request into an A2A request: {:?}",
+            err
+        );
         return Err(());
     }
     handler.remove_header("content-length");
@@ -613,7 +690,10 @@ fn forward_to_agent(
 
 /// The open question of this session, if the client is still expected to answer or resume it.
 async fn pending_of(store: &SessionStore, key: &str) -> Option<Pending> {
-    store.load_elicitation(key).await.and_then(|entry| entry.pending)
+    store
+        .load_elicitation(key)
+        .await
+        .and_then(|entry| entry.pending)
 }
 
 /// Settles the question with `result` as the `tools/call` answer. `end` also drops the stored
@@ -648,7 +728,13 @@ async fn settle(
     settled
 }
 
-async fn end_conversation(bridge: &Bridge, store: &SessionStore, key: &str, pending: &Pending, ending: Ending) -> Option<Pending> {
+async fn end_conversation(
+    bridge: &Bridge,
+    store: &SessionStore,
+    key: &str,
+    pending: &Pending,
+    ending: Ending,
+) -> Option<Pending> {
     let result = elicitation::ended_result(ending, bridge.structured_content);
     settle(store, key, pending, result, true).await
 }
@@ -697,7 +783,8 @@ async fn answer_elicitation(
         Answer::Failed => {
             // The client could not ask; the question goes back as a normal tool result.
             let reply = elicitation::client_managed_reply(&pending);
-            let result = a2a::tool_result_from_reply(&reply, &bridge.tool_name, bridge.structured_content);
+            let result =
+                a2a::tool_result_from_reply(&reply, &bridge.tool_name, bridge.structured_content);
             settle(store, &key, &pending, result, false).await;
             return plain_status(202);
         }
@@ -714,7 +801,12 @@ async fn answer_elicitation(
     )
     .to_string();
     if a2a_request.len() >= mcp::MAX_BODY_BYTES {
-        return http_error(400, None, mcp::INVALID_PARAMS, "The answer is too large to forward to the agent");
+        return http_error(
+            400,
+            None,
+            mcp::INVALID_PARAMS,
+            "The answer is too large to forward to the agent",
+        );
     }
     // Claiming the question first means a repeated answer is never sent to the agent twice.
     let claimed = store
@@ -767,7 +859,10 @@ async fn cancel_elicitation(bridge: &Bridge, key: &str, params: Option<&Value>) 
     }
     let cleared = store
         .update_elicitation(key, |entry| {
-            let open = entry.pending.as_ref().map_or(false, |p| p.stream == pending.stream && p.is_open());
+            let open = entry
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.stream == pending.stream && p.is_open());
             if open {
                 entry.pending = None;
             }
@@ -794,7 +889,12 @@ async fn resume_stream(
         return http_error(400, None, mcp::INVALID_REQUEST, &message);
     }
     let Some(session_id) = handler.header(mcp::SESSION_ID_HEADER) else {
-        return http_error(400, None, mcp::INVALID_REQUEST, "Mcp-Session-Id is required to resume a stream");
+        return http_error(
+            400,
+            None,
+            mcp::INVALID_REQUEST,
+            "Mcp-Session-Id is required to resume a stream",
+        );
     };
     let key = Identity::of(bridge, handler).session_key(bridge, &session_id);
     let live = match &key {
@@ -804,7 +904,14 @@ async fn resume_stream(
     let (Some(key), true) = (key, live) else {
         return session_not_found(None);
     };
-    let unknown = || http_error(400, None, mcp::INVALID_REQUEST, "No stream to resume for this Last-Event-ID");
+    let unknown = || {
+        http_error(
+            400,
+            None,
+            mcp::INVALID_REQUEST,
+            "No stream to resume for this Last-Event-ID",
+        )
+    };
     let Some((stream, last_seq)) = elicitation::parse_event_id(last_event_id) else {
         return unknown();
     };
@@ -819,8 +926,12 @@ async fn resume_stream(
     }
     let fresh = last_seq < pending.seq;
     match (&pending.step, fresh) {
-        (Step::Asked { .. }, true) => sse_response(elicitation::question_stream(&pending).unwrap_or_default()),
-        (Step::Done { .. }, true) => sse_response(elicitation::result_stream(&pending).unwrap_or_default()),
+        (Step::Asked { .. }, true) => {
+            sse_response(elicitation::question_stream(&pending).unwrap_or_default())
+        }
+        (Step::Done { .. }, true) => {
+            sse_response(elicitation::result_stream(&pending).unwrap_or_default())
+        }
         (Step::Done { .. }, false) => unknown(),
         _ => sse_response(elicitation::waiting_stream()),
     }
@@ -904,7 +1015,11 @@ async fn response_filter(
             return;
         }
         Mode::MayElicit => {
-            if let Some(reply) = parsed.as_ref().ok().filter(|r| elicitation::is_elicitable(r)) {
+            if let Some(reply) = parsed
+                .as_ref()
+                .ok()
+                .filter(|r| elicitation::is_elicitable(r))
+            {
                 if let Some(stream) = start_elicitation(bridge, &transcoded, reply).await {
                     write(&stream);
                     return;
@@ -933,15 +1048,25 @@ async fn response_filter(
     });
     match reply {
         Some(reply) if delivered => remember(bridge, &transcoded, &reply).await,
-        Some(_) => logger::warn!("The agent's answer could not be returned in full; session not updated."),
+        Some(_) => {
+            logger::warn!("The agent's answer could not be returned in full; session not updated.")
+        }
         None => {}
     }
 }
 
 /// Stores the agent's question and returns the SSE stream that asks it, or `None` to answer the
 /// call the client-managed way (no randomness, or the store refused the write).
-async fn start_elicitation(bridge: &Bridge, transcoded: &Transcoded, reply: &a2a::AgentReply) -> Option<Vec<u8>> {
-    let (Some(store), Some(key), Some(settings)) = (&bridge.sessions, &transcoded.session_key, &bridge.elicitation) else {
+async fn start_elicitation(
+    bridge: &Bridge,
+    transcoded: &Transcoded,
+    reply: &a2a::AgentReply,
+) -> Option<Vec<u8>> {
+    let (Some(store), Some(key), Some(settings)) = (
+        &bridge.sessions,
+        &transcoded.session_key,
+        &bridge.elicitation,
+    ) else {
         return None;
     };
     let deadline = session::now_seconds() + settings.timeout_seconds;
@@ -970,18 +1095,28 @@ async fn settle_answer(
     round: u32,
     outcome: Result<a2a::AgentReply, Value>,
 ) {
-    let (Some(store), Some(key), Some(settings)) = (&bridge.sessions, &transcoded.session_key, &bridge.elicitation) else {
+    let (Some(store), Some(key), Some(settings)) = (
+        &bridge.sessions,
+        &transcoded.session_key,
+        &bridge.elicitation,
+    ) else {
         return;
     };
-    let ask_again = matches!(&outcome, Ok(reply) if elicitation::is_elicitable(reply)) && round < settings.max_rounds;
+    let ask_again = matches!(&outcome, Ok(reply) if elicitation::is_elicitable(reply))
+        && round < settings.max_rounds;
     let (response, fit) = match &outcome {
         _ if ask_again => (String::new(), mcp::Fit::Full),
         Ok(reply) => {
-            let result = a2a::tool_result_from_reply(reply, &bridge.tool_name, bridge.structured_content);
-            let (bytes, fit) = mcp::bounded_result_envelope(&transcoded.rpc_id, result, mcp::MAX_BODY_BYTES);
+            let result =
+                a2a::tool_result_from_reply(reply, &bridge.tool_name, bridge.structured_content);
+            let (bytes, fit) =
+                mcp::bounded_result_envelope(&transcoded.rpc_id, result, mcp::MAX_BODY_BYTES);
             (String::from_utf8_lossy(&bytes).into_owned(), fit)
         }
-        Err(result) => (mcp::result_envelope(&transcoded.rpc_id, result.clone()).to_string(), mcp::Fit::Replaced),
+        Err(result) => (
+            mcp::result_envelope(&transcoded.rpc_id, result.clone()).to_string(),
+            mcp::Fit::Replaced,
+        ),
     };
     let deadline = session::now_seconds() + settings.timeout_seconds;
     let stored = store
@@ -997,8 +1132,12 @@ async fn settle_answer(
         })
         .await;
     match outcome {
-        Ok(reply) if stored && fit != mcp::Fit::Replaced => remember(bridge, transcoded, &reply).await,
-        _ if !stored => logger::debug!("The question was settled before the agent answered; reply dropped."),
+        Ok(reply) if stored && fit != mcp::Fit::Replaced => {
+            remember(bridge, transcoded, &reply).await
+        }
+        _ if !stored => {
+            logger::debug!("The question was settled before the agent answered; reply dropped.")
+        }
         _ => {}
     }
 }
@@ -1016,7 +1155,9 @@ async fn remember(bridge: &Bridge, transcoded: &Transcoded, reply: &a2a::AgentRe
     if reply.context_id.is_none() && pending_task.is_none() {
         return;
     }
-    store.update(key, reply.context_id.clone(), pending_task).await;
+    store
+        .update(key, reply.context_id.clone(), pending_task)
+        .await;
 }
 
 #[entrypoint]

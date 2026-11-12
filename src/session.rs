@@ -87,21 +87,34 @@ enum Backend {
 }
 
 impl Backend {
-    fn new(builder: &DataStorageBuilder, mode: &str, ttl_seconds: u64, namespace: &str) -> Option<Self> {
+    fn new(
+        builder: &DataStorageBuilder,
+        mode: &str,
+        ttl_seconds: u64,
+        namespace: &str,
+    ) -> Option<Self> {
         match mode {
             "local" => Some(Backend::Local(builder.local(namespace))),
-            "remote" => Some(Backend::Remote(builder.remote(namespace, remote_ttl_millis(ttl_seconds)))),
+            "remote" => Some(Backend::Remote(
+                builder.remote(namespace, remote_ttl_millis(ttl_seconds)),
+            )),
             _ => None,
         }
     }
 
-    async fn get<T: Touched + DeserializeOwned>(&self, key: &str, ttl_seconds: u64) -> Option<(T, String)> {
+    async fn get<T: Touched + DeserializeOwned>(
+        &self,
+        key: &str,
+        ttl_seconds: u64,
+    ) -> Option<(T, String)> {
         let found = match self {
             Backend::Local(s) => s.get::<T>(key).await,
             Backend::Remote(s) => s.get::<T>(key).await,
         };
         match found {
-            Ok(Some((entry, cas))) if entry.is_live(now_seconds(), ttl_seconds) => Some((entry, cas)),
+            Ok(Some((entry, cas))) if entry.is_live(now_seconds(), ttl_seconds) => {
+                Some((entry, cas))
+            }
             Ok(_) => None,
             Err(err) => {
                 // Fail open: losing the remembered context only starts a new conversation.
@@ -175,7 +188,12 @@ impl SessionStore {
         let ttl_seconds = clamp_ttl(ttl_seconds);
         let backend = Backend::new(builder, mode, ttl_seconds, namespace)?;
         let elicitations = if elicitation {
-            Backend::new(builder, mode, ttl_seconds, &format!("{}/elicitation", namespace))
+            Backend::new(
+                builder,
+                mode,
+                ttl_seconds,
+                &format!("{}/elicitation", namespace),
+            )
         } else {
             None
         };
@@ -209,7 +227,10 @@ impl SessionStore {
             return false;
         }
         if let (true, Some(elicitations)) = (elicitation, &self.elicitations) {
-            let entry = ElicitationEntry { pending: None, touched_at: now_seconds() };
+            let entry = ElicitationEntry {
+                pending: None,
+                touched_at: now_seconds(),
+            };
             elicitations.put(key, &StoreMode::Always, &entry).await;
         }
         true
@@ -235,9 +256,16 @@ impl SessionStore {
     /// Changes the live entry with `change`, which returns `false` to leave it as it is. The
     /// compare-and-swap means a change decided on a stale entry is dropped, not merged.
     /// Returns `true` when the change was stored.
-    pub async fn update_with(&self, key: &str, change: impl FnOnce(&mut SessionEntry) -> bool) -> bool {
+    pub async fn update_with(
+        &self,
+        key: &str,
+        change: impl FnOnce(&mut SessionEntry) -> bool,
+    ) -> bool {
         let Some((mut entry, cas)) = self.get(key).await else {
-            logger::debug!("Session {} ended before the agent answered; not remembered.", key_hint(key));
+            logger::debug!(
+                "Session {} ended before the agent answered; not remembered.",
+                key_hint(key)
+            );
             return false;
         };
         if !change(&mut entry) {
@@ -251,15 +279,25 @@ impl SessionStore {
     /// Callers check that the session itself is live first.
     pub async fn load_elicitation(&self, key: &str) -> Option<ElicitationEntry> {
         let elicitations = self.elicitations.as_ref()?;
-        elicitations.get(key, self.ttl_seconds).await.map(|(entry, _)| entry)
+        elicitations
+            .get(key, self.ttl_seconds)
+            .await
+            .map(|(entry, _)| entry)
     }
 
     /// Like [`update_with`](Self::update_with), for the elicitation state.
-    pub async fn update_elicitation(&self, key: &str, change: impl FnOnce(&mut ElicitationEntry) -> bool) -> bool {
+    pub async fn update_elicitation(
+        &self,
+        key: &str,
+        change: impl FnOnce(&mut ElicitationEntry) -> bool,
+    ) -> bool {
         let Some(elicitations) = &self.elicitations else {
             return false;
         };
-        let Some((mut entry, cas)) = elicitations.get::<ElicitationEntry>(key, self.ttl_seconds).await else {
+        let Some((mut entry, cas)) = elicitations
+            .get::<ElicitationEntry>(key, self.ttl_seconds)
+            .await
+        else {
             return false;
         };
         if !change(&mut entry) {
@@ -282,12 +320,14 @@ impl SessionStore {
         }
         let writes = self.writes.get().wrapping_add(1);
         self.writes.set(writes);
-        if writes % LOCAL_SWEEP_INTERVAL != 0 {
+        if !writes.is_multiple_of(LOCAL_SWEEP_INTERVAL) {
             return;
         }
         self.backend.sweep::<SessionEntry>(self.ttl_seconds).await;
         if let Some(elicitations) = &self.elicitations {
-            elicitations.sweep::<ElicitationEntry>(self.ttl_seconds).await;
+            elicitations
+                .sweep::<ElicitationEntry>(self.ttl_seconds)
+                .await;
         }
     }
 }
@@ -379,7 +419,7 @@ pub mod test_clock {
     use std::cell::Cell;
 
     thread_local! {
-        pub static OFFSET: Cell<u64> = Cell::new(0);
+        pub static OFFSET: Cell<u64> = const { Cell::new(0) };
     }
 
     pub fn advance(seconds: u64) {
@@ -407,8 +447,14 @@ mod tests {
     #[test]
     fn session_key_encoding_is_unambiguous() {
         // With "<sid>:<identity>" concatenation these pairs collided.
-        assert_ne!(session_key("x", "a:b", Some("c")), session_key("x", "a", Some("b:c")));
-        assert_ne!(session_key("x", "ab", None), session_key("x", "a", Some("b")));
+        assert_ne!(
+            session_key("x", "a:b", Some("c")),
+            session_key("x", "a", Some("b:c"))
+        );
+        assert_ne!(
+            session_key("x", "ab", None),
+            session_key("x", "a", Some("b"))
+        );
         assert_ne!(session_key("x", "s", Some("")), session_key("x", "s", None));
         assert_ne!(session_key("xs", "1", None), session_key("x", "s1", None));
     }
@@ -446,7 +492,11 @@ mod tests {
 
     #[test]
     fn expiry_follows_the_configured_ttl() {
-        let entry = SessionEntry { context_id: None, task_id: None, touched_at: 1_000 };
+        let entry = SessionEntry {
+            context_id: None,
+            task_id: None,
+            touched_at: 1_000,
+        };
         assert!(entry.is_live(1_000 + 1_799, 1_800));
         assert!(!entry.is_live(1_000 + 1_800, 1_800));
         // Lowering the TTL after the write expires the entry early.
