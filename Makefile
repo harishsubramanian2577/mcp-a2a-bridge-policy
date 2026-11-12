@@ -2,6 +2,9 @@ export PDK_COMPATIBILITY_VERSION = 1.4.0
 TARGET                	:= wasm32-wasip1
 TARGET_DIR            	:= target/$(TARGET)/release
 CARGO_ANYPOINT        	:= cargo-anypoint
+# Lowest Flex Gateway that can load the policy. enable_stop_iteration needs 1.11.0.
+# Written into target/implementation*/metadata.yaml, which publish and release upload.
+MIN_RUNTIME_VERSION    	:= 1.11.0
 DEFINITION_NAME        	= $(shell anypoint-cli-v4 pdk policy-project definition get gcl-metadata-name)
 DEFINITION_NAMESPACE   	= $(shell anypoint-cli-v4 pdk policy-project definition get gcl-metadata-namespace)
 DEFINITION_SRC_GCL_PATH = $(shell anypoint-cli-v4 pdk policy-project locate-gcl definition-src)
@@ -77,6 +80,7 @@ release: build ## Publish a release version
 .PHONY: build-asset-files
 build-asset-files: $(DEFINITION_SRC_GCL_PATH)
 	@anypoint-cli-v4 pdk policy-project build-asset-files --metadata '$(ANYPOINT_METADATA_JSON)'
+	@python3 scripts/check-min-runtime.py --write $(MIN_RUNTIME_VERSION)
 	@cargo anypoint config-gen -p -m $(DEFINITION_SRC_GCL_PATH) -o src/generated/config.rs
 
 .PHONY: install-cargo-anypoint

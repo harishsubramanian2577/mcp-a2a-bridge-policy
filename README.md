@@ -77,11 +77,12 @@ This is a PDK 1.8 single-project (unified) layout: one `make release` publishes 
 Prerequisites:
 - Anypoint CLI v4 with `anypoint-pdk-plugin`
 - Rust with the `wasm32-wasip1` target
+- Python 3.11 or later, for the build's runtime-version check
 - Docker, for the playground and integration tests
 
 ```bash
 make setup        # once
-make build        # builds the WASM binary
+make build        # builds the WASM binary; fails if metadata understates the Flex version needed
 cargo test --lib  # unit tests, no Docker needed
 make test         # integration tests (Docker); needs a local-mode tests/config/registration.yaml
 make test-shared-storage  # two Flex replicas + Redis session test; REGISTRATION=<local-mode registration.yaml>
