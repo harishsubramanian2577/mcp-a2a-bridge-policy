@@ -43,7 +43,12 @@ pub fn error_envelope(id: &Value, code: i64, message: &str) -> Value {
 
 pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
     requested
-        .and_then(|r| SUPPORTED_PROTOCOL_VERSIONS.iter().find(|v| **v == r).copied())
+        .and_then(|r| {
+            SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .find(|v| **v == r)
+                .copied()
+        })
         .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
 }
 
@@ -248,9 +253,13 @@ mod tests {
     #[test]
     fn tool_definition_advertises_reset_only_with_store() {
         let without = tool_definition("ask_agent", "d", false);
-        assert!(without["inputSchema"]["properties"].get(ARG_NEW_CONVERSATION).is_none());
+        assert!(without["inputSchema"]["properties"]
+            .get(ARG_NEW_CONVERSATION)
+            .is_none());
         let with = tool_definition("ask_agent", "d", true);
-        assert!(with["inputSchema"]["properties"].get(ARG_NEW_CONVERSATION).is_some());
+        assert!(with["inputSchema"]["properties"]
+            .get(ARG_NEW_CONVERSATION)
+            .is_some());
         assert_eq!(with["inputSchema"]["required"], json!([ARG_MESSAGE]));
     }
 
@@ -304,13 +313,20 @@ mod tests {
         // A 600,000-character data part appears twice (text + structuredContent): ~1.2 MB.
         let big = "x".repeat(600_000);
         let data = json!(big);
-        let (bytes, fit) = bounded_result_envelope(&json!(1), answer(&data.to_string(), Some(data)), MAX_BODY_BYTES);
+        let (bytes, fit) = bounded_result_envelope(
+            &json!(1),
+            answer(&data.to_string(), Some(data)),
+            MAX_BODY_BYTES,
+        );
         assert_eq!(fit, Fit::Reduced);
         assert!(bytes.len() < MAX_BODY_BYTES);
         let env = parse(&bytes);
         assert!(env["result"]["structuredContent"].get("data").is_none());
         assert_eq!(env["result"]["structuredContent"]["contextId"], "ctx");
-        assert_eq!(env["result"]["content"][0]["text"].as_str().unwrap().len(), 600_002);
+        assert_eq!(
+            env["result"]["content"][0]["text"].as_str().unwrap().len(),
+            600_002
+        );
         assert_eq!(env["result"]["content"][1]["text"], "hint");
     }
 
@@ -318,10 +334,17 @@ mod tests {
     fn escaped_text_expansion_is_truncated_under_the_limit() {
         // 600,000 quotes serialise to 1,200,000 bytes even after the data copy is dropped.
         let quotes = "\"".repeat(600_000);
-        let (bytes, fit) = bounded_result_envelope(&json!(1), answer(&quotes, Some(json!(quotes.clone()))), MAX_BODY_BYTES);
+        let (bytes, fit) = bounded_result_envelope(
+            &json!(1),
+            answer(&quotes, Some(json!(quotes.clone()))),
+            MAX_BODY_BYTES,
+        );
         assert_eq!(fit, Fit::Reduced);
         assert!(bytes.len() < MAX_BODY_BYTES, "{} bytes", bytes.len());
-        let text = parse(&bytes)["result"]["content"][0]["text"].as_str().unwrap().to_string();
+        let text = parse(&bytes)["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(text.ends_with("Ask for a shorter answer.]"));
         assert!(text.len() < 600_000);
     }

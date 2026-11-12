@@ -49,13 +49,17 @@ pub fn is_a2a_method(method: &str) -> bool {
 pub fn is_http_json_route(http_method: &str, path: &str) -> bool {
     let path = path.split(['?', '#']).next().unwrap_or("");
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let tail = |n: usize| segments.len().checked_sub(n).map(|start| &segments[start..]);
+    let tail = |n: usize| {
+        segments
+            .len()
+            .checked_sub(n)
+            .map(|start| &segments[start..])
+    };
 
     let action = segments.last().and_then(|last| last.rsplit_once(':'));
     if let Some((target, verb)) = action {
-        let task_action = !target.is_empty()
-            && segments.len() >= 2
-            && segments[segments.len() - 2] == "tasks";
+        let task_action =
+            !target.is_empty() && segments.len() >= 2 && segments[segments.len() - 2] == "tasks";
         return match (http_method, target, verb) {
             ("POST", "message", "send" | "stream") => true,
             ("POST", _, "cancel") => task_action,
@@ -543,7 +547,8 @@ fn continuation_hint(reply: &AgentReply, tool_name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    const SAMPLE_RESPONSE: &str = include_str!("../tests/fixtures/a2a_v1_send_message_response.json");
+    const SAMPLE_RESPONSE: &str =
+        include_str!("../tests/fixtures/a2a_v1_send_message_response.json");
 
     #[test]
     fn builds_v1_request_like_the_broker_sample() {
@@ -572,7 +577,14 @@ mod tests {
 
     #[test]
     fn builds_v03_request_with_continuation_ids() {
-        let req = build_send_message(A2aVersion::V03, &json!(7), "m1", "yes", Some("c1"), Some("t1"));
+        let req = build_send_message(
+            A2aVersion::V03,
+            &json!(7),
+            "m1",
+            "yes",
+            Some("c1"),
+            Some("t1"),
+        );
         assert_eq!(req["method"], "message/send");
         assert_eq!(req["id"], 7);
         let message = &req["params"]["message"];
@@ -585,10 +597,17 @@ mod tests {
 
     #[test]
     fn parses_broker_sample_completed_task_with_data_part() {
-        let reply = parse_agent_response(200, "application/json", SAMPLE_RESPONSE.as_bytes()).unwrap();
+        let reply =
+            parse_agent_response(200, "application/json", SAMPLE_RESPONSE.as_bytes()).unwrap();
         assert_eq!(reply.state, TaskState::Completed);
-        assert_eq!(reply.context_id.as_deref(), Some("59ec80cd-988c-47fd-8917-1f84dd3bd409"));
-        assert_eq!(reply.task_id.as_deref(), Some("94da0605-5da3-4eaf-8aae-a34cea57ddb6"));
+        assert_eq!(
+            reply.context_id.as_deref(),
+            Some("59ec80cd-988c-47fd-8917-1f84dd3bd409")
+        );
+        assert_eq!(
+            reply.task_id.as_deref(),
+            Some("94da0605-5da3-4eaf-8aae-a34cea57ddb6")
+        );
         assert_eq!(reply.data.len(), 1);
         assert_eq!(reply.data[0]["id"], "100200300");
         assert!(reply.texts[0].contains("SOP 2.2"));
@@ -596,11 +615,15 @@ mod tests {
 
     #[test]
     fn maps_sample_to_mcp_tool_result() {
-        let reply = parse_agent_response(200, "application/json", SAMPLE_RESPONSE.as_bytes()).unwrap();
+        let reply =
+            parse_agent_response(200, "application/json", SAMPLE_RESPONSE.as_bytes()).unwrap();
         let result = tool_result_from_reply(&reply, "ask_agent", true);
         assert_eq!(result["isError"], false);
         assert_eq!(result["structuredContent"]["state"], "completed");
-        assert_eq!(result["structuredContent"]["contextId"], "59ec80cd-988c-47fd-8917-1f84dd3bd409");
+        assert_eq!(
+            result["structuredContent"]["contextId"],
+            "59ec80cd-988c-47fd-8917-1f84dd3bd409"
+        );
         assert_eq!(result["structuredContent"]["data"][0]["spaceKey"], "SAMPLE");
         let hint = result["content"][1]["text"].as_str().unwrap();
         assert!(hint.contains("context_id=\"59ec80cd-988c-47fd-8917-1f84dd3bd409\""));
@@ -616,12 +639,16 @@ mod tests {
             "status": { "state": "TASK_STATE_INPUT_REQUIRED", "message": {
                 "role": "ROLE_AGENT", "parts": [{ "text": "Which space?" }] } }
         }}});
-        let reply = parse_agent_response(200, "application/json", body.to_string().as_bytes()).unwrap();
+        let reply =
+            parse_agent_response(200, "application/json", body.to_string().as_bytes()).unwrap();
         assert_eq!(reply.state, TaskState::InputRequired);
         assert_eq!(reply.texts, vec!["Which space?".to_string()]);
         let result = tool_result_from_reply(&reply, "ask_agent", true);
         assert_eq!(result["isError"], false);
-        assert!(result["content"][1]["text"].as_str().unwrap().contains("task_id=\"t9\""));
+        assert!(result["content"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("task_id=\"t9\""));
     }
 
     #[test]
@@ -631,7 +658,8 @@ mod tests {
             "status": { "state": "completed" },
             "artifacts": [{ "parts": [{ "kind": "text", "text": "done" }] }]
         }});
-        let reply = parse_agent_response(200, "application/json", body.to_string().as_bytes()).unwrap();
+        let reply =
+            parse_agent_response(200, "application/json", body.to_string().as_bytes()).unwrap();
         assert_eq!(reply.state, TaskState::Completed);
         assert_eq!(reply.texts, vec!["done".to_string()]);
     }
@@ -640,7 +668,8 @@ mod tests {
     fn message_result_is_completed() {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "result": { "message": {
             "role": "ROLE_AGENT", "contextId": "c2", "parts": [{ "text": "hello" }] }}});
-        let reply = parse_agent_response(200, "application/json", body.to_string().as_bytes()).unwrap();
+        let reply =
+            parse_agent_response(200, "application/json", body.to_string().as_bytes()).unwrap();
         assert_eq!(reply.state, TaskState::Completed);
         assert_eq!(reply.context_id.as_deref(), Some("c2"));
         assert_eq!(reply.task_id, None);
@@ -652,21 +681,29 @@ mod tests {
             "id": "t", "contextId": "c",
             "status": { "state": "TASK_STATE_FAILED", "message": { "parts": [{ "text": "boom" }] } }
         }}});
-        let reply = parse_agent_response(200, "application/json", body.to_string().as_bytes()).unwrap();
-        assert!(tool_result_from_reply(&reply, "ask_agent", true)["isError"].as_bool().unwrap());
+        let reply =
+            parse_agent_response(200, "application/json", body.to_string().as_bytes()).unwrap();
+        assert!(tool_result_from_reply(&reply, "ask_agent", true)["isError"]
+            .as_bool()
+            .unwrap());
     }
 
     #[test]
     fn jsonrpc_error_and_http_errors_become_messages() {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32001, "message": "Task not found" } });
-        let err = parse_agent_response(200, "application/json", body.to_string().as_bytes()).unwrap_err();
+        let err =
+            parse_agent_response(200, "application/json", body.to_string().as_bytes()).unwrap_err();
         assert_eq!(err, "A2A error -32001: Task not found");
 
-        let err = parse_agent_response(401, "application/json", body.to_string().as_bytes()).unwrap_err();
+        let err =
+            parse_agent_response(401, "application/json", body.to_string().as_bytes()).unwrap_err();
         assert!(err.starts_with("A2A error -32001"));
 
         let err = parse_agent_response(502, "text/html", b"<html>Bad gateway</html>").unwrap_err();
-        assert_eq!(err, "The A2A agent returned HTTP 502: <html>Bad gateway</html>");
+        assert_eq!(
+            err,
+            "The A2A agent returned HTTP 502: <html>Bad gateway</html>"
+        );
     }
 
     #[test]
@@ -690,17 +727,29 @@ mod tests {
             { "url": "https://x/b.png", "mediaType": "image/png", "filename": "b.png" },
             { "raw": "AAAA", "mediaType": "image/png" }
         ])));
-        assert_eq!(reply.texts[0], "[file a.pdf (application/pdf): https://x/a.pdf]");
+        assert_eq!(
+            reply.texts[0],
+            "[file a.pdf (application/pdf): https://x/a.pdf]"
+        );
         assert_eq!(reply.texts[1], "[file b.png (image/png): https://x/b.png]");
-        assert_eq!(reply.texts[2], "[file file (image/png): inline content omitted]");
+        assert_eq!(
+            reply.texts[2],
+            "[file file (image/png): inline content omitted]"
+        );
     }
 
     #[test]
     fn task_state_accepts_both_spellings() {
-        assert_eq!(TaskState::parse("TASK_STATE_AUTH_REQUIRED"), TaskState::AuthRequired);
+        assert_eq!(
+            TaskState::parse("TASK_STATE_AUTH_REQUIRED"),
+            TaskState::AuthRequired
+        );
         assert_eq!(TaskState::parse("input-required"), TaskState::InputRequired);
         assert_eq!(TaskState::parse("cancelled"), TaskState::Canceled);
-        assert_eq!(TaskState::parse("TASK_STATE_UNSPECIFIED"), TaskState::Unknown);
+        assert_eq!(
+            TaskState::parse("TASK_STATE_UNSPECIFIED"),
+            TaskState::Unknown
+        );
     }
 
     #[test]
@@ -749,7 +798,10 @@ mod tests {
     #[test]
     fn version_query_is_stripped_case_insensitively() {
         assert_eq!(strip_version_query("/a?A2A-Version=0.3"), "/a");
-        assert_eq!(strip_version_query("/a?x=1&a2a-version=1.0&y=2"), "/a?x=1&y=2");
+        assert_eq!(
+            strip_version_query("/a?x=1&a2a-version=1.0&y=2"),
+            "/a?x=1&y=2"
+        );
         assert_eq!(strip_version_query("/a?x=1"), "/a?x=1");
         assert_eq!(strip_version_query("/a"), "/a");
     }

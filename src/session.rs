@@ -85,7 +85,9 @@ impl SessionStore {
             Backend::Remote(s) => s.get::<SessionEntry>(key).await,
         };
         match found {
-            Ok(Some((entry, cas))) if entry.is_live(now_seconds(), self.ttl_seconds) => Some((entry, cas)),
+            Ok(Some((entry, cas))) if entry.is_live(now_seconds(), self.ttl_seconds) => {
+                Some((entry, cas))
+            }
             Ok(_) => None,
             Err(err) => {
                 // Fail open: losing the remembered context only starts a new conversation.
@@ -133,7 +135,10 @@ impl SessionStore {
     /// stays deleted: the compare-and-swap only updates the entry that is still there.
     pub async fn update(&self, key: &str, context_id: String, task_id: Option<String>) {
         let Some((_, cas)) = self.get(key).await else {
-            logger::debug!("Session {} ended before the agent answered; not remembered.", key_hint(key));
+            logger::debug!(
+                "Session {} ended before the agent answered; not remembered.",
+                key_hint(key)
+            );
             return;
         };
         let entry = self.fresh_entry(Some(context_id), task_id);
@@ -156,7 +161,7 @@ impl SessionStore {
         };
         let writes = self.writes.get().wrapping_add(1);
         self.writes.set(writes);
-        if writes % LOCAL_SWEEP_INTERVAL != 0 {
+        if !writes.is_multiple_of(LOCAL_SWEEP_INTERVAL) {
             return;
         }
         let Ok(keys) = storage.get_keys().await else {
@@ -271,8 +276,14 @@ mod tests {
     #[test]
     fn session_key_encoding_is_unambiguous() {
         // With "<sid>:<identity>" concatenation these pairs collided.
-        assert_ne!(session_key("x", "a:b", Some("c")), session_key("x", "a", Some("b:c")));
-        assert_ne!(session_key("x", "ab", None), session_key("x", "a", Some("b")));
+        assert_ne!(
+            session_key("x", "a:b", Some("c")),
+            session_key("x", "a", Some("b:c"))
+        );
+        assert_ne!(
+            session_key("x", "ab", None),
+            session_key("x", "a", Some("b"))
+        );
         assert_ne!(session_key("x", "s", Some("")), session_key("x", "s", None));
         assert_ne!(session_key("xs", "1", None), session_key("x", "s1", None));
     }
@@ -310,7 +321,11 @@ mod tests {
 
     #[test]
     fn expiry_follows_the_configured_ttl() {
-        let entry = SessionEntry { context_id: None, task_id: None, touched_at: 1_000 };
+        let entry = SessionEntry {
+            context_id: None,
+            task_id: None,
+            touched_at: 1_000,
+        };
         assert!(entry.is_live(1_000 + 1_799, 1_800));
         assert!(!entry.is_live(1_000 + 1_800, 1_800));
         // Lowering the TTL after the write expires the entry early.

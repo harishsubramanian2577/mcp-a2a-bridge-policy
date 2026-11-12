@@ -106,7 +106,9 @@ impl Bridge {
 fn resolve_forward_path(base_path: Option<&str>, a2a_path: Option<&str>) -> Option<String> {
     let a2a_path = a2a_path.map(str::trim).filter(|p| !p.is_empty())?;
     let Some(base_path) = base_path else {
-        logger::warn!("a2aPath is set but the API base path is unknown; paths will not be rewritten.");
+        logger::warn!(
+            "a2aPath is set but the API base path is unknown; paths will not be rewritten."
+        );
         return None;
     };
     let base = base_path.trim_end_matches('*').trim_end_matches('/');
@@ -162,7 +164,11 @@ impl Identity {
             Identity::Present(value) => Some(value.as_str()),
             Identity::Missing => return None,
         };
-        Some(session::session_key(&bridge.session_scope, session_id, identity))
+        Some(session::session_key(
+            &bridge.session_scope,
+            session_id,
+            identity,
+        ))
     }
 }
 
@@ -190,7 +196,11 @@ fn rpc_error(id: &Value, code: i64, message: &str) -> Flow<Option<Transcoded>> {
 }
 
 fn rpc_result(id: &Value, result: Value) -> Flow<Option<Transcoded>> {
-    Flow::Break(json_response(200, &mcp::result_envelope(id, result), vec![]))
+    Flow::Break(json_response(
+        200,
+        &mcp::result_envelope(id, result),
+        vec![],
+    ))
 }
 
 fn plain_status(status: u32) -> Flow<Option<Transcoded>> {
@@ -254,7 +264,11 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
         return pass_or_reject_media(bridge);
     }
     if !headers_state.contains_body() {
-        return rpc_error(&Value::Null, mcp::INVALID_REQUEST, "Empty JSON-RPC request body");
+        return rpc_error(
+            &Value::Null,
+            mcp::INVALID_REQUEST,
+            "Empty JSON-RPC request body",
+        );
     }
     let headers = RequestHeaders {
         session_id: handler.header(mcp::SESSION_ID_HEADER),
@@ -304,7 +318,11 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
         if bridge.pass_through_a2a {
             return Flow::Continue(None);
         }
-        return rpc_error(&id, mcp::METHOD_NOT_FOUND, "A2A methods are not accepted on this MCP endpoint");
+        return rpc_error(
+            &id,
+            mcp::METHOD_NOT_FOUND,
+            "A2A methods are not accepted on this MCP endpoint",
+        );
     }
     if mcp::is_notification(method) {
         return plain_status(202);
@@ -337,7 +355,11 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
             };
             transcode_tool_call(bridge, id, call, &headers, handler).await
         }
-        _ => rpc_error(&id, mcp::METHOD_NOT_FOUND, &format!("Method not found: {}", method)),
+        _ => rpc_error(
+            &id,
+            mcp::METHOD_NOT_FOUND,
+            &format!("Method not found: {}", method),
+        ),
     }
 }
 
@@ -434,11 +456,22 @@ async fn transcode_tool_call(
     )
     .to_string();
     if a2a_request.len() >= mcp::MAX_BODY_BYTES {
-        return rpc_error(&id, mcp::INVALID_PARAMS, "The message is too large to forward to the agent");
+        return rpc_error(
+            &id,
+            mcp::INVALID_PARAMS,
+            "The message is too large to forward to the agent",
+        );
     }
     if let Err(err) = handler.set_body(a2a_request.as_bytes()) {
-        logger::error!("Failed to rewrite tools/call into an A2A request: {:?}", err);
-        return rpc_error(&id, mcp::INTERNAL_ERROR, "Failed to forward the call to the A2A agent");
+        logger::error!(
+            "Failed to rewrite tools/call into an A2A request: {:?}",
+            err
+        );
+        return rpc_error(
+            &id,
+            mcp::INTERNAL_ERROR,
+            "Failed to forward the call to the A2A agent",
+        );
     }
 
     // The generated body decides the protocol, so path and version follow it, not the client.
@@ -528,7 +561,9 @@ async fn response_filter(
     });
     match reply {
         Some(reply) if delivered => remember(bridge, &transcoded, &reply).await,
-        Some(_) => logger::warn!("The agent's answer could not be returned in full; session not updated."),
+        Some(_) => {
+            logger::warn!("The agent's answer could not be returned in full; session not updated.")
+        }
         None => {}
     }
 }
