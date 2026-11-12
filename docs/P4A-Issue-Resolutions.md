@@ -33,7 +33,8 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
    - Command: `make build`.
    - Result: succeeded. The only new host import is WASI `random_get`, which Flex Gateway/Envoy provides.
 4. **Integration tests.**
-   - `tests/requests.rs` compiles (`cargo test --no-run`).
+   - `make test` passes on Flex 1.11.0: 61 unit tests and the `tools_call_round_trip` integration test.
+   - The first live run found a bug in the test itself. pdk-test puts the API path in the upstream `destinationPath`, so the gateway has no base path in local mode and `a2aPath` can't be applied. The test now calls the agent's path with `a2aPath` empty. The `a2aPath` rewrite is covered by unit tests.
    - `make test` needs a Flex registration: put a local-mode `registration.yaml` in `tests/config/` (gitignored), which is mounted into the gateway.
 5. **Shared-storage test.** `make test-shared-storage` passes on Flex 1.11.0, 1.12.0 and 1.13.0 (see issue #12 below).
 6. **Minimum gateway version.** The same harness on Flex 1.10.6 fails at load time with `FlexAbiHandler: command 'flex_enable_stop_iteration' unknown`. The request filter needs PDK's stop-iteration feature (the #4 fix), so 1.1.0 requires Flex Gateway 1.11.0 or later. The README and customer guide say so, and both integration tests are pinned to 1.11.0.
