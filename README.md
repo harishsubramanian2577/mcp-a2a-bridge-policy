@@ -99,7 +99,7 @@ make validate-definition  # Exchange metadata check; also run by make publish / 
 
 1. In `Cargo.toml`, set `group_id` to your business group ID and set `version`. A released version can't be overwritten, so bump it for every change.
 2. Authenticate with a connected app that has Exchange Contributor permission (`ANYPOINT_CLIENT_ID`, `ANYPOINT_CLIENT_SECRET`, `ANYPOINT_ORG`).
-3. Release. `make release` and `make publish` first run `scripts/validate-definition.py`, which checks the `assetTypes` tokens against Exchange's allow-list (the A2A v1 token is `a2av1`) and the description length limit:
+3. Release. `make release` and `make publish` first run `scripts/validate-definition.py`, which checks the `assetTypes` tokens against Exchange's allow-list (the A2A v1 token is `a2a_v1`) and the description length limit:
 
 ```bash
 make release   # or: make publish  (-DEV version for testing)

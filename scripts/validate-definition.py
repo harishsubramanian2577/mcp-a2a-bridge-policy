@@ -11,11 +11,11 @@ Usage: validate-definition.py [definition/gcl.yaml] [Cargo.toml]
 import re
 import sys
 
-# Exchange's allow-list for metadata/capabilities/assetTypes. The A2A v1 token is `a2av1`;
-# `a2a_v1` is the API Manager endpoint spelling and is rejected by Exchange.
-ALLOWED_ASSET_TYPES = {"http", "mcp", "a2a", "a2av1", "rest", "wsdl", "llm", "grpc", "websocket", "sse", "graphql"}
+# Exchange's allow-list for metadata/capabilities/assetTypes, as Exchange reports it when it rejects
+# a token (HTTP 400, 2026-11-11). The A2A v1 token is `a2a_v1`; `a2av1` is rejected.
+ALLOWED_ASSET_TYPES = {"http", "mcp", "a2a", "a2a_v1", "rest", "wsdl", "llm", "grpc", "websocket", "sse", "graphql"}
 # The asset types this policy is built for: MCP instances (Mode 1) and A2A instances (Mode 2).
-EXPECTED_ASSET_TYPES = ["mcp", "a2a", "a2av1"]
+EXPECTED_ASSET_TYPES = ["mcp", "a2a", "a2a_v1"]
 MAX_DESCRIPTION = 256
 
 

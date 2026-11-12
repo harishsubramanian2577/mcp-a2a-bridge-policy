@@ -26,7 +26,7 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 | #8 | SSE parser hides corrupt events and mishandles valid framing | Fixed in 1.3.0 |
 | #9 | Input-required tasks without contextId lose task continuation hints | Fixed in 1.3.0 |
 | #10 | Correct MCP policy ordering and state the adapter limitations | Fixed in 1.3.0 (documentation) |
-| #11 | Validate and correct the A2A v1 Exchange asset-type token | Fixed in 1.3.0. Not yet published to Exchange. |
+| #11 | Validate and correct the A2A v1 Exchange asset-type token | Resolved in 1.3.0. The token stays `a2a_v1`, which Exchange accepts; `a2av1` is rejected. |
 | #13 | Configurable MCP elicitation for A2A input-required | Fixed in 1.3.0. Experimental `enableElicitation`, **off by default** (the customer's client, ChatGPT, doesn't support elicitation). Client-managed mode is unchanged. Verified live on two replicas. |
 
 ## How the fixes were verified
@@ -257,7 +257,8 @@ The detailed reproductions in the issue were withheld pending a private channel.
    All shared-storage checks passed.
    ```
 
-5. **Definition check.** `make validate-definition` passes. With the old `a2a_v1` token it fails.
+5. **Definition check.** `make validate-definition` passes on `a2a_v1` and fails on `a2av1`, which Exchange rejects.
+6. **Exchange release.** 1.3.0 (definition and implementation) was released to Exchange on 2026-11-11 and is published.
 
 ---
 
@@ -478,16 +479,21 @@ A Task with `id: t9`, state `input-required` and no `contextId` produced only th
 ## Issue #11: A2A v1 Exchange asset-type token
 
 ### Resolution steps
-- [x] `definition/gcl.yaml`: `metadata/capabilities/assetTypes` is now `mcp,a2a,a2av1` (was `a2a_v1`).
+- [x] `definition/gcl.yaml`: `metadata/capabilities/assetTypes` stays `mcp,a2a,a2a_v1`. The issue proposed `a2av1`, but Exchange rejects that token (see the evidence below), so the original token was correct.
 - [x] Added `scripts/validate-definition.py` and `make validate-definition`. The script checks:
-  - every token is on the Exchange allow-list (`http`, `mcp`, `a2a`, `a2av1`, `rest`, `wsdl`, `llm`, `grpc`, `websocket`, `sse`, `graphql`);
+  - every token is on the Exchange allow-list, as Exchange reports it: `http`, `mcp`, `a2a`, `a2a_v1`, `rest`, `wsdl`, `llm`, `grpc`, `websocket`, `sse`, `graphql`;
   - there are no duplicates;
-  - the list is exactly `mcp,a2a,a2av1`;
+  - the list is exactly `mcp,a2a,a2a_v1`;
   - a title is present;
   - the descriptions in `gcl.yaml` and `Cargo.toml` are 256 characters or fewer.
 - [x] `make publish` and `make release` run the check first, so a bad token stops before upload.
 
-**Verification boundary:** the check fails on the old token and passes on the new one. The policy has not been published from this branch, so Exchange acceptance and applicability to an A2A v1 instance still need to be confirmed after publishing through the approved workflow.
+**Evidence (2026-11-11):**
+- A release with `mcp,a2a,a2av1` was rejected by Exchange with HTTP `400`: "/capabilities/assetTypes/2 must be equal to one of the allowed values (http, mcp, a2a, a2a_v1, rest, wsdl, llm, grpc, websocket, sse, graphql)". Nothing was published.
+- The 1.3.0 release with `mcp,a2a,a2a_v1` was accepted. The published definition's `metadata.yaml` lists `mcp`, `a2a` and `a2a_v1`.
+- The validator passes on `a2a_v1` and fails on `a2av1`.
+
+**Verification boundary:** Exchange accepts the token. That the policy is offered for, and applies to, MCP, A2A and A2A v1 instances in API Manager still needs to be confirmed.
 
 ### Files
 `definition/gcl.yaml`, `scripts/validate-definition.py`, `Makefile`.
