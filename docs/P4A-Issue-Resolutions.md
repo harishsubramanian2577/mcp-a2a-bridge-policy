@@ -5,10 +5,10 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 | | |
 |---|---|
 | Reviewed version | 1.0.3 (commit `3d61a41`) |
-| Fixed in | 1.1.0, branch `fix/p4a-priority-issues` (priority issues)<br>1.2.0, branch `fix/p4a-remaining-issues` (remaining issues) |
+| Fixed in | 1.1.0, branch `fix/p4a-priority-issues` (priority issues)<br>1.3.0, branch `fix/p4a-remaining-issues` (remaining issues; the interim 1.2.0 was never published) |
 | Priority issues | [#1](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/1), [#4](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/4), [#12](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/12) |
 | Remaining issues | [#2](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/2), [#3](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/3), [#5](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/5), [#6](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/6), [#7](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/7), [#8](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/8), [#9](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/9), [#10](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/10), [#11](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/11), [#13](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/13) |
-| Test baseline | 32 unit tests on 1.0.3, 61 on 1.1.0, 105 on 1.2.0, all passing |
+| Test baseline | 32 unit tests on 1.0.3, 61 on 1.1.0, 105 on 1.3.0, all passing |
 | Minimum gateway | Flex Gateway 1.11.0 (1.1.0 and later use PDK stop-iteration, which 1.10.x doesn't support) |
 
 ## Status
@@ -18,20 +18,20 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 | #1 | Failed response rewrite returns raw A2A payload instead of an MCP error | Fixed in 1.1.0 |
 | #4 | Classify native A2A before MCP dispatch and preserve native version semantics | Fixed in 1.1.0 |
 | #12 | Session isolation, identity binding and token generation | Fixed in 1.1.0. Verified live on two Flex replicas sharing Redis. Private reporting is enabled. |
-| #2 | Validate MCP envelopes and initialization before dispatching agent calls | Fixed in 1.2.0 |
-| #3 | Reject unsupported MCP-Protocol-Version headers on subsequent requests | Fixed in 1.2.0 |
-| #5 | Terminated MCP sessions remain usable and can be restored by late responses | Fixed in 1.2.0. Late answer after `DELETE` verified live on two replicas. |
-| #6 | Malformed upstream results are reported as successful completed tool calls | Fixed in 1.2.0 |
-| #7 | SSE artifact folding ignores replacement versus append semantics | Fixed in 1.2.0 |
-| #8 | SSE parser hides corrupt events and mishandles valid framing | Fixed in 1.2.0 |
-| #9 | Input-required tasks without contextId lose task continuation hints | Fixed in 1.2.0 |
-| #10 | Correct MCP policy ordering and state the adapter limitations | Fixed in 1.2.0 (documentation) |
-| #11 | Validate and correct the A2A v1 Exchange asset-type token | Fixed in 1.2.0. Not yet published to Exchange. |
-| #13 | Configurable MCP elicitation for A2A input-required | Fixed in 1.2.0. Experimental `enableElicitation`, **off by default** (the customer's client, ChatGPT, doesn't support elicitation). Client-managed mode is unchanged. Verified live on two replicas. |
+| #2 | Validate MCP envelopes and initialization before dispatching agent calls | Fixed in 1.3.0 |
+| #3 | Reject unsupported MCP-Protocol-Version headers on subsequent requests | Fixed in 1.3.0 |
+| #5 | Terminated MCP sessions remain usable and can be restored by late responses | Fixed in 1.3.0. Late answer after `DELETE` verified live on two replicas. |
+| #6 | Malformed upstream results are reported as successful completed tool calls | Fixed in 1.3.0 |
+| #7 | SSE artifact folding ignores replacement versus append semantics | Fixed in 1.3.0 |
+| #8 | SSE parser hides corrupt events and mishandles valid framing | Fixed in 1.3.0 |
+| #9 | Input-required tasks without contextId lose task continuation hints | Fixed in 1.3.0 |
+| #10 | Correct MCP policy ordering and state the adapter limitations | Fixed in 1.3.0 (documentation) |
+| #11 | Validate and correct the A2A v1 Exchange asset-type token | Fixed in 1.3.0. Not yet published to Exchange. |
+| #13 | Configurable MCP elicitation for A2A input-required | Fixed in 1.3.0. Experimental `enableElicitation`, **off by default** (the customer's client, ChatGPT, doesn't support elicitation). Client-managed mode is unchanged. Verified live on two replicas. |
 
 ## How the fixes were verified
 
-This section covers 1.1.0. For 1.2.0, see [Verification of 1.2.0](#verification-of-120).
+This section covers 1.1.0. For 1.3.0, see [Verification of 1.3.0](#verification-of-130).
 
 1. **Unit and filter tests.**
    - The tests drive the real policy entrypoint through the PDK 1.8.0 `pdk-unit` harness.
@@ -206,7 +206,7 @@ The detailed reproductions in the issue were withheld pending a private channel.
 | Test | What it proves | 1.0.3 | 1.1.0 |
 |---|---|---|---|
 | `tests::identity_binding_is_enforced_not_relaxed` | No session without identity. Omitted or changed identity can't read the session; the owner can. | Fails | Passes |
-| `tests::unissued_session_ids_are_ignored` | A caller-chosen `Mcp-Session-Id` is not stored or used. Renamed to `unissued_session_ids_are_not_found` in 1.2.0, where such an ID gets `404` (#5). | Fails | Passes |
+| `tests::unissued_session_ids_are_ignored` | A caller-chosen `Mcp-Session-Id` is not stored or used. Renamed to `unissued_session_ids_are_not_found` in 1.3.0, where such an ID gets `404` (#5). | Fails | Passes |
 | `tests::delete_ends_a_session_only_for_its_owner` | `DELETE` by another or anonymous caller gets `404` and the session survives; the owner gets `204` | Fails | Passes |
 | `tests::session_ids_are_random_and_ignore_tracing_headers` | 50 IDs with a fixed `x-request-id` are all different and don't contain it; same for `messageId` | Fails | Passes |
 | `tests::local_store_remembers_context_per_session` | Continuity still works for a valid session | Passes | Passes |
@@ -223,7 +223,7 @@ The detailed reproductions in the issue were withheld pending a private channel.
 
 ---
 
-## Verification of 1.2.0
+## Verification of 1.3.0
 
 1. **Unit and filter tests.**
    - Command: `cargo test --lib`.
@@ -234,8 +234,8 @@ The detailed reproductions in the issue were withheld pending a private channel.
    - The 13th, `session_ids_are_ignored_without_a_session_store`, is a guard test. It is expected to pass on both versions.
 3. **Integration tests.**
    - `make test` passes on Flex 1.11.0: 105 unit tests and the `tools_call_round_trip` integration test.
-   - The policy reference name includes the minor version (`mcp-atoa-bridge-policy-flex-v1-2`), so `tests/common/mod.rs` was updated for 1.2.0. Before that update, Flex reported `Extension ... not found` and the request reached the mock agent untranslated.
-   - The integration test now uses the fixture's JSON-RPC id (`broker-1`), because 1.2.0 rejects an agent answer whose id doesn't match the request (#6). It also sends `MCP-Protocol-Version: 2025-06-18`.
+   - The policy reference name includes the minor version (`mcp-atoa-bridge-policy-flex-v1-3`), so `tests/common/mod.rs` was updated for 1.3.0. Before that update, Flex reported `Extension ... not found` and the request reached the mock agent untranslated.
+   - The integration test now uses the fixture's JSON-RPC id (`broker-1`), because 1.3.0 rejects an agent answer whose id doesn't match the request (#6). It also sends `MCP-Protocol-Version: 2025-06-18`.
 4. **Shared-storage test.**
    - `make test-shared-storage` passes on Flex 1.11.0 with two replicas sharing Redis. That covers the 1.1.0 checks, updated for `404` (#5), plus a new "Late answer after delete" section and the elicitation sections shown under #13:
 
@@ -288,7 +288,7 @@ The detailed reproductions in the issue were withheld pending a private channel.
 `src/mcp.rs` (`classify`, `classify_json`, `initialize_protocol_version`, `error_body`), `src/lib.rs` (`request_filter`, `http_error`, `invalid_message`).
 
 ### Tests
-| Test | What it proves | 1.1.0 | 1.2.0 |
+| Test | What it proves | 1.1.0 | 1.3.0 |
 |---|---|---|---|
 | `tests::invalid_envelopes_get_errors_and_never_reach_the_agent` | Table of bad versions, ids, params and missing ids. Each gets the right error and status, and the agent is never called. | Fails | Passes |
 | `tests::notifications_and_responses_are_told_apart_by_structure` | Notifications and client responses get a bodyless `202`. A `notifications/*` method that carries an id gets a reply. | Fails | Passes |
@@ -315,7 +315,7 @@ The detailed reproductions in the issue were withheld pending a private channel.
 `src/mcp.rs` (`check_protocol_version_header`), `src/lib.rs`, docs.
 
 ### Tests
-| Test | What it proves | 1.1.0 | 1.2.0 |
+| Test | What it proves | 1.1.0 | 1.3.0 |
 |---|---|---|---|
 | `tests::unsupported_protocol_version_header_is_rejected_and_the_client_can_recover` | Unsupported and malformed headers get `400` without calling the agent. Supported and absent headers work. A retry succeeds. | Fails | Passes |
 | `tests::delete_checks_the_protocol_version_header` | `DELETE` with a bad header gets `400` and the session survives | Fails | Passes |
@@ -337,7 +337,7 @@ After `DELETE` (`204`), a call with the same session ID still reached the agent 
 `src/lib.rs` (`session_not_found`, `request_filter`, `transcode_tool_call`), `src/session.rs`, `tests/shared-storage/`.
 
 ### Tests
-| Test | What it proves | 1.1.0 | 1.2.0 |
+| Test | What it proves | 1.1.0 | 1.3.0 |
 |---|---|---|---|
 | `tests::terminated_session_gets_404_and_initialize_starts_a_new_one` | initialize, call, `DELETE`, call: the last call gets `404` without calling the agent, and a new `initialize` works | Fails | Passes |
 | `tests::unissued_session_ids_are_not_found` | A caller-chosen session ID gets `404` | Fails | Passes |
@@ -365,7 +365,7 @@ The pdk-unit harness runs a call to completion in one step, so it can't run a `D
 `src/a2a.rs` (`rpc_result`, `result_snapshot`, `task_snapshot`, `message_snapshot`, `parts`), `src/tests.rs`, `tests/requests.rs`.
 
 ### Tests
-| Test | What it proves | 1.1.0 | 1.2.0 |
+| Test | What it proves | 1.1.0 | 1.3.0 |
 |---|---|---|---|
 | `tests::malformed_or_uncorrelated_agent_answers_are_tool_errors` | The cases from the issue, plus a wrong id, through the filter. Each is a tool error and nothing is remembered. | Fails | Passes |
 | `a2a::tests::malformed_envelopes_are_invalid_responses` | Wrong version, wrong id, both or neither of result and error | n/a | Passes |
@@ -443,7 +443,7 @@ A Task with `id: t9`, state `input-required` and no `contextId` produced only th
 `src/a2a.rs` (`continuation_hint`, `into_reply`), docs.
 
 ### Tests
-| Test | What it proves | 1.1.0 | 1.2.0 |
+| Test | What it proves | 1.1.0 | 1.3.0 |
 |---|---|---|---|
 | `tests::input_required_task_without_context_keeps_its_continuation` | With structured content on and off, the result carries the state and `t9`, and the next call sends `taskId: t9` with no `contextId` | Fails | Passes |
 | `tests::auth_required_task_without_context_is_not_answered_with_secrets` | `auth-required` wording, without structured content | Fails | Passes |

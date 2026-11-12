@@ -7,7 +7,7 @@ It is a **single-tool adapter**, not a full MCP↔A2A protocol translation: each
 | | |
 |---|---|
 | Exchange assets | `mcp-a2a-bridge-policy` (definition), `mcp-atoa-bridge-policy-flex` (implementation) |
-| Version | 1.2.0 |
+| Version | 1.3.0 |
 | Category | Transformation |
 | API instance types | MCP, A2A (v0.3), A2A (v1.0) |
 | PDK | 1.8.0 |
@@ -38,7 +38,7 @@ It is a **single-tool adapter**, not a full MCP↔A2A protocol translation: each
 
 On an MCP instance (Mode 1), apply MuleSoft's **MCP Support** policy **first**, as MuleSoft requires; it isn't available in Local Mode, so local tests omit it. Put the bridge **after** authentication policies (Client ID enforcement, or OIDC with OAuth 2.0 Protected Resource Metadata). The bridge answers `initialize` and `tools/list` itself, so policies placed after it never run for those requests. Set the response timeout to about 120 s, because multi-agent answers can take 30–60 s.
 
-To report a security issue, see [SECURITY.md](SECURITY.md). Fixes in 1.1.0 and 1.2.0 for the P4A review findings are tracked in [docs/P4A-Issue-Resolutions.md](docs/P4A-Issue-Resolutions.md).
+To report a security issue, see [SECURITY.md](SECURITY.md). Fixes in 1.1.0 and 1.3.0 for the P4A review findings are tracked in [docs/P4A-Issue-Resolutions.md](docs/P4A-Issue-Resolutions.md).
 
 The full guide, with diagrams, every property, policy-order tables, limitations and a verification checklist, is in [docs/MCP-A2A-Bridge-Policy.md](docs/MCP-A2A-Bridge-Policy.md).
 
