@@ -309,14 +309,70 @@ fn optional_string(
 }
 
 fn parts(obj: &Map<String, Value>, what: &str) -> Result<Vec<Value>, String> {
-    match obj.get("parts") {
-        Some(Value::Array(parts)) if parts.iter().all(Value::is_object) => Ok(parts.clone()),
-        Some(Value::Array(_)) => Err(invalid(format!(
-            "{} has a part that is not an object",
-            what
-        ))),
-        _ => Err(invalid(format!("{} has no parts array", what))),
+    let Some(Value::Array(parts)) = obj.get("parts") else {
+        return Err(invalid(format!("{} has no parts array", what)));
+    };
+    for part in parts {
+        check_part(part).map_err(|detail| invalid(format!("{} has {}", what, detail)))?;
     }
+    Ok(parts.clone())
+}
+
+/// A part must carry content in one of the supported forms: v1.0 `text`, `data`, `url` or `raw`,
+/// or v0.3 `text`, `data` or `file` (with `uri` or `bytes`). A file part is valid but only
+/// described to the client; a part with no content, or content of the wrong type, is malformed.
+fn check_part(part: &Value) -> Result<(), String> {
+    let Some(obj) = part.as_object() else {
+        return Err("a part that is not an object".to_string());
+    };
+    let string = |key: &str| match obj.get(key) {
+        None => Ok(false),
+        Some(Value::String(_)) => Ok(true),
+        Some(_) => Err(format!("a part whose {} is not a string", key)),
+    };
+    for key in ["kind", "mediaType", "filename"] {
+        string(key)?;
+    }
+    if string("text")? || string("url")? || string("raw")? {
+        return Ok(());
+    }
+    if let Some(data) = obj.get("data") {
+        // v0.3 data parts hold an object; v1.0 holds any JSON value.
+        return match (obj.get("kind").and_then(Value::as_str), data) {
+            (_, Value::Null) => Err("a data part with null data".to_string()),
+            (Some("data"), data) if !data.is_object() => {
+                Err("a v0.3 data part whose data is not an object".to_string())
+            }
+            _ => Ok(()),
+        };
+    }
+    if let Some(file) = obj.get("file") {
+        let file = file
+            .as_object()
+            .ok_or("a file part whose file is not an object")?;
+        for key in ["name", "mimeType"] {
+            if file.get(key).is_some_and(|v| !v.is_string()) {
+                return Err(format!("a file part whose {} is not a string", key));
+            }
+        }
+        return match (file.get("uri"), file.get("bytes")) {
+            (Some(Value::String(_)), _) | (_, Some(Value::String(_))) => Ok(()),
+            _ => Err("a file part with no uri or bytes string".to_string()),
+        };
+    }
+    Err("a part with no text, data, file, url or raw content".to_string())
+}
+
+/// A Message: a recognised `role`, a non-empty `messageId` and valid parts. Returns its parts.
+fn message_parts(message: &Map<String, Value>, what: &str) -> Result<Vec<Value>, String> {
+    match message.get("role").and_then(Value::as_str) {
+        Some("ROLE_AGENT" | "ROLE_USER" | "agent" | "user") => {}
+        _ => return Err(invalid(format!("{} has no valid role", what))),
+    }
+    if optional_string(message, "messageId", what)?.is_none() {
+        return Err(invalid(format!("{} has no messageId", what)));
+    }
+    parts(message, what)
 }
 
 /// The `status` of a Task or status update: a recognised state and the status message's parts.
@@ -333,7 +389,9 @@ fn task_status(obj: &Map<String, Value>, what: &str) -> Result<(TaskState, Vec<V
         .ok_or_else(|| invalid(format!("unrecognised task state {:?}", raw)))?;
     let message_parts = match status.get("message") {
         None | Some(Value::Null) => Vec::new(),
-        Some(message) => parts(object(message, "the status message")?, "the status message")?,
+        Some(message) => {
+            message_parts(object(message, "the status message")?, "the status message")?
+        }
     };
     Ok((state, message_parts))
 }
@@ -432,11 +490,23 @@ impl Snapshot {
     fn adopt_ids(&mut self, update: &Map<String, Value>) -> Result<(), String> {
         let context_id = optional_string(update, "contextId", "the stream update")?;
         let task_id = optional_string(update, "taskId", "the stream update")?;
+        self.check_ids(context_id.as_deref(), task_id.as_deref())?;
         if self.context_id.is_none() {
             self.context_id = context_id;
         }
         if self.task_id.is_none() {
             self.task_id = task_id;
+        }
+        Ok(())
+    }
+
+    /// One stream answers one call, so every event must be about the same task and context.
+    fn check_ids(&self, context_id: Option<&str>, task_id: Option<&str>) -> Result<(), String> {
+        let differs = |known: &Option<String>, new: Option<&str>| matches!((known.as_deref(), new), (Some(a), Some(b)) if a != b);
+        if differs(&self.task_id, task_id) || differs(&self.context_id, context_id) {
+            return Err(invalid(
+                "the stream mixes events of different tasks or contexts",
+            ));
         }
         Ok(())
     }
@@ -487,7 +557,7 @@ fn message_snapshot(value: &Value) -> Result<Snapshot, String> {
     let mut snapshot = Snapshot::new(TaskState::Completed);
     snapshot.context_id = optional_string(message, "contextId", "the message")?;
     snapshot.task_id = optional_string(message, "taskId", "the message")?;
-    snapshot.status_parts = parts(message, "the message")?;
+    snapshot.status_parts = message_parts(message, "the message")?;
     Ok(snapshot)
 }
 
@@ -652,7 +722,11 @@ fn parse_sse_body(body: &[u8], expected_id: &Value) -> Result<Snapshot, String> 
                 .get_or_insert_with(|| Snapshot::new(TaskState::Unknown))
                 .apply_artifact(update)?;
         } else {
-            snapshot = Some(result_snapshot(result)?);
+            let next = result_snapshot(result)?;
+            if let Some(previous) = &snapshot {
+                previous.check_ids(next.context_id.as_deref(), next.task_id.as_deref())?;
+            }
+            snapshot = Some(next);
         }
     }
     snapshot.ok_or_else(|| "The A2A agent stream contained no result events".to_string())
@@ -886,7 +960,7 @@ mod tests {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "result": { "task": {
             "id": "t9", "contextId": "c9",
             "status": { "state": "TASK_STATE_INPUT_REQUIRED", "message": {
-                "role": "ROLE_AGENT", "parts": [{ "text": "Which space?" }] } }
+                "role": "ROLE_AGENT", "messageId": "m1", "parts": [{ "text": "Which space?" }] } }
         }}});
         let reply = parse_json(&body, &json!(1)).unwrap();
         assert_eq!(reply.state, TaskState::InputRequired);
@@ -916,14 +990,14 @@ mod tests {
     #[test]
     fn message_result_is_completed() {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "result": { "message": {
-            "role": "ROLE_AGENT", "contextId": "c2", "parts": [{ "text": "hello" }] }}});
+            "role": "ROLE_AGENT", "messageId": "m1", "contextId": "c2", "parts": [{ "text": "hello" }] }}});
         let reply = parse_json(&body, &json!(1)).unwrap();
         assert_eq!(reply.state, TaskState::Completed);
         assert_eq!(reply.context_id.as_deref(), Some("c2"));
         assert_eq!(reply.task_id, None);
 
         let v03 = json!({ "jsonrpc": "2.0", "id": 1, "result": {
-            "kind": "message", "role": "agent", "parts": [{ "kind": "text", "text": "hi" }] }});
+            "kind": "message", "role": "agent", "messageId": "m1", "parts": [{ "kind": "text", "text": "hi" }] }});
         assert_eq!(
             parse_json(&v03, &json!(1)).unwrap().texts,
             vec!["hi".to_string()]
@@ -934,7 +1008,7 @@ mod tests {
     fn failed_task_is_an_mcp_tool_error() {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "result": { "task": {
             "id": "t", "contextId": "c",
-            "status": { "state": "TASK_STATE_FAILED", "message": { "parts": [{ "text": "boom" }] } }
+            "status": { "state": "TASK_STATE_FAILED", "message": { "role": "ROLE_AGENT", "messageId": "m1", "parts": [{ "text": "boom" }] } }
         }}});
         let reply = parse_json(&body, &json!(1)).unwrap();
         assert!(tool_result_from_reply(&reply, "ask_agent", true)["isError"]
@@ -1009,7 +1083,7 @@ mod tests {
 
     #[test]
     fn malformed_envelopes_are_invalid_responses() {
-        let ok = json!({ "message": { "parts": [{ "text": "hi" }] } });
+        let ok = json!({ "message": { "role": "ROLE_AGENT", "messageId": "m1", "parts": [{ "text": "hi" }] } });
         for body in [
             json!({ "id": 1, "result": ok }),
             json!({ "jsonrpc": "1.0", "id": 1, "result": ok }),
@@ -1133,9 +1207,9 @@ mod tests {
     fn status_update_replaces_the_status_message() {
         let body = [
             event(json!({ "task": { "id": "t", "status": { "state": "TASK_STATE_WORKING",
-                "message": { "parts": [{ "text": "Looking it up…" }] } } } })),
+                "message": { "role": "ROLE_AGENT", "messageId": "m1", "parts": [{ "text": "Looking it up…" }] } } } })),
             event(json!({ "statusUpdate": { "taskId": "t", "status": { "state": "TASK_STATE_INPUT_REQUIRED",
-                "message": { "parts": [{ "text": "Which account?" }] } } } })),
+                "message": { "role": "ROLE_AGENT", "messageId": "m2", "parts": [{ "text": "Which account?" }] } } } })),
         ]
         .concat();
         let reply = parse_sse(&body).unwrap();
@@ -1166,7 +1240,7 @@ mod tests {
         }
 
         // A single event split over several data lines, and an empty data event that is ignored.
-        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\ndata: \"result\":{\"message\":{\"parts\":[{\"text\":\"hi\"}]}}}\n\ndata:\n\n";
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\ndata: \"result\":{\"message\":{\"role\":\"agent\",\"messageId\":\"m\",\"parts\":[{\"text\":\"hi\"}]}}}\n\ndata:\n\n";
         assert_eq!(parse_sse(body).unwrap().texts, vec!["hi".to_string()]);
 
         // The BOM case from the issue: one valid event that used to report no result events.
@@ -1235,7 +1309,7 @@ mod tests {
     fn input_required_without_context_keeps_the_task_hint() {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "result": { "task": { "id": "t9",
             "status": { "state": "TASK_STATE_INPUT_REQUIRED", "message": {
-                "role": "ROLE_AGENT", "parts": [{ "text": "Which account?" }] } } } } });
+                "role": "ROLE_AGENT", "messageId": "m1", "parts": [{ "text": "Which account?" }] } } } } });
         let reply = parse_json(&body, &json!(1)).unwrap();
         assert_eq!(reply.context_id, None);
 

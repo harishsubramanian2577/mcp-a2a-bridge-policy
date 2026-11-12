@@ -8,7 +8,7 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 | Fixed in | 1.1.0, branch `fix/p4a-priority-issues` (priority issues)<br>1.3.0, branch `fix/p4a-remaining-issues` (remaining issues; the interim 1.2.0 was never published) |
 | Priority issues | [#1](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/1), [#4](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/4), [#12](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/12) |
 | Remaining issues | [#2](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/2), [#3](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/3), [#5](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/5), [#6](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/6), [#7](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/7), [#8](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/8), [#9](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/9), [#10](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/10), [#11](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/11), [#13](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/13) |
-| Test baseline | 32 unit tests on 1.0.3, 61 on 1.1.0, 105 on 1.3.0, all passing |
+| Test baseline | 32 unit tests on 1.0.3, 61 on 1.1.0, 105 on 1.3.0, 112 after the PR #15 review follow-up, all passing |
 | Minimum gateway | Flex Gateway 1.11.0 (1.1.0 and later use PDK stop-iteration, which 1.10.x doesn't support) |
 
 ## Status
@@ -527,7 +527,7 @@ A Task with `id: t9`, state `input-required` and no `contextId` produced only th
   - the client resumes with `GET` and `Last-Event-ID`, and gets the next question or the final result under the original request ID.
 - [x] **State in the session store.** The open question is stored next to the session, under a separate namespace, so any replica can take the answer or resume the stream. It is bound to the session's identity. Sessions stored by earlier builds stay readable.
 - [x] **Exactly-once answers.** The question is claimed with compare-and-swap before the answer is forwarded. A duplicate or concurrent answer, an answer to another or an old question ID, and a late answer after timeout or decline are acknowledged with `202` and never reach the agent. A malformed answer gets `400` and the question stays open.
-- [x] **Supersede and cancel.** A new `tools/call` in the session drops the open question. `notifications/cancelled` with the call's `requestId` drops it and clears the context.
+- [x] **Open questions are protected.** A `tools/call` that would continue the waiting conversation gets a tool error asking the user to answer or cancel first, and the question and its stream stay intact. An independent call (`new_conversation`, or other explicit IDs) runs without eliciting. `notifications/cancelled` with the call's `requestId` ends the question and clears the context, if it still belongs to that conversation. (Changed in the PR #15 review follow-up; 1.3.0 dropped the open question on any new call.)
 - [x] **Configuration and docs.** New `gcl.yaml` properties: `enableElicitation`, `elicitationTimeoutSeconds` and `maxElicitationRounds`. Updated the customer guide (new "3.2 Experimental: MCP elicitation", configuration table, Limitations, checklist item 9) and the README.
 
 ### Files
@@ -546,7 +546,7 @@ A Task with `id: t9`, state `input-required` and no `contextId` produced only th
 | `tests::auth_required_and_task_less_questions_are_never_elicited` | `auth-required` and plain messages are answered directly |
 | `tests::a_question_without_context_resumes_with_the_task_only` | Works with #9's task-only continuation |
 | `tests::an_agent_failure_after_the_answer_is_a_tool_error_on_the_resumed_stream` | Agent errors after an answer become a tool error |
-| `tests::cancelling_the_call_or_calling_again_drops_the_open_question` | `notifications/cancelled` and a new `tools/call` |
+| `tests::cancelling_the_call_ends_the_question_but_another_call_does_not` | `notifications/cancelled` ends the question; a new `tools/call` does not |
 | `elicitation::tests::*` (8) | Settings bounds, capability and version gating, form schema, strict answer parsing, event IDs, stream framing, ended results |
 | `make test-shared-storage`, elicitation sections | Live, two replicas on Redis (below) |
 
@@ -566,3 +566,31 @@ Client-managed fallback on the same API (ChatGPT-style client)
 ```
 
 **Verification boundary:** the live checks use a scripted MCP client. No shipping MCP client that supports elicitation and `Last-Event-ID` resumption has been tried yet, which is why the feature is marked experimental. ChatGPT is unaffected, because it never declares the capability and the setting is off by default.
+
+## PR #15 review follow-up
+
+The second review of PR #15 (at `9dff842`) found seven more problems. It also flagged lint failures and the inherited `minRuntimeVersion` blocker. The branch now contains `fix/p4a-priority-issues` (PR #14). That merge brings in the `minRuntimeVersion` 1.11.0 fix and its build-time check (`scripts/check-min-runtime.py`).
+
+**Merge order:** PR #15 targets `main`, and it includes all of PR #14. Merge #14 first, then #15. Once #14 is in `main`, the #15 diff contains only the remaining-issue fixes.
+
+| # | Finding | Fix | Regression test |
+|---|---|---|---|
+| 1 | A second tool call destroys the outstanding elicitation | A call that continues the waiting conversation is refused with a tool error, and the question and its stream are kept. An independent call runs without eliciting. `start_elicitation` never replaces a question that is still open. | `tests::review_second_call_must_preserve_first_stream` |
+| 2 | A completed task-only response keeps a stale continuation | When a reply has no context and no awaiting task, the stored task is cleared. | `tests::review_completed_task_only_must_clear_continuation` (completed, failed, rejected, canceled) |
+| 3 | An explicit `task_id` inherits an unrelated stored context | If the call passes `context_id` or `task_id`, only the IDs it passes are used. | `tests::review_explicit_task_must_not_inherit_unrelated_context` |
+| 4 | A new call reuses an expired elicitation conversation | A question past its deadline is ended as timed out, and its conversation is forgotten before the call is built. | `tests::review_expired_question_must_not_resume_on_new_call` |
+| 5 | Mixed request/response envelopes still execute | A request or notification that carries `result` or `error` is rejected as `-32600`. Notifications get `400`. Nothing reaches the agent. | `tests::review_mixed_envelope_must_not_execute` |
+| 6 | Malformed A2A Message/Part bodies become successful results | Messages must have a known `role` and a non-empty `messageId`. Each part must carry well-typed `text`, `data`, `file`, `url` or `raw` content. Anything else is a tool error. | `tests::review_invalid_message_must_be_tool_error` |
+| 7 | SSE folding combines different tasks | A stream whose events name a different task or context than the earlier events is rejected. | `tests::review_sse_task_ids_must_match` |
+| 8 | Inherited runtime metadata blocker | Merged from PR #14. `make build` writes `minRuntimeVersion: 1.11.0` and checks it. | `scripts/check-min-runtime.py` (runs in `make build`) |
+
+**How the fixes were verified:**
+
+- All eight regression tests were copied unchanged onto the pre-fix code and run there. The rewritten cancel test is one of the eight. All of them fail there, and all pass after the fixes.
+- `cargo test --lib`: 112 passed.
+- `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean. So is `cargo clippy --lib --target wasm32-wasip1 -- -D warnings`.
+- `make build` passes its runtime-version check.
+
+**Known limitation:** a question that has been answered but whose result hasn't been fetched yet can still be replaced by a new call's question.
+
+**Still open:** interop with an MCP SDK client has not been tested end to end. The elicitation checks use a scripted client (see the verification boundary under #13).

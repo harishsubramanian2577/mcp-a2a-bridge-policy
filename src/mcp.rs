@@ -130,6 +130,14 @@ pub fn classify(envelope: &Map<String, Value>) -> Result<Incoming<'_>, Invalid> 
             "The method must be a string",
         ));
     };
+    // A message is a request, a notification or a response, never two at once.
+    if envelope.contains_key("result") || envelope.contains_key("error") {
+        return Err(Invalid::new(
+            request_id,
+            INVALID_REQUEST,
+            "A request or notification must not carry result or error",
+        ));
+    }
     let params = match envelope.get("params") {
         None => None,
         Some(Value::Object(params)) => Some(params),

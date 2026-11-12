@@ -592,19 +592,50 @@ async fn transcode_tool_call(
     handler: &dyn HeadersBodyHandler,
 ) -> Flow<Option<Transcoded>> {
     // `session` is the caller's live session, already resolved by the request filter.
-    let (session_key, entry) = match session {
+    let (session_key, mut entry) = match session {
         Some((key, entry)) => (Some(key), Some(entry)),
         None => (None, None),
     };
 
-    // Explicit arguments win; the store only fills in a missing context.
-    let (context_id, task_id) = match (&call.context_id, entry) {
-        (Some(ctx), _) => (Some(ctx.clone()), call.task_id.clone()),
-        (None, Some(entry)) if !call.new_conversation => {
-            (entry.context_id, call.task_id.clone().or(entry.task_id))
+    // The session's question, if its client declared elicitation. An expired question is settled
+    // first, so its result is ready to replay and its conversation is not continued.
+    let mut elicits = false;
+    let mut open_question = None;
+    if let (Some(store), Some(key), Some(_)) = (&bridge.sessions, &session_key, &bridge.elicitation)
+    {
+        if let Some(state) = store.load_elicitation(key).await {
+            elicits = true;
+            match state.pending.filter(Pending::is_open) {
+                Some(pending) if session::now_seconds() >= pending.deadline => {
+                    end_conversation(bridge, store, key, &pending, Ending::TimedOut).await;
+                    entry = store.load(key).await;
+                }
+                pending => open_question = pending,
+            }
         }
-        _ => (None, call.task_id.clone()),
+    }
+
+    // Explicit arguments replace the stored continuation as a whole: a task named by the caller
+    // is never paired with a context the bridge remembered for something else.
+    let explicit = call.context_id.is_some() || call.task_id.is_some();
+    let (context_id, task_id) = match entry {
+        _ if explicit => (call.context_id.clone(), call.task_id.clone()),
+        Some(entry) if !call.new_conversation => (entry.context_id, entry.task_id),
+        _ => (None, None),
     };
+
+    // A question waiting on the user stays as it is. Continuing its conversation now would race
+    // the user's answer, so that call is refused; any other call goes ahead without asking a
+    // question of its own, since a session holds one question at a time.
+    let mut mode = Mode::Plain;
+    match &open_question {
+        Some(pending) if continues(pending, context_id.as_deref(), task_id.as_deref()) => {
+            return rpc_result(&id, mcp::tool_error_result(QUESTION_OPEN_TEXT));
+        }
+        Some(_) => {}
+        None if elicits && headers.accepts_sse => mode = Mode::MayElicit,
+        None => {}
+    }
 
     let a2a_request = a2a::build_send_message(
         bridge.a2a_version,
@@ -621,20 +652,6 @@ async fn transcode_tool_call(
             mcp::INVALID_PARAMS,
             "The message is too large to forward to the agent",
         );
-    }
-
-    // A new call supersedes any question still open in this session.
-    let mut mode = Mode::Plain;
-    if let (Some(store), Some(key), Some(_)) = (&bridge.sessions, &session_key, &bridge.elicitation)
-    {
-        if store.load_elicitation(key).await.is_some() {
-            store
-                .update_elicitation(key, |entry| entry.pending.take().is_some())
-                .await;
-            if headers.accepts_sse {
-                mode = Mode::MayElicit;
-            }
-        }
     }
 
     if forward_to_agent(bridge, handler, headers, &a2a_request).is_err() {
@@ -655,6 +672,34 @@ async fn transcode_tool_call(
         session_key,
         mode,
     }))
+}
+
+const QUESTION_OPEN_TEXT: &str = "The agent is waiting for the user to answer its question in \
+     this conversation. Answer or cancel that question first, or start a new conversation.";
+
+/// The call would continue the conversation of the open question.
+fn continues(pending: &Pending, context_id: Option<&str>, task_id: Option<&str>) -> bool {
+    task_id == Some(pending.task_id.as_str())
+        || (context_id.is_some() && context_id == pending.context_id.as_deref())
+}
+
+/// Drops the session's stored continuation if it still belongs to the question's conversation;
+/// a call made since in another conversation keeps its own.
+async fn forget_conversation(store: &SessionStore, key: &str, pending: &Pending) {
+    store
+        .update_with(key, |entry| {
+            if !continues(
+                pending,
+                entry.context_id.as_deref(),
+                entry.task_id.as_deref(),
+            ) {
+                return false;
+            }
+            entry.context_id = None;
+            entry.task_id = None;
+            true
+        })
+        .await;
 }
 
 /// Replaces the request with `a2a_request` for the agent. The generated body decides the
@@ -722,7 +767,7 @@ async fn settle(
         return pending_of(store, key).await;
     }
     if end {
-        store.update(key, None, None).await;
+        forget_conversation(store, key, pending).await;
     }
     logger::debug!("Elicitation settled (conversation ended: {}).", end);
     settled
@@ -870,7 +915,7 @@ async fn cancel_elicitation(bridge: &Bridge, key: &str, params: Option<&Value>) 
         })
         .await;
     if cleared {
-        store.update(key, None, None).await;
+        forget_conversation(store, key, &pending).await;
     }
 }
 
@@ -1072,8 +1117,12 @@ async fn start_elicitation(
     let deadline = session::now_seconds() + settings.timeout_seconds;
     let pending = Pending::first(session::random_uuid()?, &transcoded.rpc_id, reply, deadline)?;
     let stream = elicitation::question_stream(&pending)?;
+    // Never replaces a question still open, e.g. one asked by a concurrent call.
     let stored = store
         .update_elicitation(key, |entry| {
+            if entry.pending.as_ref().is_some_and(Pending::is_open) {
+                return false;
+            }
             entry.pending = Some(pending);
             true
         })
@@ -1143,7 +1192,9 @@ async fn settle_answer(
 }
 
 /// Records the reply's context and, while the agent waits on the caller, its task. A task-only
-/// reply is remembered too, since the agent infers the context from the task id.
+/// reply is remembered too, since the agent infers the context from the task id. A reply with no
+/// context that no longer waits on the caller still ends the stored task, so a finished task is
+/// never continued.
 async fn remember(bridge: &Bridge, transcoded: &Transcoded, reply: &a2a::AgentReply) {
     let (Some(store), Some(key)) = (&bridge.sessions, &transcoded.session_key) else {
         return;
@@ -1153,6 +1204,9 @@ async fn remember(bridge: &Bridge, transcoded: &Transcoded, reply: &a2a::AgentRe
         .clone()
         .filter(|_| reply.state.awaits_client());
     if reply.context_id.is_none() && pending_task.is_none() {
+        store
+            .update_with(key, |entry| entry.task_id.take().is_some())
+            .await;
         return;
     }
     store

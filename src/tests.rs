@@ -1883,11 +1883,11 @@ fn an_agent_failure_after_the_answer_is_a_tool_error_on_the_resumed_stream() {
 }
 
 #[test]
-fn cancelling_the_call_or_calling_again_drops_the_open_question() {
+fn cancelling_the_call_ends_the_question_but_another_call_does_not() {
     let backend = scripted_agent(vec![
         asks("Which city?"),
         asks("Which city?"),
-        completes("Other"),
+        completes("Booked in Paris."),
     ]);
     let mut tester = tester_for(elicit_config(json!({})), &backend);
     let sid = elicit_session(&mut tester);
@@ -1913,18 +1913,257 @@ fn cancelling_the_call_or_calling_again_drops_the_open_question() {
         "cancel ended the conversation: {}",
         message
     );
-    call_in(&mut tester, &sid, 7, json!({ "message": "Something else" }));
-    assert_eq!(
-        resume(&mut tester, &sid, &event_id).status_code(),
-        400,
-        "a new call supersedes the question"
-    );
+
+    // A call that would continue the waiting conversation is refused and changes nothing.
+    let refused = json_body(&call_in(
+        &mut tester,
+        &sid,
+        7,
+        json!({ "message": "Something else" }),
+    ));
+    assert_eq!(refused["id"], 7);
+    assert_eq!(refused["result"]["isError"], true, "{}", refused);
+    assert!(backend.next().is_none(), "call 7 never reached the agent");
+    assert!(is_waiting(&resume(&mut tester, &sid, &event_id)));
+
+    // Call 6 still gets its answer.
     assert_eq!(
         respond(&mut tester, &sid, &question["id"], accept("Paris")).status_code(),
         202
     );
-    assert!(
-        backend.next().is_some() && backend.next().is_none(),
-        "only call 7 reached the agent after call 6"
+    assert_eq!(
+        json_body(&backend.next().unwrap())["params"]["message"]["taskId"],
+        "t1"
     );
+    let result = result_on(&resume(&mut tester, &sid, &event_id), 6);
+    assert_eq!(result["content"][0]["text"], "Booked in Paris.");
+}
+
+// ---- Regressions from the independent review of #15.
+
+#[test]
+fn review_second_call_must_preserve_first_stream() {
+    let backend = scripted_agent(vec![
+        asks("Which city?"),
+        agent_task(
+            "TASK_STATE_INPUT_REQUIRED",
+            "t2",
+            Some("ctx-2"),
+            "Which date?",
+        ),
+        completes("Booked in Paris."),
+    ]);
+    let mut tester = tester_for(elicit_config(json!({})), &backend);
+    let sid = elicit_session(&mut tester);
+    let (event_id, question) =
+        question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+    backend.next();
+
+    // A new conversation goes ahead on its own. It cannot open a second question, so its own
+    // question comes back the client-managed way.
+    let other = call_in(
+        &mut tester,
+        &sid,
+        6,
+        json!({ "message": "Something else", "new_conversation": true }),
+    );
+    let outbound = json_body(&backend.next().expect("call 6 reached the agent"));
+    assert!(outbound["params"]["message"].get("taskId").is_none());
+    assert!(outbound["params"]["message"].get("contextId").is_none());
+    assert!(other
+        .header("content-type")
+        .unwrap()
+        .starts_with("application/json"));
+    let other = json_body(&other);
+    assert_eq!(other["id"], 6);
+    assert_eq!(other["result"]["structuredContent"]["taskId"], "t2");
+
+    // Call 5's stream is still there and still gets its result.
+    assert!(is_waiting(&resume(&mut tester, &sid, &event_id)));
+    assert_eq!(
+        respond(&mut tester, &sid, &question["id"], accept("Paris")).status_code(),
+        202
+    );
+    let answer = json_body(&backend.next().expect("the answer reached the agent"));
+    assert_eq!(answer["params"]["message"]["taskId"], "t1");
+    assert_eq!(answer["params"]["message"]["contextId"], "ctx-1");
+    let result = result_on(&resume(&mut tester, &sid, &event_id), 5);
+    assert_eq!(result["content"][0]["text"], "Booked in Paris.");
+}
+
+#[test]
+fn review_completed_task_only_must_clear_continuation() {
+    for state in [
+        "TASK_STATE_COMPLETED",
+        "TASK_STATE_FAILED",
+        "TASK_STATE_REJECTED",
+        "TASK_STATE_CANCELED",
+    ] {
+        let backend = scripted_agent(vec![
+            agent_task("TASK_STATE_INPUT_REQUIRED", "t9", None, "Which account?"),
+            agent_task(state, "t9", None, "Done"),
+            agent_task("TASK_STATE_COMPLETED", "t10", None, "Fresh"),
+        ]);
+        let mut tester = tester_for(config("local"), &backend);
+        let session = start_session(&mut tester, &[]);
+        let headers = [("mcp-session-id", session.as_str())];
+        let mut call = |id: i64, message: &str| {
+            tester.request(with_headers(
+                mcp_post(tools_call(id, json!({ "message": message }))),
+                &headers,
+            ));
+            json_body(&backend.next().unwrap())["params"]["message"].clone()
+        };
+
+        call(1, "Pay the bill");
+        assert_eq!(call(2, "Checking")["taskId"], "t9", "{}", state);
+        let fresh = call(3, "A new question");
+        assert!(fresh.get("taskId").is_none(), "{}: {}", state, fresh);
+    }
+}
+
+#[test]
+fn review_explicit_task_must_not_inherit_unrelated_context() {
+    let backend = scripted_agent(vec![
+        completes("First"),
+        completes("Second"),
+        completes("Third"),
+    ]);
+    let mut tester = tester_for(config("local"), &backend);
+    let session = start_session(&mut tester, &[]);
+    let headers = [("mcp-session-id", session.as_str())];
+    let mut call = |id: i64, args: Value| {
+        tester.request(with_headers(mcp_post(tools_call(id, args)), &headers));
+        json_body(&backend.next().unwrap())["params"]["message"].clone()
+    };
+
+    call(1, json!({ "message": "Hi" }));
+    let task_only = call(2, json!({ "message": "Go on", "task_id": "other-task" }));
+    assert_eq!(task_only["taskId"], "other-task");
+    assert!(task_only.get("contextId").is_none(), "{}", task_only);
+    let context_only = call(3, json!({ "message": "Go on", "context_id": "ctx-9" }));
+    assert_eq!(context_only["contextId"], "ctx-9");
+    assert!(context_only.get("taskId").is_none(), "{}", context_only);
+}
+
+#[test]
+fn review_expired_question_must_not_resume_on_new_call() {
+    crate::session::test_clock::OFFSET.with(|o| o.set(0));
+    let backend = scripted_agent(vec![asks("Which city?"), completes("Fresh start")]);
+    let mut tester = tester_for(elicit_config(json!({})), &backend);
+    let sid = elicit_session(&mut tester);
+    let (event_id, _) = question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+    backend.next();
+
+    crate::session::test_clock::advance(301);
+    call_in(&mut tester, &sid, 6, json!({ "message": "Hello" }));
+    let message =
+        json_body(&backend.next().expect("call 6 reached the agent"))["params"]["message"].clone();
+    assert!(
+        message.get("taskId").is_none() && message.get("contextId").is_none(),
+        "{}",
+        message
+    );
+
+    // The expired call still ends with an explicit timeout result.
+    let result = result_on(&resume(&mut tester, &sid, &event_id), 5);
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["structuredContent"]["reason"], "timeout");
+    crate::session::test_clock::OFFSET.with(|o| o.set(0));
+}
+
+#[test]
+fn review_mixed_envelope_must_not_execute() {
+    let backend = agent(SAMPLE_RESPONSE);
+    let mut tester = tester_for(config("disabled"), &backend);
+    for member in [
+        json!({ "result": {} }),
+        json!({ "error": { "code": 1, "message": "x" } }),
+    ] {
+        let mut call = tools_call(4, json!({ "message": "Delete everything" }));
+        call.as_object_mut()
+            .unwrap()
+            .extend(member.as_object().unwrap().clone());
+        let response = json_body(&tester.request(mcp_post(call)));
+        assert_eq!(response["error"]["code"], -32600, "{}", response);
+        assert_eq!(response["id"], 4);
+
+        let mut notification = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        notification
+            .as_object_mut()
+            .unwrap()
+            .extend(member.as_object().unwrap().clone());
+        let response = tester.request(mcp_post(notification));
+        assert_eq!(response.status_code(), 400);
+    }
+    assert!(backend.next().is_none(), "nothing reached the agent");
+}
+
+#[test]
+fn review_invalid_message_must_be_tool_error() {
+    let malformed = json!({ "jsonrpc": "2.0", "id": 0, "result": { "message": {
+        "role": 42, "contextId": "ctx-bad", "parts": [{ "text": 42 }] } } });
+    let backend = scripted_agent(vec![malformed, completes("Fine")]);
+    let mut tester = tester_for(config("local"), &backend);
+    let session = start_session(&mut tester, &[]);
+    let headers = [("mcp-session-id", session.as_str())];
+
+    let response = json_body(&tester.request(with_headers(
+        mcp_post(tools_call(1, json!({ "message": "Hi" }))),
+        &headers,
+    )));
+    assert_eq!(response["result"]["isError"], true, "{}", response);
+    backend.next();
+
+    tester.request(with_headers(
+        mcp_post(tools_call(2, json!({ "message": "Again" }))),
+        &headers,
+    ));
+    let message = json_body(&backend.next().unwrap())["params"]["message"].clone();
+    assert!(
+        message.get("contextId").is_none(),
+        "nothing from the malformed answer was remembered: {}",
+        message
+    );
+}
+
+#[test]
+fn review_sse_task_ids_must_match() {
+    let event = |result: Value| {
+        format!(
+            "data: {}\n\n",
+            json!({ "jsonrpc": "2.0", "id": 0, "result": result })
+        )
+    };
+    let stream = [
+        event(json!({ "task": { "id": "t1", "contextId": "c1",
+            "status": { "state": "TASK_STATE_WORKING" } } })),
+        event(
+            json!({ "artifactUpdate": { "taskId": "t2", "contextId": "c2",
+            "artifact": { "artifactId": "a", "parts": [{ "text": "other task answer" }] } } }),
+        ),
+        event(json!({ "statusUpdate": { "taskId": "t2", "contextId": "c2",
+            "status": { "state": "TASK_STATE_COMPLETED" } } })),
+    ]
+    .concat();
+    let backend = agent_with("text/event-stream", stream.into_bytes());
+    let mut tester = tester_for(config("local"), &backend);
+    let session = start_session(&mut tester, &[]);
+    let headers = [("mcp-session-id", session.as_str())];
+
+    let response = json_body(&tester.request(with_headers(
+        mcp_post(tools_call(1, json!({ "message": "Hi" }))),
+        &headers,
+    )));
+    assert_eq!(response["result"]["isError"], true, "{}", response);
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("other task answer"), "{}", text);
+    backend.next();
+
+    tester.request(with_headers(
+        mcp_post(tools_call(2, json!({ "message": "Again" }))),
+        &headers,
+    ));
+    let message = json_body(&backend.next().unwrap())["params"]["message"].clone();
+    assert!(message.get("contextId").is_none(), "{}", message);
 }
