@@ -5,10 +5,10 @@ A custom Omni Gateway (Flex Gateway) policy that lets MCP clients use an A2A age
 | | |
 |---|---|
 | Exchange asset | `mcp-a2a-bridge-policy` (definition), `mcp-atoa-bridge-policy-flex` (implementation) |
-| Current version | 1.0.3 |
+| Current version | 1.1.0 |
 | Category | Transformation |
 | Applies to API instance types | MCP, A2A (v0.3), A2A (v1.0) |
-| Gateway | Omni Gateway / Flex Gateway (managed or self-managed) |
+| Gateway | Omni Gateway / Flex Gateway (managed or self-managed), **1.11.0 or later** for policy 1.1.0 |
 
 ---
 
@@ -30,7 +30,7 @@ Without the policy, every team that wants these clients to reach the broker has 
 |---|---|
 | `initialize`, `ping`, `tools/list`, notifications | Answers them at the gateway; nothing reaches the broker |
 | `tools/call` for `ask_agent` | Converts the call into an A2A `SendMessage`, forwards it to the broker, and converts the A2A reply back into an MCP tool result |
-| Native A2A request (Mode 2 only) | Forwards it to the broker unchanged |
+| Native A2A request (Mode 2 only): JSON-RPC (v1.0 or v0.3), HTTP+JSON (`/message:send`, `/tasks/{id}:cancel`, ...), agent card, gRPC | Forwards it to the broker unchanged: same path, headers and body |
 
 **Multi-turn conversations.** Every tool result returns the broker's `contextId`, `taskId` and `state`.
 - To **continue a conversation**, the client passes `context_id` back.
@@ -91,7 +91,9 @@ flowchart LR
 
 How the policy decides what to do with each request:
 1. **The request is MCP**, for example `initialize`, `tools/list` or `tools/call`. The policy answers it itself or converts it, as in section 3.
-2. **The request is native A2A**, for example `SendMessage` or the agent card. With `passThroughA2A: true`, the policy forwards it to the broker untouched.
+2. **The request is native A2A**, for example a `SendMessage` or `message/send` JSON-RPC call, an HTTP+JSON call such as `POST /message:send`, or the agent card. With `passThroughA2A: true`, the policy recognises it before any MCP handling and forwards it to the broker untouched. It does not add or change the `A2A-Version` header, the path or the body, and the broker's response goes back unchanged.
+
+Only translated `tools/call` requests are changed. Their `A2A-Version` header and query parameter always match the configured `a2aProtocolVersion`: `1.0` sets the header to `1.0`, and `0.3` removes it.
 
 - **When to use:** you want a single endpoint for every client, or you can't create a second API instance.
 - **Key settings:** `passThroughA2A: true` and `a2aPath` left empty. MCP clients call the A2A base URL, with the trailing slash.
@@ -109,11 +111,16 @@ How the policy decides what to do with each request:
 | `serverInstructions` | No | empty | Short usage instructions returned during the handshake. Not every client uses them. | `Use ask_agent. Reuse context_id for follow-ups and restate the subject in full.` |
 | `a2aProtocolVersion` | Yes | `1.0` | A2A version the broker uses: `1.0` or `0.3`. | `1.0` |
 | `passThroughA2A` | No | `false` | `false`: accept MCP traffic only (Mode 1). `true`: also forward native A2A traffic unchanged (Mode 2). | Mode 1: `false` / Mode 2: `true` |
-| `a2aPath` | No | empty | Path on the upstream (broker) URL that converted calls are sent to. Empty forwards the path the client used. `/` sends every call to the broker's root URL. | Mode 1: `/` / Mode 2: empty / custom: `/<a2a-sub-path>` |
+| `a2aPath` | No | empty | Path on the upstream (broker) URL that converted calls are sent to. Empty forwards the path the client used. `/` sends every call to the broker's root URL. Native A2A traffic is never rewritten. | Mode 1: `/` / Mode 2: empty / custom: `/<a2a-sub-path>` |
 | `includeStructuredContent` | No | `true` | Adds `contextId`, `taskId` and `state` to each tool result. Keep it on so clients can hold multi-turn conversations. | `true` |
 | `sessionStoreMode` | No | `disabled` | Optional gateway-side memory of the last conversation per MCP session, for clients that never send `context_id` back. `local` keeps it in memory on each gateway replica; `remote` needs gateway Shared Storage (Redis). | `disabled` |
 | `sessionTtlSeconds` | No | `1800` | How long, in seconds, a remembered conversation lasts (60–86400). Used only with a session store. | `1800` |
-| `sessionKeyHeader` | No | empty | Request header whose value is mixed into the session key, so a remembered conversation is tied to the caller. Used only with a session store. | `client_id` |
+| `sessionKeyHeader` | No | empty | Request header whose value is mixed into the session key, so a remembered conversation is tied to the caller. When set, this is enforced: a request without the header gets no session and can't use or end one. Used only with a session store. | `client_id` |
+
+**Limits and session security (1.1.0)**
+- **Gateway version.** 1.1.0 needs Flex Gateway **1.11.0 or later**. It reads the request body before choosing which headers to change, and Flex 1.10.x doesn't support that: the gateway logs `FlexAbiHandler: command 'flex_enable_stop_iteration' unknown` and doesn't start the API. Stay on policy 1.0.x until the gateway is upgraded.
+- **Response size.** The gateway can't write a body of 1 MB or more. If a converted answer would be too large, the policy first drops `structuredContent.data` (data parts are also in the text), then truncates the answer text with a note, and as a last resort returns a tool error. The client always gets a valid MCP result, never the raw A2A reply. The remembered conversation is updated only after the answer is delivered. A `tools/call` message too large to forward gets error `-32602`.
+- **Sessions.** `Mcp-Session-Id` values are random UUIDs, issued at `initialize` and registered in the store. The policy ignores any other value a client sends. Store keys are a SHA-256 hash of the API/policy scope, session ID and identity. The store namespace is specific to the API instance and policy, so two APIs that share one Redis don't share sessions, while replicas of the same API do. Expiry uses the TTL configured now, so a lower `sessionTtlSeconds` also shortens existing entries. `DELETE` with `Mcp-Session-Id` returns `204` for the owner and `404` otherwise.
 
 ### 5.1 Writing a good `toolDescription`
 
@@ -168,6 +175,7 @@ mcp-a2a-bridge-policy/
 ```
 
 ### 7.1 Prerequisites
+- **Flex Gateway 1.11.0 or later** where the policy runs (policy 1.1.0). Tested on 1.11.0, 1.12.0 and 1.13.0. Version 1.10.x can't load it.
 - **Anypoint CLI v4** with the PDK plugin (`anypoint-cli-v4 plugins:install anypoint-pdk-plugin`), plus the Rust toolchain. For first-time setup, run `make setup`.
 - **A connected app** (client credentials) with the **Exchange Contributor** permission in the target business group.
 

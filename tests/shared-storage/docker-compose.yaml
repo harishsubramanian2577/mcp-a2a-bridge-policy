@@ -1,0 +1,37 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+#
+# Two Flex Gateway replicas sharing one Redis, in front of a recording mock A2A agent.
+# Both replicas mount the same registration, as replicas of one gateway do.
+# Driven by run.sh (`make test-shared-storage`).
+services:
+  redis:
+    image: redis:7-alpine
+  agent:
+    image: python:3.12-alpine
+    command: ["python", "-u", "/agent.py"]
+    volumes:
+      - ./agent.py:/agent.py:ro
+    ports:
+      - 18090:8080
+  flex-1:
+    image: mulesoft/flex-gateway:${FLEX_VERSION:-1.11.0}
+    environment:
+      FLEX_NAME: flex-1
+    volumes:
+      - ./config:/usr/local/share/mulesoft/flex-gateway/conf.d/
+      - ${REGISTRATION:?set REGISTRATION}:/etc/mulesoft/flex-gateway/conf.d/registration.yaml:ro
+    ports:
+      - 18081:8081
+      - 18082:8082
+    depends_on: [redis, agent]
+  flex-2:
+    image: mulesoft/flex-gateway:${FLEX_VERSION:-1.11.0}
+    environment:
+      FLEX_NAME: flex-2
+    volumes:
+      - ./config:/usr/local/share/mulesoft/flex-gateway/conf.d/
+      - ${REGISTRATION:?set REGISTRATION}:/etc/mulesoft/flex-gateway/conf.d/registration.yaml:ro
+    ports:
+      - 28081:8081
+      - 28082:8082
+    depends_on: [redis, agent]

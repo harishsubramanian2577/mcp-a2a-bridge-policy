@@ -43,7 +43,12 @@ pub fn error_envelope(id: &Value, code: i64, message: &str) -> Value {
 
 pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
     requested
-        .and_then(|r| SUPPORTED_PROTOCOL_VERSIONS.iter().find(|v| **v == r).copied())
+        .and_then(|r| {
+            SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .find(|v| **v == r)
+                .copied()
+        })
         .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
 }
 
@@ -152,6 +157,81 @@ pub fn tool_error_result(text: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": true })
 }
 
+/// PDK refuses to write a body of 1 MiB or more; converted answers stay clear of that.
+pub const MAX_BODY_BYTES: usize = 1_000_000;
+/// Room for the truncation note and JSON escaping of the bytes around the cut.
+const TRUNCATION_MARGIN: usize = 1024;
+const TRUNCATION_NOTE: &str =
+    "\n\n[Answer truncated: it exceeded the gateway's 1 MB response limit. Ask for a shorter answer.]";
+const TOO_LARGE_MESSAGE: &str =
+    "The agent's answer exceeded the gateway's 1 MB response limit and could not be returned. Ask for a shorter answer.";
+const UNDELIVERABLE_MESSAGE: &str =
+    "The gateway could not convert the agent's answer into an MCP result.";
+
+/// How much of the converted result survived the size limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// Unchanged.
+    Full,
+    /// `structuredContent.data` dropped and/or the answer text truncated; still a real answer.
+    Reduced,
+    /// Replaced by a tool error; nothing of the answer is left.
+    Replaced,
+}
+
+/// Serialises a `tools/call` result envelope that is always under `limit` bytes. Shrinks in
+/// order: drop `structuredContent.data` (data parts are also in the text), truncate the answer
+/// text, then replace the result with a tool error. Removing k raw bytes of a JSON string removes
+/// at least k serialised bytes, so one truncation pass is enough.
+pub fn bounded_result_envelope(id: &Value, result: Value, limit: usize) -> (Vec<u8>, Fit) {
+    let mut envelope = result_envelope(id, result);
+    let bytes = envelope.to_string().into_bytes();
+    if bytes.len() < limit {
+        return (bytes, Fit::Full);
+    }
+
+    if let Some(sc) = envelope
+        .pointer_mut("/result/structuredContent")
+        .and_then(Value::as_object_mut)
+    {
+        sc.remove("data");
+    }
+    let mut bytes = envelope.to_string().into_bytes();
+    if bytes.len() >= limit {
+        let cut = bytes.len() - limit + TRUNCATION_MARGIN;
+        if let Some(Value::String(text)) = envelope.pointer_mut("/result/content/0/text") {
+            if text.len() > cut {
+                let mut keep = text.len() - cut;
+                while !text.is_char_boundary(keep) {
+                    keep -= 1;
+                }
+                text.truncate(keep);
+                text.push_str(TRUNCATION_NOTE);
+            }
+        }
+        bytes = envelope.to_string().into_bytes();
+    }
+    if bytes.len() < limit {
+        return (bytes, Fit::Reduced);
+    }
+    let replacement = result_envelope(id, tool_error_result(TOO_LARGE_MESSAGE));
+    (replacement.to_string().into_bytes(), Fit::Replaced)
+}
+
+/// Writes the converted answer with `write`. If that write fails, a small tool error is written
+/// instead, so the client never receives the raw A2A body as if it were an MCP response.
+/// Returns `true` only when the agent's answer itself (in full or reduced) was delivered, which
+/// is the condition for remembering its context.
+pub fn deliver_result(id: &Value, result: Value, mut write: impl FnMut(&[u8]) -> bool) -> bool {
+    let (bytes, fit) = bounded_result_envelope(id, result, MAX_BODY_BYTES);
+    if write(&bytes) {
+        return fit != Fit::Replaced;
+    }
+    let fallback = result_envelope(id, tool_error_result(UNDELIVERABLE_MESSAGE));
+    write(fallback.to_string().as_bytes());
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,9 +253,13 @@ mod tests {
     #[test]
     fn tool_definition_advertises_reset_only_with_store() {
         let without = tool_definition("ask_agent", "d", false);
-        assert!(without["inputSchema"]["properties"].get(ARG_NEW_CONVERSATION).is_none());
+        assert!(without["inputSchema"]["properties"]
+            .get(ARG_NEW_CONVERSATION)
+            .is_none());
         let with = tool_definition("ask_agent", "d", true);
-        assert!(with["inputSchema"]["properties"].get(ARG_NEW_CONVERSATION).is_some());
+        assert!(with["inputSchema"]["properties"]
+            .get(ARG_NEW_CONVERSATION)
+            .is_some());
         assert_eq!(with["inputSchema"]["required"], json!([ARG_MESSAGE]));
     }
 
@@ -202,5 +286,109 @@ mod tests {
         assert!(parse_tool_arguments(Some(&json!({ "message": 3 }))).is_err());
         assert!(parse_tool_arguments(Some(&json!(["message"]))).is_err());
         assert!(parse_tool_arguments(Some(&json!({ "message": "x", "context_id": 7 }))).is_err());
+    }
+
+    fn answer(text: &str, data: Option<Value>) -> Value {
+        let mut sc = json!({ "state": "completed", "contextId": "ctx" });
+        if let Some(data) = data {
+            sc["data"] = json!([data]);
+        }
+        json!({ "content": [{ "type": "text", "text": text }, { "type": "text", "text": "hint" }],
+                "isError": false, "structuredContent": sc })
+    }
+
+    fn parse(bytes: &[u8]) -> Value {
+        serde_json::from_slice(bytes).expect("valid JSON")
+    }
+
+    #[test]
+    fn small_results_are_untouched() {
+        let (bytes, fit) = bounded_result_envelope(&json!(1), answer("hi", None), MAX_BODY_BYTES);
+        assert_eq!(fit, Fit::Full);
+        assert_eq!(parse(&bytes)["result"]["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn duplicated_data_part_is_dropped_from_structured_content_first() {
+        // A 600,000-character data part appears twice (text + structuredContent): ~1.2 MB.
+        let big = "x".repeat(600_000);
+        let data = json!(big);
+        let (bytes, fit) = bounded_result_envelope(
+            &json!(1),
+            answer(&data.to_string(), Some(data)),
+            MAX_BODY_BYTES,
+        );
+        assert_eq!(fit, Fit::Reduced);
+        assert!(bytes.len() < MAX_BODY_BYTES);
+        let env = parse(&bytes);
+        assert!(env["result"]["structuredContent"].get("data").is_none());
+        assert_eq!(env["result"]["structuredContent"]["contextId"], "ctx");
+        assert_eq!(
+            env["result"]["content"][0]["text"].as_str().unwrap().len(),
+            600_002
+        );
+        assert_eq!(env["result"]["content"][1]["text"], "hint");
+    }
+
+    #[test]
+    fn escaped_text_expansion_is_truncated_under_the_limit() {
+        // 600,000 quotes serialise to 1,200,000 bytes even after the data copy is dropped.
+        let quotes = "\"".repeat(600_000);
+        let (bytes, fit) = bounded_result_envelope(
+            &json!(1),
+            answer(&quotes, Some(json!(quotes.clone()))),
+            MAX_BODY_BYTES,
+        );
+        assert_eq!(fit, Fit::Reduced);
+        assert!(bytes.len() < MAX_BODY_BYTES, "{} bytes", bytes.len());
+        let text = parse(&bytes)["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.ends_with("Ask for a shorter answer.]"));
+        assert!(text.len() < 600_000);
+    }
+
+    #[test]
+    fn multibyte_text_is_cut_on_a_char_boundary() {
+        let text = "é".repeat(600_000); // 1.2 MB of UTF-8
+        let (bytes, fit) = bounded_result_envelope(&json!(1), answer(&text, None), MAX_BODY_BYTES);
+        assert_eq!(fit, Fit::Reduced);
+        assert!(bytes.len() < MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn oversized_non_text_parts_replace_the_result_with_a_tool_error() {
+        let huge_id = "i".repeat(MAX_BODY_BYTES);
+        let mut result = answer("short", None);
+        result["structuredContent"]["taskId"] = json!(huge_id);
+        let (bytes, fit) = bounded_result_envelope(&json!(5), result, MAX_BODY_BYTES);
+        assert_eq!(fit, Fit::Replaced);
+        let env = parse(&bytes);
+        assert_eq!(env["id"], 5);
+        assert_eq!(env["result"]["isError"], true);
+    }
+
+    #[test]
+    fn failed_write_falls_back_to_a_tool_error_and_reports_not_delivered() {
+        let mut written: Vec<Vec<u8>> = vec![];
+        let delivered = deliver_result(&json!(9), answer("hi", None), |bytes| {
+            written.push(bytes.to_vec());
+            written.len() > 1 // the first (real) write fails
+        });
+        assert!(!delivered);
+        assert_eq!(written.len(), 2);
+        let env = parse(&written[1]);
+        assert_eq!(env["id"], 9);
+        assert_eq!(env["result"]["isError"], true);
+        assert!(env["result"].get("task").is_none());
+    }
+
+    #[test]
+    fn successful_write_reports_delivered_unless_replaced() {
+        assert!(deliver_result(&json!(1), answer("hi", None), |_| true));
+        let mut result = answer("short", None);
+        result["structuredContent"]["taskId"] = json!("i".repeat(MAX_BODY_BYTES));
+        assert!(!deliver_result(&json!(1), result, |_| true));
     }
 }
