@@ -493,7 +493,9 @@ A Task with `id: t9`, state `input-required` and no `contextId` produced only th
 - The 1.3.0 release with `mcp,a2a,a2a_v1` was accepted. The published definition's `metadata.yaml` lists `mcp`, `a2a` and `a2a_v1`.
 - The validator passes on `a2a_v1` and fails on `a2av1`.
 
-**Verification boundary:** Exchange accepts the token. That the policy is offered for, and applies to, MCP, A2A and A2A v1 instances in API Manager still needs to be confirmed.
+- In API Manager (2026-11-11), 1.3.0 is offered on MCP and A2A v1 instances, and the elicitation fields show their defaults (off, 300 seconds, 3 rounds).
+
+**Verification boundary:** no A2A v0.3 instance was available, so the `a2a` token was not checked in API Manager.
 
 ### Files
 `definition/gcl.yaml`, `scripts/validate-definition.py`, `Makefile`.
