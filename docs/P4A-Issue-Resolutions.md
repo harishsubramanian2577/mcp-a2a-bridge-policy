@@ -613,3 +613,16 @@ The scripted client reads the whole body, so `check.py` never saw this. Now the 
 ### Release 1.3.1
 
 1.3.1 is this branch: the PR #15 fixes, the SDK test and the answer-leg fix above, with `minRuntimeVersion: 1.11.0`. It replaces 1.3.0, which was published with `minRuntimeVersion: 1.6.1` and without these fixes. Exchange versions can't be overwritten, so 1.3.0 is left in place; use 1.3.1.
+
+### MCP Inspector / TypeScript SDK: an answer given after the first resume never arrived
+
+Found in manual testing with MCP Inspector against 1.3.1. After a question, the client resumes the stream (GET with `Last-Event-ID`) after the 2 s `retry`. If the user hasn't answered yet, the gateway sends a short "waiting" stream and closes it. That stream had no event id. The TypeScript SDK (the client in Inspector) resumes with the last id seen on the *latest* stream, so it came back without `Last-Event-ID`, got `405`, and stopped. The answer reached the agent and the result was stored, but the call timed out on the client. The Python SDK keeps the original id, and its callback had answered before the first resume, so the Python test didn't catch this.
+
+**Fix:** the waiting stream now repeats the client's `Last-Event-ID` as a priming event (`id:` with empty `data:`), which both SDKs record without treating it as a message (`waiting_stream` in `src/elicitation.rs`).
+
+**Regression tests:**
+- `tests/shared-storage/ts_check.mjs` runs the MCP TypeScript SDK (`@modelcontextprotocol/sdk` 1.32.2, pinned, in `node:22-slim`). It answers once at once and once after 5 s. On the unfixed build the 5 s case times out with `-32001`, the same error as in Inspector. With the fix, it returns the result.
+- `sdk_check.py` adds the same slow-answer scenario for the Python SDK.
+- The unit tests that resume while a question is open now check that the waiting stream repeats the event id.
+
+`make test-shared-storage` (44 checks, both SDKs included) passes on Flex 1.11.0 (2 runs), 1.12.1 and 1.13.0. `cargo test --lib`: 112 passed.

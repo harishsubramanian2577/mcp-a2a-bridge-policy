@@ -978,7 +978,10 @@ async fn resume_stream(
             sse_response(elicitation::result_stream(&pending).unwrap_or_default())
         }
         (Step::Done { .. }, false) => unknown(),
-        _ => sse_response(elicitation::waiting_stream()),
+        _ => sse_response(elicitation::waiting_stream(&format!(
+            "{}-{}",
+            stream, last_seq
+        ))),
     }
 }
 

@@ -4,7 +4,7 @@
 # Shared-storage integration test: two Flex replicas, two API instances, one Redis.
 # Usage: [REGISTRATION=<path>] tests/shared-storage/run.sh   (after `make build`)
 #    or: [REGISTRATION=<path>] make test-shared-storage
-# SKIP_SDK=1 skips the MCP SDK checks (sdk_check.py), which install the SDK from PyPI.
+# SKIP_SDK=1 skips the MCP SDK checks (sdk_check.py, ts_check.mjs), which install from PyPI and npm.
 # Flex needs a registration even in local mode. REGISTRATION defaults to the playground's
 # (gitignored) playground/config/registration.yaml; the file is mounted read-only, never copied.
 set -euo pipefail
@@ -46,8 +46,9 @@ if ! python3 -I check.py; then
   echo "--- flex-1 logs (tail) ---"; docker compose logs --tail 40 flex-1
   exit 1
 fi
-# The same gateway, driven by the official MCP Python SDK. SKIP_SDK=1 skips it (it needs PyPI).
-if [ "${SKIP_SDK:-}" = "" ] && ! docker compose run --rm sdk; then
+# The same gateway, driven by the official MCP Python and TypeScript SDKs. SKIP_SDK=1 skips them
+# (they install from PyPI and npm).
+if [ "${SKIP_SDK:-}" = "" ] && ! { docker compose run --rm sdk && docker compose run --rm ts-sdk; }; then
   echo "--- flex-1 logs (tail) ---"; docker compose logs --tail 40 flex-1
   exit 1
 fi

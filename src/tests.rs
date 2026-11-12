@@ -1456,8 +1456,13 @@ fn result_on(response: &pdk_unit::UnitHttpResponse, call_id: i64) -> Value {
     answer["result"].clone()
 }
 
-fn is_waiting(response: &pdk_unit::UnitHttpResponse) -> bool {
-    sse_events(response).is_empty() && String::from_utf8_lossy(response.body()).contains("retry: ")
+/// A waiting stream carries no message, only a `retry` hint and a priming event that repeats the
+/// client's `Last-Event-ID`, so a client that resumes with the last id it saw keeps its place.
+fn is_waiting(response: &pdk_unit::UnitHttpResponse, event_id: &str) -> bool {
+    let body = String::from_utf8_lossy(response.body());
+    sse_events(response).is_empty()
+        && body.contains("retry: ")
+        && body.contains(&format!("id: {}\ndata:\n", event_id))
 }
 
 #[test]
@@ -1577,7 +1582,7 @@ fn accepted_answer_resumes_the_task_and_the_result_arrives_on_the_resumed_stream
     );
 
     // Before the user answers, a resumed stream only says when to come back.
-    assert!(is_waiting(&resume(&mut tester, &sid, &event_id)));
+    assert!(is_waiting(&resume(&mut tester, &sid, &event_id), &event_id));
 
     let ack = respond(&mut tester, &sid, &question["id"], accept("Paris"));
     assert_eq!(ack.status_code(), 202);
@@ -1923,7 +1928,7 @@ fn cancelling_the_call_ends_the_question_but_another_call_does_not() {
     assert_eq!(refused["id"], 7);
     assert_eq!(refused["result"]["isError"], true, "{}", refused);
     assert!(backend.next().is_none(), "call 7 never reached the agent");
-    assert!(is_waiting(&resume(&mut tester, &sid, &event_id)));
+    assert!(is_waiting(&resume(&mut tester, &sid, &event_id), &event_id));
 
     // Call 6 still gets its answer.
     assert_eq!(
@@ -1978,7 +1983,7 @@ fn review_second_call_must_preserve_first_stream() {
     assert_eq!(other["result"]["structuredContent"]["taskId"], "t2");
 
     // Call 5's stream is still there and still gets its result.
-    assert!(is_waiting(&resume(&mut tester, &sid, &event_id)));
+    assert!(is_waiting(&resume(&mut tester, &sid, &event_id), &event_id));
     assert_eq!(
         respond(&mut tester, &sid, &question["id"], accept("Paris")).status_code(),
         202

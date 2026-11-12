@@ -308,8 +308,15 @@ pub fn question_stream(pending: &Pending) -> Option<Vec<u8>> {
 }
 
 /// Nothing new yet: a comment and a `retry` hint, so the client reconnects with the same id.
-pub fn waiting_stream() -> Vec<u8> {
-    let mut out = b": waiting for the user's answer\n".to_vec();
+/// Repeats the client's last event id as a priming event (an id with empty data): a client that
+/// resumes with the last id seen on the latest stream (the TypeScript SDK does) would otherwise
+/// come back without `Last-Event-ID` and lose the result.
+pub fn waiting_stream(last_event_id: &str) -> Vec<u8> {
+    let mut out = format!(
+        ": waiting for the user's answer\nid: {}\ndata:\n",
+        last_event_id
+    )
+    .into_bytes();
     out.extend(retry_field());
     out
 }
@@ -532,9 +539,10 @@ mod tests {
             String::from_utf8(result_stream(&pending).unwrap()).unwrap(),
             "id: s-3\ndata: {\"id\":7}\n\n"
         );
-        assert!(String::from_utf8(waiting_stream())
-            .unwrap()
-            .ends_with("retry: 2000\n\n"));
+        assert_eq!(
+            String::from_utf8(waiting_stream("s-1")).unwrap(),
+            ": waiting for the user's answer\nid: s-1\ndata:\nretry: 2000\n\n"
+        );
     }
 
     #[test]

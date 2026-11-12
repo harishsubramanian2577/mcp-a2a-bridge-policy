@@ -2,7 +2,7 @@
 #
 # Two Flex Gateway replicas sharing one Redis, in front of a recording mock A2A agent.
 # Both replicas mount the same registration, as replicas of one gateway do.
-# Driven by run.sh (`make test-shared-storage`). The sdk service runs only on demand (`run`).
+# Driven by run.sh (`make test-shared-storage`). The sdk and ts-sdk services run only on demand (`run`).
 services:
   redis:
     image: redis:7-alpine
@@ -46,4 +46,15 @@ services:
     command: ["sh", "-c", "pip install -q --disable-pip-version-check --root-user-action=ignore mcp==$$MCP_SDK_VERSION && python -I -u /sdk_check.py"]
     volumes:
       - ./sdk_check.py:/sdk_check.py:ro
+    depends_on: [flex-1, agent]
+  ts-sdk:
+    # The official MCP TypeScript SDK (the client in MCP Inspector) as a real client (ts_check.mjs).
+    image: node:22-slim
+    profiles: [sdk]
+    environment:
+      MCP_TS_SDK_VERSION: ${MCP_TS_SDK_VERSION:-1.32.2}
+    working_dir: /check
+    command: ["sh", "-c", "npm install --silent --no-audit --no-fund @modelcontextprotocol/sdk@$$MCP_TS_SDK_VERSION >/dev/null && cp /ts_check.mjs . && node ts_check.mjs"]
+    volumes:
+      - ./ts_check.mjs:/ts_check.mjs:ro
     depends_on: [flex-1, agent]

@@ -92,7 +92,7 @@ make build        # builds the WASM binary; fails if metadata understates the Fl
 cargo test --lib  # unit tests, no Docker needed
 make test         # integration tests (Docker); needs a local-mode tests/config/registration.yaml
 make test-shared-storage  # two Flex replicas + Redis session test; REGISTRATION=<local-mode registration.yaml>
-                          # then the official MCP Python SDK as client (needs PyPI; SKIP_SDK=1 skips it)
+                          # then the official MCP Python and TypeScript SDKs as clients (needs PyPI and npm; SKIP_SDK=1 skips them)
 make run          # local playground; needs playground/config/registration.yaml (gitignored)
 make validate-definition  # Exchange metadata check; also run by make publish / make release
 ```

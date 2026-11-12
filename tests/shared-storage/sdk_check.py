@@ -88,6 +88,20 @@ async def elicitation_accept():
               and not sent.get("taskId"), f"agent got {sent.get('contextId')}")
 
 
+async def elicitation_slow_answer():
+    print("SDK client with elicitation: answer after the client has resumed")
+
+    async def answer(_context, _params):
+        # Longer than the retry hint, so the client resumes while the question is still open.
+        await asyncio.sleep(5)
+        return types.ElicitResult(action="accept", content={"answer": "Oslo"})
+
+    async with client("sdk-slow", answer) as c:
+        result = await c.call_tool("ask_agent", {"message": "ask me"})
+        check("a resumed client that is still waiting gets the result", not result.is_error
+              and text(result) == "echo: Oslo", text(result)[:120])
+
+
 async def elicitation_decline():
     print("SDK client with elicitation: decline")
 
@@ -108,8 +122,9 @@ async def elicitation_decline():
 async def main():
     await client_managed()
     await elicitation_accept()
+    await elicitation_slow_answer()
     await elicitation_decline()
     print("All MCP SDK checks passed.")
 
 
-asyncio.run(asyncio.wait_for(main(), 3 * TIMEOUT))
+asyncio.run(asyncio.wait_for(main(), 4 * TIMEOUT))
