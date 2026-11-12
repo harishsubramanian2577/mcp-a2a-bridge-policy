@@ -609,3 +609,7 @@ The second review of PR #15 (at `9dff842`) found seven more problems. It also fl
 - If it came after, the result arrived, but the session still held the finished task. The next call sent that task to the agent.
 
 The scripted client reads the whole body, so `check.py` never saw this. Now the answer leg holds its headers (the combined headers+body state) until the reply is settled and the session is updated, and only then sends the `202` (`response_filter` in `src/lib.rs`). The other modes keep the split flow. The PDK notes report the combined state hanging on the response leg on Flex 1.12.1. That doesn't happen here: the full suite, SDK checks included, passes on 1.11.0 (3 runs), 1.12.1 (2 runs) and 1.13.0 (1 run). Before the fix, the accept scenario failed on every run. `tests::accepted_answer_resumes_the_task_and_the_result_arrives_on_the_resumed_stream` now also checks the next call, but `pdk-unit` doesn't model a client disconnect, so the SDK scenario is the regression test for this bug.
+
+### Release 1.3.1
+
+1.3.1 is this branch: the PR #15 fixes, the SDK test and the answer-leg fix above, with `minRuntimeVersion: 1.11.0`. It replaces 1.3.0, which was published with `minRuntimeVersion: 1.6.1` and without these fixes. Exchange versions can't be overwritten, so 1.3.0 is left in place; use 1.3.1.

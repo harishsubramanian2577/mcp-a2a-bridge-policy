@@ -5,7 +5,7 @@ A custom Omni Gateway (Flex Gateway) policy that lets MCP clients use an A2A age
 | | |
 |---|---|
 | Exchange asset | `mcp-a2a-bridge-policy` (definition), `mcp-atoa-bridge-policy-flex` (implementation) |
-| Current version | 1.3.0 |
+| Current version | 1.3.1 |
 | Category | Transformation |
 | Applies to API instance types | MCP, A2A (v0.3), A2A (v1.0) |
 | Gateway | Omni Gateway / Flex Gateway (managed or self-managed), **1.11.0 or later** for policy 1.1.0 and later |
