@@ -62,7 +62,7 @@ def ask(url, message, session=None, client=None):
     status, _, body = http("POST", url, {"jsonrpc": "2.0", "id": calls, "method": "tools/call",
                                          "params": {"name": "ask_agent", "arguments": {"message": message}}},
                            headers(session, client))
-    if status != 200 or body is None or "result" not in body:
+    if status != 200 or body is None or "structuredContent" not in body.get("result", {}):
         check(f"tools/call {message!r} answered", False, f"status {status}, body {body}")
     _, _, received = http("GET", AGENT)
     sent = received[-1]["message"].get("contextId") if received else None
@@ -118,15 +118,21 @@ def main():
 
     print("What is stored in Redis")
     keys = [k for k in redis("--scan") if "mcp-a2a-sessions" in k]
-    check("session entries are in Redis", len(keys) >= 2, f"{len(keys)} keys")
+    # Flex keeps one index key per namespace (no TTL, managed by the gateway); every other key
+    # is a session entry whose last segment is the policy's SHA-256 session key.
+    entries = [k for k in keys if len(k.rsplit(":", 1)[-1]) == 64]
+    indexes = [k for k in keys if k not in entries]
+    check("session entries are in Redis", len(entries) >= 2, f"{len(entries)} entries, {len(indexes)} index keys")
     for k in keys:
         print(f"         {k}")
     check("no key contains a session id", not any(s in k for k in keys for s in (sid, fsid)))
     check("no key contains the client identity", not any("alice" in k for k in keys))
-    ttls = [int(redis("PTTL", k)[0]) for k in keys]
-    check("Redis TTL matches sessionTtlSeconds", all(0 < t <= TTL_MILLIS for t in ttls), f"{ttls} ms")
-    namespaces = {k.rsplit("/", 1)[0] for k in keys}
-    check("hr and finance use different namespaces", len(namespaces) >= 2, ", ".join(sorted(namespaces)))
+    ttls = [int(redis("PTTL", k)[0]) for k in entries]
+    check("every session entry expires within sessionTtlSeconds", all(0 < t <= TTL_MILLIS for t in ttls), f"{min(ttls)}-{max(ttls)} ms")
+    for k in indexes:
+        print(f"         index {k.rsplit(':', 1)[-1]}: type {redis('TYPE', k)[0]}, TTL {redis('PTTL', k)[0]}")
+    namespaces = {k.rsplit(":", 1)[0] for k in entries}
+    check("hr and finance use different namespaces", len(namespaces) >= 2, f"{len(namespaces)} namespaces")
 
     print("Restart survival")
     subprocess.run(["docker", "compose", "restart", "flex-1"], check=True, capture_output=True)

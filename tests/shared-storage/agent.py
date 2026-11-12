@@ -28,8 +28,19 @@ class Agent(BaseHTTPRequestHandler):
         received.clear()
         self._send(200, [])
 
+    def _body(self):
+        if "content-length" in self.headers:
+            return self.rfile.read(int(self.headers["content-length"]))
+        # The policy drops content-length when it rewrites the body, so Envoy sends it chunked.
+        body = b""
+        while (size := int(self.rfile.readline().split(b";")[0], 16)) > 0:
+            body += self.rfile.read(size)
+            self.rfile.readline()
+        self.rfile.readline()
+        return body
+
     def do_POST(self):
-        request = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))))
+        request = json.loads(self._body())
         message = request.get("params", {}).get("message", {})
         received.append({"path": self.path, "message": message})
         context_id = message.get("contextId") or f"ctx-{next(contexts)}"

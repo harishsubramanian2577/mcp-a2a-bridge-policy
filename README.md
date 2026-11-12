@@ -9,6 +9,7 @@ A custom [Omni Gateway (Flex Gateway)](https://docs.mulesoft.com/gateway/latest/
 | Category | Transformation |
 | API instance types | MCP, A2A (v0.3), A2A (v1.0) |
 | PDK | 1.8.0 |
+| Flex Gateway | 1.11.0 or later (1.10.x can't load 1.1.0) |
 
 ## What it does
 

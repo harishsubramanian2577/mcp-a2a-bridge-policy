@@ -22,7 +22,7 @@ spec:
         toolName: ask_agent
         a2aProtocolVersion: "1.0"
         passThroughA2A: false
-        a2aPath: "/"
+        a2aPath: ""
         sessionStoreMode: remote
         sessionTtlSeconds: 600
         sessionKeyHeader: x-client-id
@@ -46,6 +46,6 @@ spec:
         toolName: ask_agent
         a2aProtocolVersion: "1.0"
         passThroughA2A: false
-        a2aPath: "/"
+        a2aPath: ""
         sessionStoreMode: remote
         sessionTtlSeconds: 600

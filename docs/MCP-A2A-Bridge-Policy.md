@@ -8,7 +8,7 @@ A custom Omni Gateway (Flex Gateway) policy that lets MCP clients use an A2A age
 | Current version | 1.1.0 |
 | Category | Transformation |
 | Applies to API instance types | MCP, A2A (v0.3), A2A (v1.0) |
-| Gateway | Omni Gateway / Flex Gateway (managed or self-managed) |
+| Gateway | Omni Gateway / Flex Gateway (managed or self-managed), **1.11.0 or later** for policy 1.1.0 |
 
 ---
 
@@ -118,6 +118,7 @@ Only translated `tools/call` requests are changed. Their `A2A-Version` header an
 | `sessionKeyHeader` | No | empty | Request header whose value is mixed into the session key, so a remembered conversation is tied to the caller. When set, this is enforced: a request without the header gets no session and can't use or end one. Used only with a session store. | `client_id` |
 
 **Limits and session security (1.1.0)**
+- **Gateway version.** 1.1.0 needs Flex Gateway **1.11.0 or later**. It reads the request body before choosing which headers to change, and Flex 1.10.x doesn't support that: the gateway logs `FlexAbiHandler: command 'flex_enable_stop_iteration' unknown` and doesn't start the API. Stay on policy 1.0.x until the gateway is upgraded.
 - **Response size.** The gateway can't write a body of 1 MB or more. If a converted answer would be too large, the policy first drops `structuredContent.data` (data parts are also in the text), then truncates the answer text with a note, and as a last resort returns a tool error. The client always gets a valid MCP result, never the raw A2A reply. The remembered conversation is updated only after the answer is delivered. A `tools/call` message too large to forward gets error `-32602`.
 - **Sessions.** `Mcp-Session-Id` values are random UUIDs, issued at `initialize` and registered in the store. The policy ignores any other value a client sends. Store keys are a SHA-256 hash of the API/policy scope, session ID and identity. The store namespace is specific to the API instance and policy, so two APIs that share one Redis don't share sessions, while replicas of the same API do. Expiry uses the TTL configured now, so a lower `sessionTtlSeconds` also shortens existing entries. `DELETE` with `Mcp-Session-Id` returns `204` for the owner and `404` otherwise.
 
@@ -174,6 +175,7 @@ mcp-a2a-bridge-policy/
 ```
 
 ### 7.1 Prerequisites
+- **Flex Gateway 1.11.0 or later** where the policy runs (policy 1.1.0). Tested on 1.11.0, 1.12.0 and 1.13.0. Version 1.10.x can't load it.
 - **Anypoint CLI v4** with the PDK plugin (`anypoint-cli-v4 plugins:install anypoint-pdk-plugin`), plus the Rust toolchain. For first-time setup, run `make setup`.
 - **A connected app** (client credentials) with the **Exchange Contributor** permission in the target business group.
 

@@ -8,6 +8,7 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 | Fixed in | 1.1.0, branch `fix/p4a-priority-issues` |
 | Priority issues | [#1](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/1), [#4](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/4), [#12](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/12) |
 | Test baseline | 32 unit tests on 1.0.3, 61 on 1.1.0, all passing |
+| Minimum gateway | Flex Gateway 1.11.0 (1.1.0 uses PDK stop-iteration, which 1.10.x doesn't support) |
 
 ## Status
 
@@ -15,7 +16,7 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 |---|---|---|
 | #1 | Failed response rewrite returns raw A2A payload instead of an MCP error | Fixed in 1.1.0 |
 | #4 | Classify native A2A before MCP dispatch and preserve native version semantics | Fixed in 1.1.0 |
-| #12 | Session isolation, identity binding and token generation | Fixed in 1.1.0. Private reporting is enabled. A two-replica Redis test is added; its live run is pending (see below). |
+| #12 | Session isolation, identity binding and token generation | Fixed in 1.1.0. Verified live on two Flex replicas sharing Redis. Private reporting is enabled. |
 
 ## How the fixes were verified
 
@@ -34,7 +35,8 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 4. **Integration tests.**
    - `tests/requests.rs` compiles (`cargo test --no-run`).
    - `make test` needs a Flex registration: put a local-mode `registration.yaml` in `tests/config/` (gitignored), which is mounted into the gateway.
-5. **Shared-storage test.** `make test-shared-storage` (see issue #12 below).
+5. **Shared-storage test.** `make test-shared-storage` passes on Flex 1.11.0, 1.12.0 and 1.13.0 (see issue #12 below).
+6. **Minimum gateway version.** The same harness on Flex 1.10.6 fails at load time with `FlexAbiHandler: command 'flex_enable_stop_iteration' unknown`. The request filter needs PDK's stop-iteration feature (the #4 fix), so 1.1.0 requires Flex Gateway 1.11.0 or later. The README and customer guide say so, and both integration tests are pinned to 1.11.0.
 
 ---
 
@@ -140,7 +142,47 @@ The detailed reproductions in the issue were withheld pending a private channel.
   - Redis keys contain neither the session ID nor the identity, and their TTL matches `sessionTtlSeconds`;
   - the session survives a restart of flex-1;
   - only the owner can `DELETE` it, and once deleted on flex-2 it is gone on flex-1 too.
-- [ ] **Live run of that test.** Flex 1.10 loads no API without a registration, even in local mode. The harness mounts a **local-mode** registration read-only (`REGISTRATION=<path>`, default `playground/config/registration.yaml`) and refuses to run if Flex comes up in connected mode. The results will be added here once a local-mode registration is available.
+- [x] **Live run of that test: passed.** It ran on 2026-11-11 against Flex Gateway 1.11.0, 1.12.0 and 1.13.0 in local mode, with a local-mode registration mounted read-only (`REGISTRATION=<path>`). The harness refuses to run if Flex starts in connected mode. All 18 checks pass:
+
+  ```
+  Replica continuity (hr, bound to x-client-id)
+    PASS  initialize on flex-1 issues a session  (da1bd333-f5a7-46fe-8f80-1a2eae41b3b7)
+    PASS  first call starts a new context  (ctx-1)
+    PASS  flex-2 continues the context stored by flex-1  (agent got ctx-1)
+  Identity binding across replicas
+    PASS  another client with the same session id gets no context  (agent got None)
+    PASS  a request without x-client-id gets no context  (agent got None)
+  Isolation between API instances on the same Redis
+    PASS  hr's session id is unknown to finance  (agent got None)
+    PASS  finance issues its own session  (0e6627f1-aea5-4453-9eef-5213c6fc32e6)
+    PASS  finance continues across replicas  (agent got ctx-5)
+    PASS  finance's session id is unknown to hr  (agent got None)
+  What is stored in Redis
+    PASS  session entries are in Redis  (6 entries, 2 index keys)
+           mcp-a2a-sessions%2F-%2Fhr-agent-p1.default:mcp-a2a-sessions%2F-%2Fhr-agent-p1.default:9758a32df64439d312e3b15155e5061ce4482c993e38dcb08799325f7ab0a5e8
+           mcp-a2a-sessions%2F-%2Fhr-agent-p1.default:mcp-a2a-sessions%2F-%2Fhr-agent-p1.default:992b971e14afbd5b52f84246dc96be00de847c755efc424b97ca618de63fd6f1
+           mcp-a2a-sessions%2F-%2Ffinance-agent-p1.default
+           mcp-a2a-sessions%2F-%2Ffinance-agent-p1.default:mcp-a2a-sessions%2F-%2Ffinance-agent-p1.default:1dcf3854d2ddd015f2114a6973b22ab04e3d3819b646079ed287ad3bf49f5c72
+           mcp-a2a-sessions%2F-%2Fhr-agent-p1.default
+           mcp-a2a-sessions%2F-%2Fhr-agent-p1.default:mcp-a2a-sessions%2F-%2Fhr-agent-p1.default:99ea7c739f41997a807e2879df5134937fe629344c523acf169f7f3f9d07f745
+           mcp-a2a-sessions%2F-%2Ffinance-agent-p1.default:mcp-a2a-sessions%2F-%2Ffinance-agent-p1.default:8f201b699471a9d7857e19d5bf4b36c4a1ef37b3993c8b9e6ba6dfbd1a175185
+           mcp-a2a-sessions%2F-%2Ffinance-agent-p1.default:mcp-a2a-sessions%2F-%2Ffinance-agent-p1.default:f80e9c33e878615e839aee72d945f2ce27d13f46ee5e39f40a0678178e6c731e
+    PASS  no key contains a session id
+    PASS  no key contains the client identity
+    PASS  every session entry expires within sessionTtlSeconds  (599075-599704 ms)
+           index mcp-a2a-sessions%2F-%2Ffinance-agent-p1.default: type hash, TTL -1
+           index mcp-a2a-sessions%2F-%2Fhr-agent-p1.default: type hash, TTL -1
+    PASS  hr and finance use different namespaces  (2 namespaces)
+  Restart survival
+    PASS  the session survives a flex-1 restart  (agent got ctx-1)
+  Delete across replicas
+    PASS  another client cannot delete the session  (404)
+    PASS  the owner deletes the session on flex-2  (204)
+    PASS  flex-1 no longer uses the deleted session  (agent got None)
+  All shared-storage checks passed.
+  ```
+
+  Each session entry is stored under `<namespace>:<SHA-256 key>` with the Redis TTL set to `sessionTtlSeconds`. The two `index` keys are Flex's own per-namespace key index, which the gateway manages and which has no TTL. In local mode the API ID and base path are not known, so the namespace is told apart by the policy instance name (`hr-agent-p1.default` and `finance-agent-p1.default`).
 - [x] **Private security reporting channel.** GitHub private vulnerability reporting is enabled, and [`SECURITY.md`](../SECURITY.md) describes how to report. The repository visibility is unchanged.
 
 ### Files
