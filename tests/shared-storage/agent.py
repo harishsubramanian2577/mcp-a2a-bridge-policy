@@ -3,7 +3,8 @@
 
 A message without a contextId starts a new context ("ctx-1", "ctx-2", ...); a message with one
 continues it. A message whose text starts with "slow" is answered after SLOW_SECONDS, so a test can
-end the session while the call is in flight. GET /requests returns what was received; DELETE
+end the session while the call is in flight. A message whose text starts with "ask" and that
+continues no task is answered input-required, so the elicitation checks have a question. GET /requests returns what was received; DELETE
 /requests clears it.
 """
 import itertools
@@ -51,16 +52,17 @@ class Agent(BaseHTTPRequestHandler):
         text = message.get("parts", [{}])[0].get("text", "")
         if text.startswith("slow"):
             time.sleep(SLOW_SECONDS)
+        asking = text.startswith("ask") and not message.get("taskId")
         self._send(200, {
             "jsonrpc": "2.0",
             "id": request.get("id"),
             "result": {"task": {
-                "id": f"task-{len(received)}",
+                "id": message.get("taskId") or f"task-{len(received)}",
                 "contextId": context_id,
                 "status": {
-                    "state": "TASK_STATE_COMPLETED",
+                    "state": "TASK_STATE_INPUT_REQUIRED" if asking else "TASK_STATE_COMPLETED",
                     "message": {"messageId": f"m-{len(received)}", "role": "ROLE_AGENT",
-                                "parts": [{"text": f"echo: {text}"}]},
+                                "parts": [{"text": "Which city?" if asking else f"echo: {text}"}]},
                 },
             }},
         })

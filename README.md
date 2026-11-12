@@ -2,7 +2,7 @@
 
 A custom [Omni Gateway (Flex Gateway)](https://docs.mulesoft.com/gateway/latest/) policy, built with the [PDK](https://docs.mulesoft.com/pdk/latest/), that puts an MCP front on an A2A agent: MCP clients see it as a server with one tool. The agent can be a single A2A agent or a broker such as MuleSoft Agent Broker, and it needs no changes. MCP-only clients such as ChatGPT, Claude and Cursor can then use it.
 
-It is a **single-tool adapter**, not a full MCP↔A2A protocol translation: each `tools/call` becomes one A2A `SendMessage`. Polling, cancel, push notifications, streaming delivery, elicitation and authentication flows are not mapped. See [Limitations](docs/MCP-A2A-Bridge-Policy.md#8-limitations).
+It is a **single-tool adapter**, not a full MCP↔A2A protocol translation: each `tools/call` becomes one A2A `SendMessage`. Polling, cancel, push notifications, streaming delivery and authentication flows are not mapped. MCP elicitation is an experimental opt-in, off by default. See [Limitations](docs/MCP-A2A-Bridge-Policy.md#8-limitations).
 
 | | |
 |---|---|
@@ -23,7 +23,7 @@ It is a **single-tool adapter**, not a full MCP↔A2A protocol translation: each
 
 **Multi-turn conversations.** Every tool result carries `structuredContent.state`, plus `contextId` and `taskId` when the broker sent them, and a text hint saying how to continue.
 - To continue a conversation, the client passes `context_id`.
-- To answer an `input-required` question from the broker, the client passes `task_id`, plus `context_id` when one was returned. The client collects the answer from the user; the policy never sends elicitation requests ([example](docs/MCP-A2A-Bridge-Policy.md#31-client-managed-follow-up-questions)).
+- To answer an `input-required` question from the broker, the client passes `task_id`, plus `context_id` when one was returned. By default the client collects the answer from the user, and the policy never sends elicitation requests ([example](docs/MCP-A2A-Bridge-Policy.md#31-client-managed-follow-up-questions)). This is how ChatGPT works. With the experimental `enableElicitation` setting, clients that declare elicitation get the question as an `elicitation/create` form on a resumable SSE stream instead ([details](docs/MCP-A2A-Bridge-Policy.md#32-experimental-mcp-elicitation-enableelicitation)).
 - `auth-required` is completed by the user outside the conversation. Never send secrets in a message.
 - An optional session store (`local`, or `remote` via Redis) can remember the last context and pending task for each `Mcp-Session-Id`. This helps clients that never send IDs back. Session IDs are random, issued at `initialize`, scoped to the API instance and policy, and bound to `sessionKeyHeader` when it is set. An unknown, expired, ended or other caller's session ID gets `404`, so the client starts again with `initialize`.
 
@@ -57,6 +57,9 @@ The full guide, with diagrams, every property, policy-order tables, limitations 
 | `sessionStoreMode` | `disabled` | `disabled`, `local` or `remote` |
 | `sessionTtlSeconds` | `1800` | Session store TTL (60–86400) |
 | `sessionKeyHeader` | empty | Header hashed into the session key, for example `client_id`. Enforced: without it, a request gets no session |
+| `enableElicitation` | `false` | Experimental: ask `input-required` questions through MCP elicitation. Needs a session store; leave off for ChatGPT |
+| `elicitationTimeoutSeconds` | `300` | Time to answer an elicited question (30–1800) before the conversation ends |
+| `maxElicitationRounds` | `3` | Elicited questions per call (1–10); more come back as a normal tool result |
 
 ## Repository layout
 

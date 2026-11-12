@@ -11,6 +11,7 @@ pub const PING_METHOD_NAME: &str = "ping";
 pub const TOOLS_LIST_METHOD_NAME: &str = "tools/list";
 pub const TOOLS_CALL_METHOD_NAME: &str = "tools/call";
 pub const NOTIFICATION_METHOD_PREFIX: &str = "notifications/";
+pub const CANCELLED_NOTIFICATION: &str = "notifications/cancelled";
 
 pub const SESSION_ID_HEADER: &str = "mcp-session-id";
 pub const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";

@@ -968,3 +968,396 @@ fn auth_required_task_without_context_is_not_answered_with_secrets() {
     assert!(hint.contains("never send passwords, tokens or other secrets"), "{}", hint);
     assert!(hint.contains("replying does not grant authorization"), "{}", hint);
 }
+
+// ---- Issue #13: experimental elicitation for input-required (enableElicitation, off by default).
+
+/// A mock agent that answers each call with the next reply, relabelled with the request's id.
+fn scripted_agent(replies: Vec<Value>) -> Agent {
+    let replies = std::cell::RefCell::new(std::collections::VecDeque::from(replies));
+    Rc::new(TraceBackend::new(Box::new(move |request: UnitHttpRequest| {
+        let mut reply = replies.borrow_mut().pop_front().expect("the agent was called more often than scripted");
+        if let Some(id) = serde_json::from_slice::<Value>(request.body()).ok().and_then(|r| r.get("id").cloned()) {
+            reply["id"] = id;
+        }
+        UnitHttpResponse::new(200)
+            .with_header("content-type", "application/json")
+            .with_body(reply.to_string().into_bytes())
+    })))
+}
+
+fn agent_task(state: &str, task: &str, context: Option<&str>, text: &str) -> Value {
+    let mut task_json = json!({ "id": task, "status": { "state": state,
+        "message": { "messageId": "m", "role": "ROLE_AGENT", "parts": [{ "text": text }] } } });
+    if let Some(context) = context {
+        task_json["contextId"] = json!(context);
+    }
+    json!({ "jsonrpc": "2.0", "id": "x", "result": { "task": task_json } })
+}
+
+fn asks(question: &str) -> Value {
+    agent_task("TASK_STATE_INPUT_REQUIRED", "t1", Some("ctx-1"), question)
+}
+
+fn completes(text: &str) -> Value {
+    agent_task("TASK_STATE_COMPLETED", "t1", Some("ctx-1"), text)
+}
+
+fn elicit_config(extra: Value) -> String {
+    let mut config: Value = serde_json::from_str(&config_with("local", json!({ "enableElicitation": true }))).unwrap();
+    config.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    config.to_string()
+}
+
+fn initialize_with(version: &str, capabilities: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": version, "capabilities": capabilities, "clientInfo": { "name": "t", "version": "1" } } })
+}
+
+/// A session of a client that declared elicitation.
+fn elicit_session(tester: &mut pdk_unit::UnitTest) -> String {
+    let init = tester.request(mcp_post(initialize_with("2025-06-18", json!({ "elicitation": {} }))));
+    init.header("mcp-session-id").expect("session issued").to_string()
+}
+
+fn in_session(request: UnitHttpRequest, sid: &str) -> UnitHttpRequest {
+    request
+        .with_header("mcp-session-id", sid)
+        .with_header("mcp-protocol-version", "2025-06-18")
+}
+
+fn call_in(tester: &mut pdk_unit::UnitTest, sid: &str, id: i64, args: Value) -> pdk_unit::UnitHttpResponse {
+    tester.request(in_session(mcp_post(tools_call(id, args)), sid))
+}
+
+fn resume(tester: &mut pdk_unit::UnitTest, sid: &str, last_event_id: &str) -> pdk_unit::UnitHttpResponse {
+    tester.request(in_session(
+        UnitHttpRequest::get()
+            .with_path("/mcp")
+            .with_header("accept", "text/event-stream")
+            .with_header("last-event-id", last_event_id),
+        sid,
+    ))
+}
+
+fn respond(tester: &mut pdk_unit::UnitTest, sid: &str, request_id: &Value, result: Value) -> pdk_unit::UnitHttpResponse {
+    tester.request(in_session(
+        mcp_post(json!({ "jsonrpc": "2.0", "id": request_id, "result": result })),
+        sid,
+    ))
+}
+
+fn accept(answer: &str) -> Value {
+    json!({ "action": "accept", "content": { "answer": answer } })
+}
+
+/// The `(id, data)` of every SSE event that carries data.
+fn sse_events(response: &pdk_unit::UnitHttpResponse) -> Vec<(Option<String>, Value)> {
+    assert_eq!(response.status_code(), 200);
+    assert!(response.header("content-type").unwrap().starts_with("text/event-stream"));
+    let text = String::from_utf8(response.body().to_vec()).unwrap();
+    text.split("\n\n")
+        .filter_map(|event| {
+            let id = event.lines().find_map(|l| l.strip_prefix("id: ")).map(str::to_string);
+            let data = event.lines().find_map(|l| l.strip_prefix("data: "))?;
+            Some((id, serde_json::from_str(data).expect("event data is JSON")))
+        })
+        .collect()
+}
+
+/// The single `elicitation/create` on a stream: `(event id, request)`.
+fn question_on(response: &pdk_unit::UnitHttpResponse) -> (String, Value) {
+    let events = sse_events(response);
+    assert_eq!(events.len(), 1, "{:?}", events);
+    let (id, request) = events.into_iter().next().unwrap();
+    assert_eq!(request["method"], "elicitation/create", "{}", request);
+    assert!(String::from_utf8_lossy(response.body()).contains("retry: "), "the stream tells the client when to resume");
+    (id.expect("the question has an event id"), request)
+}
+
+/// The single `tools/call` answer on a stream.
+fn result_on(response: &pdk_unit::UnitHttpResponse, call_id: i64) -> Value {
+    let events = sse_events(response);
+    assert_eq!(events.len(), 1, "{:?}", events);
+    let (_, answer) = events.into_iter().next().unwrap();
+    assert_eq!(answer["id"], call_id, "{}", answer);
+    answer["result"].clone()
+}
+
+fn is_waiting(response: &pdk_unit::UnitHttpResponse) -> bool {
+    sse_events(response).is_empty() && String::from_utf8_lossy(response.body()).contains("retry: ")
+}
+
+#[test]
+fn elicitation_is_off_by_default_and_questions_stay_tool_results() {
+    // The ChatGPT path: even a client that declares elicitation gets the question and the
+    // continuation ids as a JSON tool result, and there is no stream to resume.
+    let backend = scripted_agent(vec![asks("Which city?")]);
+    let mut tester = tester_for(config("local"), &backend);
+    let sid = elicit_session(&mut tester);
+
+    let response = call_in(&mut tester, &sid, 5, json!({ "message": "Book a hotel" }));
+    assert!(response.header("content-type").unwrap().contains("application/json"));
+    let result = json_body(&response)["result"].clone();
+    assert_eq!(result["structuredContent"]["state"], "input-required");
+    assert_eq!(result["structuredContent"]["taskId"], "t1");
+    assert_eq!(result["structuredContent"]["contextId"], "ctx-1");
+    assert_eq!(resume(&mut tester, &sid, "anything-1").status_code(), 405);
+}
+
+#[test]
+fn elicitation_needs_the_capability_a_session_store_and_an_sse_capable_call() {
+    let cases: Vec<(&str, String, Value, &str)> = vec![
+        ("no capability", elicit_config(json!({})), initialize_with("2025-06-18", json!({})), "application/json, text/event-stream"),
+        ("pre-elicitation revision", elicit_config(json!({})), initialize_with("2025-03-26", json!({ "elicitation": {} })), "application/json, text/event-stream"),
+        ("call does not accept SSE", elicit_config(json!({})), initialize_with("2025-06-18", json!({ "elicitation": {} })), "application/json"),
+    ];
+    for (why, config, init, accept_header) in cases {
+        let backend = scripted_agent(vec![asks("Which city?")]);
+        let mut tester = tester_for(config, &backend);
+        let sid = tester.request(mcp_post(init)).header("mcp-session-id").unwrap().to_string();
+        let mut request = UnitHttpRequest::post()
+            .with_path("/mcp")
+            .with_header("content-type", "application/json")
+            .with_header("accept", accept_header)
+            .with_body(tools_call(5, json!({ "message": "Book a hotel" })).to_string().into_bytes());
+        request = in_session(request, &sid);
+        let response = tester.request(request);
+        assert!(response.header("content-type").unwrap().contains("application/json"), "{}", why);
+        assert_eq!(json_body(&response)["result"]["structuredContent"]["taskId"], "t1", "{}", why);
+    }
+
+    // Without a session store there is nowhere to keep the question.
+    let backend = scripted_agent(vec![asks("Which city?")]);
+    let mut tester = tester_for(config_with("disabled", json!({ "enableElicitation": true })), &backend);
+    let response = tester.request(mcp_post(tools_call(5, json!({ "message": "Book a hotel" }))));
+    assert!(response.header("content-type").unwrap().contains("application/json"));
+    assert_eq!(json_body(&response)["result"]["structuredContent"]["state"], "input-required");
+}
+
+#[test]
+fn accepted_answer_resumes_the_task_and_the_result_arrives_on_the_resumed_stream() {
+    let backend = scripted_agent(vec![asks("Which city?"), completes("Booked in Paris."), completes("Anything else?")]);
+    let mut tester = tester_for(elicit_config(json!({})), &backend);
+    let sid = elicit_session(&mut tester);
+
+    let response = call_in(&mut tester, &sid, 5, json!({ "message": "Book a hotel" }));
+    backend.next().expect("the call reached the agent");
+    let (event_id, question) = question_on(&response);
+    assert_eq!(question["params"]["message"], "Which city?");
+    assert_eq!(question["params"]["requestedSchema"]["required"], json!(["answer"]));
+
+    // Before the user answers, a resumed stream only says when to come back.
+    assert!(is_waiting(&resume(&mut tester, &sid, &event_id)));
+
+    let ack = respond(&mut tester, &sid, &question["id"], accept("Paris"));
+    assert_eq!(ack.status_code(), 202);
+    assert!(ack.body().is_empty());
+    let upstream = json_body(&backend.next().expect("the answer reached the agent"));
+    assert_eq!(upstream["method"], "SendMessage");
+    assert_eq!(upstream["id"], 5);
+    assert_eq!(upstream["params"]["message"]["parts"][0]["text"], "Paris");
+    assert_eq!(upstream["params"]["message"]["taskId"], "t1");
+    assert_eq!(upstream["params"]["message"]["contextId"], "ctx-1");
+
+    let result = result_on(&resume(&mut tester, &sid, &event_id), 5);
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["content"][0]["text"], "Booked in Paris.");
+    assert_eq!(result["structuredContent"]["contextId"], "ctx-1");
+
+    // A repeated answer is never sent to the agent twice.
+    assert_eq!(respond(&mut tester, &sid, &question["id"], accept("Paris")).status_code(), 202);
+    assert!(backend.next().is_none());
+
+    // The conversation goes on in the same context.
+    call_in(&mut tester, &sid, 6, json!({ "message": "Thanks" }));
+    assert_eq!(json_body(&backend.next().unwrap())["params"]["message"]["contextId"], "ctx-1");
+}
+
+#[test]
+fn repeated_questions_stop_at_the_round_limit() {
+    let backend = scripted_agent(vec![asks("Which city?"), asks("Which dates?"), asks("Which room?")]);
+    let mut tester = tester_for(elicit_config(json!({ "maxElicitationRounds": 2 })), &backend);
+    let sid = elicit_session(&mut tester);
+
+    let (first_event, first) = question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+    respond(&mut tester, &sid, &first["id"], accept("Paris"));
+    let (second_event, second) = question_on(&resume(&mut tester, &sid, &first_event));
+    assert_eq!(second["params"]["message"], "Which dates?");
+    assert_ne!(second["id"], first["id"]);
+    assert_ne!(second_event, first_event);
+
+    // The third question exceeds the limit and comes back the client-managed way.
+    respond(&mut tester, &sid, &second["id"], accept("May"));
+    let result = result_on(&resume(&mut tester, &sid, &second_event), 5);
+    assert_eq!(result["structuredContent"]["state"], "input-required");
+    assert_eq!(result["structuredContent"]["taskId"], "t1");
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("Which room?"));
+    assert_eq!(backend.next().map(|r| json_body(&r)["params"]["message"]["parts"][0]["text"].clone()), Some(json!("Book")));
+}
+
+#[test]
+fn decline_cancel_and_timeout_end_the_conversation() {
+    for ending in ["decline", "cancel", "timeout"] {
+        crate::session::test_clock::OFFSET.with(|o| o.set(0));
+        let backend = scripted_agent(vec![asks("Which city?"), completes("Fresh start")]);
+        let mut tester = tester_for(elicit_config(json!({})), &backend);
+        let sid = elicit_session(&mut tester);
+        let (event_id, question) = question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+        backend.next();
+
+        let ack = match ending {
+            "timeout" => {
+                crate::session::test_clock::advance(301);
+                None
+            }
+            action => Some(respond(&mut tester, &sid, &question["id"], json!({ "action": action }))),
+        };
+        if let Some(ack) = ack {
+            assert_eq!(ack.status_code(), 202, "{}", ending);
+        }
+        let result = result_on(&resume(&mut tester, &sid, &event_id), 5);
+        let reason = if ending == "timeout" { "timeout" } else if ending == "decline" { "declined" } else { "cancelled" };
+        assert_eq!(result["structuredContent"]["reason"], reason, "{}", ending);
+        assert_eq!(result["isError"], ending == "timeout", "{}", ending);
+        assert!(backend.next().is_none(), "{}: nothing is sent to the agent", ending);
+
+        // A late answer is not forwarded, and the next call starts a new conversation.
+        assert_eq!(respond(&mut tester, &sid, &question["id"], accept("Paris")).status_code(), 202);
+        assert!(backend.next().is_none(), "{}: late answer", ending);
+        call_in(&mut tester, &sid, 6, json!({ "message": "Hello" }));
+        let message = json_body(&backend.next().unwrap())["params"]["message"].clone();
+        assert!(message.get("contextId").is_none() && message.get("taskId").is_none(), "{}: {}", ending, message);
+    }
+    crate::session::test_clock::OFFSET.with(|o| o.set(0));
+}
+
+#[test]
+fn a_client_that_cannot_show_the_form_gets_the_question_as_a_tool_result() {
+    let backend = scripted_agent(vec![asks("Which city?"), completes("Booked")]);
+    let mut tester = tester_for(elicit_config(json!({})), &backend);
+    let sid = elicit_session(&mut tester);
+    let (event_id, question) = question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+    backend.next();
+
+    let failed = tester.request(in_session(
+        mcp_post(json!({ "jsonrpc": "2.0", "id": question["id"], "error": { "code": -32602, "message": "unsupported" } })),
+        &sid,
+    ));
+    assert_eq!(failed.status_code(), 202);
+    let result = result_on(&resume(&mut tester, &sid, &event_id), 5);
+    assert_eq!(result["structuredContent"]["state"], "input-required");
+    assert!(result["content"][1]["text"].as_str().unwrap().contains("task_id=\"t1\""));
+
+    // The conversation continues the client-managed way.
+    call_in(&mut tester, &sid, 6, json!({ "message": "Paris" }));
+    assert_eq!(json_body(&backend.next().unwrap())["params"]["message"]["taskId"], "t1");
+}
+
+#[test]
+fn answers_and_streams_are_bound_to_the_session_and_the_question() {
+    let backend = scripted_agent(vec![asks("Which city?")]);
+    let mut config: Value = serde_json::from_str(&elicit_config(json!({}))).unwrap();
+    config["sessionKeyHeader"] = json!("client_id");
+    let mut tester = tester_for(config.to_string(), &backend);
+    let owner = [("client_id", "alice")];
+    let init = tester.request(with_headers(mcp_post(initialize_with("2025-06-18", json!({ "elicitation": {} }))), &owner));
+    let sid = init.header("mcp-session-id").unwrap().to_string();
+    let response = tester.request(with_headers(in_session(mcp_post(tools_call(5, json!({ "message": "Book" }))), &sid), &owner));
+    let (event_id, question) = question_on(&response);
+    backend.next();
+
+    // Another caller with the same session id has no session.
+    let other = with_headers(in_session(mcp_post(json!({ "jsonrpc": "2.0", "id": question["id"], "result": accept("Rome") })), &sid), &[("client_id", "mallory")]);
+    assert_eq!(tester.request(other).status_code(), 404);
+    let other_resume = with_headers(
+        in_session(UnitHttpRequest::get().with_path("/mcp").with_header("accept", "text/event-stream").with_header("last-event-id", event_id.as_str()), &sid),
+        &[("client_id", "mallory")],
+    );
+    assert_eq!(tester.request(other_resume).status_code(), 404);
+
+    // An answer to another question id is ignored; a malformed one is rejected.
+    let wrong = with_headers(in_session(mcp_post(json!({ "jsonrpc": "2.0", "id": "not-the-question", "result": accept("Rome") })), &sid), &owner);
+    assert_eq!(tester.request(wrong).status_code(), 202);
+    let malformed = with_headers(in_session(mcp_post(json!({ "jsonrpc": "2.0", "id": question["id"], "result": { "action": "accept", "content": {} } })), &sid), &owner);
+    assert_eq!(tester.request(malformed).status_code(), 400);
+    assert!(backend.next().is_none(), "no answer reached the agent");
+
+    // A stream id the session never issued cannot be resumed.
+    let unknown = with_headers(
+        in_session(UnitHttpRequest::get().with_path("/mcp").with_header("accept", "text/event-stream").with_header("last-event-id", "00000000-0000-4000-8000-000000000000-1"), &sid),
+        &owner,
+    );
+    assert_eq!(tester.request(unknown).status_code(), 400);
+}
+
+#[test]
+fn auth_required_and_task_less_questions_are_never_elicited() {
+    let auth = agent_task("TASK_STATE_AUTH_REQUIRED", "t1", Some("ctx-1"), "Sign in at the portal");
+    let no_task = json!({ "jsonrpc": "2.0", "id": "x", "result": { "message": {
+        "messageId": "m", "role": "ROLE_AGENT", "contextId": "ctx-1", "parts": [{ "text": "Hi" }] } } });
+    for (why, reply) in [("auth-required", auth), ("plain message", no_task)] {
+        let backend = scripted_agent(vec![reply]);
+        let mut tester = tester_for(elicit_config(json!({})), &backend);
+        let sid = elicit_session(&mut tester);
+        let response = call_in(&mut tester, &sid, 5, json!({ "message": "Book" }));
+        let events = sse_events(&response);
+        assert_eq!(events.len(), 1, "{}", why);
+        assert_eq!(events[0].1["id"], 5, "{}: the call is answered directly", why);
+        assert!(events[0].1.get("method").is_none(), "{}: no elicitation/create", why);
+    }
+}
+
+#[test]
+fn a_question_without_context_resumes_with_the_task_only() {
+    let backend = scripted_agent(vec![
+        agent_task("TASK_STATE_INPUT_REQUIRED", "t9", None, "Which city?"),
+        agent_task("TASK_STATE_COMPLETED", "t9", None, "Done"),
+    ]);
+    let mut tester = tester_for(elicit_config(json!({})), &backend);
+    let sid = elicit_session(&mut tester);
+    let (event_id, question) = question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+    backend.next();
+    respond(&mut tester, &sid, &question["id"], accept("Paris"));
+    let message = json_body(&backend.next().unwrap())["params"]["message"].clone();
+    assert_eq!(message["taskId"], "t9");
+    assert!(message.get("contextId").is_none(), "{}", message);
+    assert_eq!(result_on(&resume(&mut tester, &sid, &event_id), 5)["content"][0]["text"], "Done");
+}
+
+#[test]
+fn an_agent_failure_after_the_answer_is_a_tool_error_on_the_resumed_stream() {
+    let backend = scripted_agent(vec![
+        asks("Which city?"),
+        json!({ "jsonrpc": "2.0", "id": "x", "error": { "code": -32603, "message": "boom" } }),
+    ]);
+    let mut tester = tester_for(elicit_config(json!({})), &backend);
+    let sid = elicit_session(&mut tester);
+    let (event_id, question) = question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+    assert_eq!(respond(&mut tester, &sid, &question["id"], accept("Paris")).status_code(), 202);
+    let result = result_on(&resume(&mut tester, &sid, &event_id), 5);
+    assert_eq!(result["isError"], true);
+}
+
+#[test]
+fn cancelling_the_call_or_calling_again_drops_the_open_question() {
+    let backend = scripted_agent(vec![asks("Which city?"), asks("Which city?"), completes("Other")]);
+    let mut tester = tester_for(elicit_config(json!({})), &backend);
+    let sid = elicit_session(&mut tester);
+
+    let (event_id, _) = question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+    let cancelled = tester.request(in_session(
+        mcp_post(json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 5 } })),
+        &sid,
+    ));
+    assert_eq!(cancelled.status_code(), 202);
+    assert_eq!(resume(&mut tester, &sid, &event_id).status_code(), 400, "the stream is gone");
+
+    let (event_id, question) = question_on(&call_in(&mut tester, &sid, 6, json!({ "message": "Book" })));
+    backend.next();
+    let message = json_body(&backend.next().unwrap())["params"]["message"].clone();
+    assert!(message.get("contextId").is_none(), "cancel ended the conversation: {}", message);
+    call_in(&mut tester, &sid, 7, json!({ "message": "Something else" }));
+    assert_eq!(resume(&mut tester, &sid, &event_id).status_code(), 400, "a new call supersedes the question");
+    assert_eq!(respond(&mut tester, &sid, &question["id"], accept("Paris")).status_code(), 202);
+    assert!(backend.next().is_some() && backend.next().is_none(), "only call 7 reached the agent after call 6");
+}

@@ -66,6 +66,22 @@ spec:
       type: string
       default: ""
       description: Optional request header (for example client_id or authorization) whose value is hashed into the session key, binding a stored conversation to the caller identity as well as the Mcp-Session-Id. When set, the binding is enforced - a request without this header gets no session and cannot use or end one.
+    enableElicitation:
+      type: boolean
+      default: false
+      description: "Experimental. When the agent needs input (input-required), ask the user through MCP elicitation instead of returning the question as a tool result. Used only when a session store is enabled, the client declared the elicitation capability at initialize (protocol 2025-06-18) and supports resuming SSE streams with Last-Event-ID; otherwise the question is returned as a tool result with continuation ids. ChatGPT does not support elicitation, so leave this off for ChatGPT clients."
+    elicitationTimeoutSeconds:
+      type: integer
+      default: 300
+      minimum: 30
+      maximum: 1800
+      description: How long the bridge waits for the user's answer to one elicitation. When it expires the conversation is ended and the tool call returns a timeout result. Capped by sessionTtlSeconds.
+    maxElicitationRounds:
+      type: integer
+      default: 3
+      minimum: 1
+      maximum: 10
+      description: How many follow-up questions one tool call may ask through elicitation. A further question from the agent is returned as a normal tool result with continuation ids.
   required:
     - toolName
     - a2aProtocolVersion

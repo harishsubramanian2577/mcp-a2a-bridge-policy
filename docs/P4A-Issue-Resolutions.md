@@ -8,7 +8,7 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 | Fixed in | 1.1.0, branch `fix/p4a-priority-issues` (priority issues)<br>1.2.0, branch `fix/p4a-remaining-issues` (remaining issues) |
 | Priority issues | [#1](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/1), [#4](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/4), [#12](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/12) |
 | Remaining issues | [#2](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/2), [#3](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/3), [#5](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/5), [#6](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/6), [#7](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/7), [#8](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/8), [#9](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/9), [#10](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/10), [#11](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/11), [#13](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/13) |
-| Test baseline | 32 unit tests on 1.0.3, 61 on 1.1.0, 86 on 1.2.0, all passing |
+| Test baseline | 32 unit tests on 1.0.3, 61 on 1.1.0, 105 on 1.2.0, all passing |
 | Minimum gateway | Flex Gateway 1.11.0 (1.1.0 and later use PDK stop-iteration, which 1.10.x doesn't support) |
 
 ## Status
@@ -27,7 +27,7 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 | #9 | Input-required tasks without contextId lose task continuation hints | Fixed in 1.2.0 |
 | #10 | Correct MCP policy ordering and state the adapter limitations | Fixed in 1.2.0 (documentation) |
 | #11 | Validate and correct the A2A v1 Exchange asset-type token | Fixed in 1.2.0. Not yet published to Exchange. |
-| #13 | Configurable MCP elicitation for A2A input-required | Partly addressed in 1.2.0: client-managed mode is documented with a full example. Elicitation itself is not implemented and is not advertised; it is an open design question. |
+| #13 | Configurable MCP elicitation for A2A input-required | Fixed in 1.2.0. Experimental `enableElicitation`, **off by default** (the customer's client, ChatGPT, doesn't support elicitation). Client-managed mode is unchanged. Verified live on two replicas. |
 
 ## How the fixes were verified
 
@@ -227,17 +227,17 @@ The detailed reproductions in the issue were withheld pending a private channel.
 
 1. **Unit and filter tests.**
    - Command: `cargo test --lib`.
-   - Result: 86 passed, 0 failed. The run is stable both in parallel and with `--test-threads=1`.
+   - Result: 105 passed, 0 failed. The run is stable both in parallel and with `--test-threads=1`. That is 86 for #2–#11 and 19 for #13 (8 module tests and 11 filter tests).
 2. **Baseline check.**
    - The 13 new or changed filter-level tests in `src/tests.rs` were run unchanged on the 1.1.0 code (`3196f89`).
    - 12 of the 13 failed, each with the bug its issue reports.
    - The 13th, `session_ids_are_ignored_without_a_session_store`, is a guard test. It is expected to pass on both versions.
 3. **Integration tests.**
-   - `make test` passes on Flex 1.11.0: 86 unit tests and the `tools_call_round_trip` integration test.
+   - `make test` passes on Flex 1.11.0: 105 unit tests and the `tools_call_round_trip` integration test.
    - The policy reference name includes the minor version (`mcp-atoa-bridge-policy-flex-v1-2`), so `tests/common/mod.rs` was updated for 1.2.0. Before that update, Flex reported `Extension ... not found` and the request reached the mock agent untranslated.
    - The integration test now uses the fixture's JSON-RPC id (`broker-1`), because 1.2.0 rejects an agent answer whose id doesn't match the request (#6). It also sends `MCP-Protocol-Version: 2025-06-18`.
 4. **Shared-storage test.**
-   - `make test-shared-storage` passes on Flex 1.11.0 with two replicas sharing Redis. That covers the 1.1.0 checks, updated for `404` (#5), plus a new "Late answer after delete" section:
+   - `make test-shared-storage` passes on Flex 1.11.0 with two replicas sharing Redis. That covers the 1.1.0 checks, updated for `404` (#5), plus a new "Late answer after delete" section and the elicitation sections shown under #13:
 
    ```
    Identity binding across replicas
@@ -496,18 +496,60 @@ A Task with `id: t9`, state `input-required` and no `contextId` produced only th
 
 ## Issue #13: Elicitation for input-required, with client-managed fallback
 
-### Status
-Partly addressed. 1.2.0 provides and documents **client-managed mode** only. MCP elicitation is not implemented, and the bridge doesn't advertise it.
+### Decisions
+| Question | Decision |
+|---|---|
+| Target clients | The customer's primary MCP client is ChatGPT, which doesn't support MCP elicitation. So `enableElicitation` is **off by default**, and the client-managed mode (`structuredContent` with `contextId`/`taskId`, guide 3.1) stays the default and is unchanged. Elicitation is experimental, for clients that declare it. |
+| Form and answers | One required free-text field, `answer`, with the agent's question as the message. Nothing is inferred from the agent's text, because A2A doesn't say what shape of answer it wants. The answer is sent to the agent as a plain text part of the same task (`taskId`, plus `contextId` when known), which is exactly what a client-managed follow-up sends. The field description tells the user never to enter passwords, tokens or other secrets, and `auth-required` is never turned into a form. |
+| Timeout | `elicitationTimeoutSeconds`, default **300**, range 30–1800, capped by `sessionTtlSeconds`. Five minutes covers a person reading and typing without leaving a stale task waiting at the agent. |
+| Repeated questions | `maxElicitationRounds`, default **3**, range 1–10, per `tools/call`. A further question comes back as an ordinary `input-required` result with the IDs, so a looping agent can't keep the user in forms. |
+| Decline, cancel, disconnect | The conversation ends: the result says why (`structuredContent: {state: "ended", reason}`), and the session's context and task are cleared, so the next call starts fresh. A disconnect is not a cancellation in MCP, so a client that never comes back is treated as a timeout. `notifications/cancelled` for the call ends it at once. A JSON-RPC error from the client (for example it can't show the form) is not a refusal: the question falls back to the client-managed result and the conversation goes on. |
 
-### What 1.2.0 provides
-- [x] On `input-required`, the bridge returns the agent's question, the state and the continuation IDs, task-only when there is no context (#9). It sends no server-to-client request and never resubmits a task on its own. The client collects the answer and calls the tool again.
-- [x] `auth-required` is not treated as a form. The hint never asks for secrets.
-- [x] The customer guide has a new section, "3.1 Client-managed follow-up questions", with a complete JSON example of the round trip.
+### Resolution steps
+- [x] **Opt-in and gating.** `enableElicitation` (default `false`) is honoured only with a session store, a client that negotiated `2025-06-18` or later and declared `capabilities.elicitation`, and a `tools/call` that accepts `text/event-stream`. Otherwise behaviour is unchanged.
+- [x] **Resumable stream instead of a held connection.** A policy can't keep a response open while waiting for the user, so the bridge uses Streamable HTTP resumption:
+  - the `tools/call` gets an SSE stream with one `elicitation/create` (event `id: <stream>-<n>`) and a `retry` hint, and the stream ends;
+  - the client POSTs its response and gets `202`;
+  - an accepted answer goes to the agent;
+  - the client resumes with `GET` and `Last-Event-ID`, and gets the next question or the final result under the original request ID.
+- [x] **State in the session store.** The open question is stored next to the session, under a separate namespace, so any replica can take the answer or resume the stream. It is bound to the session's identity. Sessions stored by earlier builds stay readable.
+- [x] **Exactly-once answers.** The question is claimed with compare-and-swap before the answer is forwarded. A duplicate or concurrent answer, an answer to another or an old question ID, and a late answer after timeout or decline are acknowledged with `202` and never reach the agent. A malformed answer gets `400` and the question stays open.
+- [x] **Supersede and cancel.** A new `tools/call` in the session drops the open question. `notifications/cancelled` with the call's `requestId` drops it and clears the context.
+- [x] **Configuration and docs.** New `gcl.yaml` properties: `enableElicitation`, `elicitationTimeoutSeconds` and `maxElicitationRounds`. Updated the customer guide (new "3.2 Experimental: MCP elicitation", configuration table, Limitations, checklist item 9) and the README.
 
-### Open design question
-Elicitation needs server-to-client delivery and orchestration that the current single JSON rewrite doesn't have: an SSE response to the tool call, a correlated `elicitation/create`, waiting for the answer, and resuming the A2A task. Before it is built, these need agreement:
-- the target clients and their versions;
-- the requested schema and how answers are serialised;
-- timeouts and limits on repeated interruptions;
-- what happens on decline, cancel or disconnect;
-- the `enableElicitation` default.
+### Files
+`src/elicitation.rs` (new), `src/lib.rs` (`resume_stream`, `answer_elicitation`, `cancel_elicitation`, `start_elicitation`, `settle_answer`), `src/session.rs` (elicitation namespace, `update_elicitation`), `definition/gcl.yaml`, `tests/shared-storage/`, docs.
+
+### Tests
+| Test | What it proves |
+|---|---|
+| `tests::elicitation_is_off_by_default_and_questions_stay_tool_results` | ChatGPT path: with the default config, even a client that declares elicitation gets the JSON result with `taskId` and `contextId` |
+| `tests::elicitation_needs_the_capability_a_session_store_and_an_sse_capable_call` | No capability, a pre-2025-06-18 revision, a JSON-only `Accept`, or no session store: no elicitation |
+| `tests::accepted_answer_resumes_the_task_and_the_result_arrives_on_the_resumed_stream` | Full round trip: the question on SSE, waiting on resume, the answer is `202` and goes to the agent with `taskId`/`contextId`, the result arrives under the original ID, a repeat answer isn't forwarded, and the context continues |
+| `tests::repeated_questions_stop_at_the_round_limit` | New request and event IDs per round, and the extra question comes back client-managed |
+| `tests::decline_cancel_and_timeout_end_the_conversation` | Each ends with its reason, nothing is sent to the agent, a late answer is ignored, and the next call has no `contextId`/`taskId` |
+| `tests::a_client_that_cannot_show_the_form_gets_the_question_as_a_tool_result` | A JSON-RPC error answer falls back to the client-managed result |
+| `tests::answers_and_streams_are_bound_to_the_session_and_the_question` | Another identity gets `404`, a wrong question ID is ignored, a malformed answer gets `400`, and an unknown stream gets `400` |
+| `tests::auth_required_and_task_less_questions_are_never_elicited` | `auth-required` and plain messages are answered directly |
+| `tests::a_question_without_context_resumes_with_the_task_only` | Works with #9's task-only continuation |
+| `tests::an_agent_failure_after_the_answer_is_a_tool_error_on_the_resumed_stream` | Agent errors after an answer become a tool error |
+| `tests::cancelling_the_call_or_calling_again_drops_the_open_question` | `notifications/cancelled` and a new `tools/call` |
+| `elicitation::tests::*` (8) | Settings bounds, capability and version gating, form schema, strict answer parsing, event IDs, stream framing, ended results |
+| `make test-shared-storage`, elicitation sections | Live, two replicas on Redis (below) |
+
+```
+Elicitation across replicas (support, experimental)
+  PASS  the question arrives as elicitation/create on SSE  (200 text/event-stream)
+  PASS  flex-2 resumes the stream and waits for the answer  (200)
+  PASS  another client cannot answer  (404)
+  PASS  both replicas acknowledge the answer  ([202, 202])
+  PASS  the answer reaches the agent once, on the same task and context  (1 answers)
+  PASS  the result arrives on flex-2 under the original call id
+Elicitation decline
+  PASS  declining ends the conversation  ({'reason': 'declined', 'state': 'ended'})
+  PASS  the next call starts a new context  (agent got None)
+Client-managed fallback on the same API (ChatGPT-style client)
+  PASS  a client without the capability gets a JSON tool result with the ids
+```
+
+**Verification boundary:** the live checks use a scripted MCP client. No shipping MCP client that supports elicitation and `Last-Event-ID` resumption has been tried yet, which is why the feature is marked experimental. ChatGPT is unaffected, because it never declares the capability and the setting is off by default.

@@ -17,8 +17,11 @@ use pdk::data_storage::{
     DataStorage, DataStorageBuilder, LocalDataStorage, RemoteDataStorage, StoreMode,
 };
 use pdk::logger;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::elicitation::Pending;
 
 const NAMESPACE_PREFIX: &str = "mcp-a2a-sessions";
 const KEY_FORMAT: &[u8] = b"mcp-a2a-session-key/v1";
@@ -35,14 +38,46 @@ pub struct SessionEntry {
     pub context_id: Option<String>,
     /// Only set while the agent is waiting on the caller (input-required / auth-required).
     pub task_id: Option<String>,
-    /// Last write, in Unix seconds. Expiry is judged against the TTL configured now, so lowering
-    /// `sessionTtlSeconds` also shortens the life of entries written before the change.
+    /// Last write, in Unix seconds.
     pub touched_at: u64,
 }
 
-impl SessionEntry {
-    pub fn is_live(&self, now: u64, ttl_seconds: u64) -> bool {
-        now < self.touched_at.saturating_add(ttl_seconds)
+/// Elicitation state of a session, kept in its own namespace so the session entry format (and
+/// sessions stored by earlier versions) stays unchanged. Its presence means the client declared
+/// elicitation at `initialize`. Storage uses bincode, so these types avoid serde features that
+/// need a self-describing format (tags, `Value`, skipped fields).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElicitationEntry {
+    pub pending: Option<Pending>,
+    pub touched_at: u64,
+}
+
+/// Stored entries carry their last write time. Expiry is judged against the TTL configured now,
+/// so lowering `sessionTtlSeconds` also shortens the life of entries written before the change.
+pub trait Touched {
+    fn touched_at(&self) -> u64;
+    fn touch(&mut self);
+
+    fn is_live(&self, now: u64, ttl_seconds: u64) -> bool {
+        now < self.touched_at().saturating_add(ttl_seconds)
+    }
+}
+
+impl Touched for SessionEntry {
+    fn touched_at(&self) -> u64 {
+        self.touched_at
+    }
+    fn touch(&mut self) {
+        self.touched_at = now_seconds();
+    }
+}
+
+impl Touched for ElicitationEntry {
+    fn touched_at(&self) -> u64 {
+        self.touched_at
+    }
+    fn touch(&mut self) {
+        self.touched_at = now_seconds();
     }
 }
 
@@ -51,8 +86,78 @@ enum Backend {
     Remote(RemoteDataStorage),
 }
 
+impl Backend {
+    fn new(builder: &DataStorageBuilder, mode: &str, ttl_seconds: u64, namespace: &str) -> Option<Self> {
+        match mode {
+            "local" => Some(Backend::Local(builder.local(namespace))),
+            "remote" => Some(Backend::Remote(builder.remote(namespace, remote_ttl_millis(ttl_seconds)))),
+            _ => None,
+        }
+    }
+
+    async fn get<T: Touched + DeserializeOwned>(&self, key: &str, ttl_seconds: u64) -> Option<(T, String)> {
+        let found = match self {
+            Backend::Local(s) => s.get::<T>(key).await,
+            Backend::Remote(s) => s.get::<T>(key).await,
+        };
+        match found {
+            Ok(Some((entry, cas))) if entry.is_live(now_seconds(), ttl_seconds) => Some((entry, cas)),
+            Ok(_) => None,
+            Err(err) => {
+                // Fail open: losing the remembered context only starts a new conversation.
+                logger::warn!("Session store read failed for {}: {}", key_hint(key), err);
+                None
+            }
+        }
+    }
+
+    async fn put<T: Serialize>(&self, key: &str, mode: &StoreMode, entry: &T) -> bool {
+        let stored = match self {
+            Backend::Local(s) => s.store(key, mode, entry).await,
+            Backend::Remote(s) => s.store(key, mode, entry).await,
+        };
+        match stored {
+            Ok(()) => true,
+            Err(err) => {
+                logger::warn!("Session store write failed for {}: {}", key_hint(key), err);
+                false
+            }
+        }
+    }
+
+    async fn delete(&self, key: &str) {
+        let removed = match self {
+            Backend::Local(s) => s.delete(key).await,
+            Backend::Remote(s) => s.delete(key).await,
+        };
+        if let Err(err) = removed {
+            logger::warn!("Session store delete failed for {}: {}", key_hint(key), err);
+        }
+    }
+
+    /// Local storage has no TTL, so expired entries are deleted here.
+    async fn sweep<T: Touched + DeserializeOwned>(&self, ttl_seconds: u64) {
+        let Backend::Local(storage) = self else {
+            return;
+        };
+        let Ok(keys) = storage.get_keys().await else {
+            return;
+        };
+        let now = now_seconds();
+        for key in keys {
+            if let Ok(Some((entry, _))) = storage.get::<T>(&key).await {
+                if !entry.is_live(now, ttl_seconds) {
+                    let _ = storage.delete(&key).await;
+                }
+            }
+        }
+    }
+}
+
 pub struct SessionStore {
     backend: Backend,
+    /// Present when elicitation is enabled.
+    elicitations: Option<Backend>,
     ttl_seconds: u64,
     writes: Cell<u32>,
 }
@@ -65,63 +170,49 @@ impl SessionStore {
         mode: &str,
         ttl_seconds: u64,
         namespace: &str,
+        elicitation: bool,
     ) -> Option<Self> {
         let ttl_seconds = clamp_ttl(ttl_seconds);
-        let backend = match mode {
-            "local" => Backend::Local(builder.local(namespace)),
-            "remote" => Backend::Remote(builder.remote(namespace, remote_ttl_millis(ttl_seconds))),
-            _ => return None,
+        let backend = Backend::new(builder, mode, ttl_seconds, namespace)?;
+        let elicitations = if elicitation {
+            Backend::new(builder, mode, ttl_seconds, &format!("{}/elicitation", namespace))
+        } else {
+            None
         };
         Some(SessionStore {
             backend,
+            elicitations,
             ttl_seconds,
             writes: Cell::new(0),
         })
     }
 
     async fn get(&self, key: &str) -> Option<(SessionEntry, String)> {
-        let found = match &self.backend {
-            Backend::Local(s) => s.get::<SessionEntry>(key).await,
-            Backend::Remote(s) => s.get::<SessionEntry>(key).await,
-        };
-        match found {
-            Ok(Some((entry, cas))) if entry.is_live(now_seconds(), self.ttl_seconds) => Some((entry, cas)),
-            Ok(_) => None,
-            Err(err) => {
-                // Fail open: losing the remembered context only starts a new conversation.
-                logger::warn!("Session store read failed for {}: {}", key_hint(key), err);
-                None
-            }
-        }
+        self.backend.get(key, self.ttl_seconds).await
     }
 
     async fn put(&self, key: &str, mode: &StoreMode, entry: &SessionEntry) -> bool {
-        let stored = match &self.backend {
-            Backend::Local(s) => s.store(key, mode, entry).await,
-            Backend::Remote(s) => s.store(key, mode, entry).await,
-        };
+        let stored = self.backend.put(key, mode, entry).await;
         self.sweep_if_due().await;
-        match stored {
-            Ok(()) => true,
-            Err(err) => {
-                logger::warn!("Session store write failed for {}: {}", key_hint(key), err);
-                false
-            }
-        }
-    }
-
-    fn fresh_entry(&self, context_id: Option<String>, task_id: Option<String>) -> SessionEntry {
-        SessionEntry {
-            context_id,
-            task_id,
-            touched_at: now_seconds(),
-        }
+        stored
     }
 
     /// Records a newly issued session id. Only registered sessions are ever read or updated.
-    pub async fn register(&self, key: &str) -> bool {
-        self.put(key, &StoreMode::Absent, &self.fresh_entry(None, None))
-            .await
+    /// `elicitation` marks a client that declared elicitation, when it is enabled.
+    pub async fn register(&self, key: &str, elicitation: bool) -> bool {
+        let entry = SessionEntry {
+            context_id: None,
+            task_id: None,
+            touched_at: now_seconds(),
+        };
+        if !self.put(key, &StoreMode::Absent, &entry).await {
+            return false;
+        }
+        if let (true, Some(elicitations)) = (elicitation, &self.elicitations) {
+            let entry = ElicitationEntry { pending: None, touched_at: now_seconds() };
+            elicitations.put(key, &StoreMode::Always, &entry).await;
+        }
+        true
     }
 
     /// The live entry of a registered session; `None` for unknown, expired or deleted sessions.
@@ -133,43 +224,70 @@ impl SessionStore {
     /// call was in flight stays deleted: the compare-and-swap only updates the entry that is still
     /// there, so a late answer cannot bring a terminated session back.
     pub async fn update(&self, key: &str, context_id: Option<String>, task_id: Option<String>) {
-        let Some((_, cas)) = self.get(key).await else {
+        self.update_with(key, |entry| {
+            entry.context_id = context_id;
+            entry.task_id = task_id;
+            true
+        })
+        .await;
+    }
+
+    /// Changes the live entry with `change`, which returns `false` to leave it as it is. The
+    /// compare-and-swap means a change decided on a stale entry is dropped, not merged.
+    /// Returns `true` when the change was stored.
+    pub async fn update_with(&self, key: &str, change: impl FnOnce(&mut SessionEntry) -> bool) -> bool {
+        let Some((mut entry, cas)) = self.get(key).await else {
             logger::debug!("Session {} ended before the agent answered; not remembered.", key_hint(key));
-            return;
+            return false;
         };
-        let entry = self.fresh_entry(context_id, task_id);
-        self.put(key, &StoreMode::Cas(cas), &entry).await;
+        if !change(&mut entry) {
+            return false;
+        }
+        entry.touch();
+        self.put(key, &StoreMode::Cas(cas), &entry).await
+    }
+
+    /// The elicitation state of a session whose client declared elicitation; `None` otherwise.
+    /// Callers check that the session itself is live first.
+    pub async fn load_elicitation(&self, key: &str) -> Option<ElicitationEntry> {
+        let elicitations = self.elicitations.as_ref()?;
+        elicitations.get(key, self.ttl_seconds).await.map(|(entry, _)| entry)
+    }
+
+    /// Like [`update_with`](Self::update_with), for the elicitation state.
+    pub async fn update_elicitation(&self, key: &str, change: impl FnOnce(&mut ElicitationEntry) -> bool) -> bool {
+        let Some(elicitations) = &self.elicitations else {
+            return false;
+        };
+        let Some((mut entry, cas)) = elicitations.get::<ElicitationEntry>(key, self.ttl_seconds).await else {
+            return false;
+        };
+        if !change(&mut entry) {
+            return false;
+        }
+        entry.touch();
+        elicitations.put(key, &StoreMode::Cas(cas), &entry).await
     }
 
     pub async fn remove(&self, key: &str) {
-        let removed = match &self.backend {
-            Backend::Local(s) => s.delete(key).await,
-            Backend::Remote(s) => s.delete(key).await,
-        };
-        if let Err(err) = removed {
-            logger::warn!("Session store delete failed for {}: {}", key_hint(key), err);
+        self.backend.delete(key).await;
+        if let Some(elicitations) = &self.elicitations {
+            elicitations.delete(key).await;
         }
     }
 
     async fn sweep_if_due(&self) {
-        let Backend::Local(storage) = &self.backend else {
+        if !matches!(self.backend, Backend::Local(_)) {
             return;
-        };
+        }
         let writes = self.writes.get().wrapping_add(1);
         self.writes.set(writes);
         if writes % LOCAL_SWEEP_INTERVAL != 0 {
             return;
         }
-        let Ok(keys) = storage.get_keys().await else {
-            return;
-        };
-        let now = now_seconds();
-        for key in keys {
-            if let Ok(Some((entry, _))) = storage.get::<SessionEntry>(&key).await {
-                if !entry.is_live(now, self.ttl_seconds) {
-                    let _ = storage.delete(&key).await;
-                }
-            }
+        self.backend.sweep::<SessionEntry>(self.ttl_seconds).await;
+        if let Some(elicitations) = &self.elicitations {
+            elicitations.sweep::<ElicitationEntry>(self.ttl_seconds).await;
         }
     }
 }
@@ -246,10 +364,27 @@ fn key_hint(key: &str) -> String {
 }
 
 pub fn now_seconds() -> u64 {
-    SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    #[cfg(test)]
+    let now = now + test_clock::OFFSET.with(Cell::get);
+    now
+}
+
+/// Lets filter tests move time forward; pdk-unit runs the filters on the test's thread.
+#[cfg(test)]
+pub mod test_clock {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub static OFFSET: Cell<u64> = Cell::new(0);
+    }
+
+    pub fn advance(seconds: u64) {
+        OFFSET.with(|offset| offset.set(offset.get() + seconds));
+    }
 }
 
 #[cfg(test)]

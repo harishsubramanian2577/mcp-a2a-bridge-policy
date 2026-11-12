@@ -23,6 +23,7 @@ services:
     ports:
       - 18081:8081
       - 18082:8082
+      - 18083:8083
     depends_on: [redis, agent]
   flex-2:
     image: mulesoft/flex-gateway:${FLEX_VERSION:-1.11.0}
@@ -34,4 +35,5 @@ services:
     ports:
       - 28081:8081
       - 28082:8082
+      - 28083:8083
     depends_on: [redis, agent]

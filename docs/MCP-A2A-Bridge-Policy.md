@@ -16,7 +16,7 @@ A custom Omni Gateway (Flex Gateway) policy that lets MCP clients use an A2A age
 
 The policy puts an MCP front on an A2A agent. The agent can be a single A2A agent or an agent broker such as MuleSoft Agent Broker; this guide says "broker" for either. MCP clients see one tool (`ask_agent` by default), call it with a natural-language message, and get the agent's answer back as an ordinary MCP tool result. The agent needs no changes.
 
-It is a **single-tool adapter**, not a full or lossless MCP↔A2A protocol translation. Each `tools/call` becomes one A2A `SendMessage`, and the policy returns the final or interrupted result. Polling, cancel, push notifications, streaming delivery, elicitation and authentication flows are not mapped, and some artifact detail is flattened. Read [section 8, Limitations](#8-limitations) before relying on it.
+It is a **single-tool adapter**, not a full or lossless MCP↔A2A protocol translation. Each `tools/call` becomes one A2A `SendMessage`, and the policy returns the final or interrupted result. Polling, cancel, push notifications, streaming delivery and authentication flows are not mapped, MCP elicitation is an experimental opt-in (3.2), and some artifact detail is flattened. Read [section 8, Limitations](#8-limitations) before relying on it.
 
 ## 2. Problem statement
 
@@ -43,7 +43,7 @@ The tool result text always says what to do next, even with `includeStructuredCo
 
 ### 3.1 Client-managed follow-up questions
 
-The policy never asks the user anything itself: it doesn't send MCP `elicitation/create` or any other server-to-client request, and it never resubmits a task on its own. The MCP client owns the conversation. It shows the broker's question to the user, collects the answer, and calls the tool again with the IDs.
+This is the default, and the mode to use with ChatGPT. The policy never asks the user anything itself: it doesn't send MCP `elicitation/create` or any other server-to-client request, and it never resubmits a task on its own. The MCP client owns the conversation. It shows the broker's question to the user, collects the answer, and calls the tool again with the IDs.
 
 1. The client calls the tool:
    ```json
@@ -67,7 +67,35 @@ The policy never asks the user anything itself: it doesn't send MCP `elicitation
    ```
 4. The broker continues task `t9` and the policy returns its next result: `completed`, or another `input-required` that the client handles the same way.
 
-Interactive MCP elicitation is a possible future enhancement (issue #13). It isn't available in this version and isn't advertised.
+### 3.2 Experimental: MCP elicitation (`enableElicitation`)
+
+Off by default. **Leave it off for ChatGPT**, which doesn't support MCP elicitation; the client-managed mode in 3.1 is what ChatGPT uses, and it is unchanged when this setting is on.
+
+When `enableElicitation` is `true`, the policy asks the user the broker's question itself, through the MCP client's form, but only when all of these hold:
+- a session store is configured (`sessionStoreMode` `local` or `remote`; use `remote` with more than one replica);
+- the client negotiated MCP `2025-06-18` or later and declared `capabilities.elicitation` at `initialize`;
+- the `tools/call` accepts `text/event-stream`;
+- the broker answered `input-required` with a task ID. `auth-required` is never turned into a form.
+
+Otherwise the call behaves exactly as in 3.1.
+
+How it works. A gateway policy can't hold a response open while the user thinks, so the question travels on a short SSE stream that the client resumes, as Streamable HTTP allows:
+1. The `tools/call` response is an SSE stream with one `elicitation/create` request (event `id: <stream>-1`) and a `retry` hint, and then the stream ends. The form has one required text field, `answer`, and tells the user never to enter passwords, tokens or other secrets.
+2. The client POSTs its JSON-RPC response to that request and gets `202`. An accepted answer is sent to the broker as the next message of the same task, with its `taskId` and `contextId`.
+3. The client reconnects with `GET` and `Last-Event-ID`. It receives the broker's next question on the same stream, or the `tools/call` result under the original request ID. Until the broker has answered, the stream only carries the `retry` hint.
+
+| Event | What happens |
+|---|---|
+| **Accept** | The answer goes to the broker. Its reply is the next question, or the result. |
+| **Decline or cancel** | The conversation ends: the result says so (`structuredContent: {"state":"ended","reason":"declined"}` or `"cancelled"`), and the remembered context and task are cleared. The next call starts a new conversation. |
+| **No answer in time, or the client disconnects and never comes back** | After `elicitationTimeoutSeconds` (default 300) the conversation ends the same way, with `reason: "timeout"` and `isError: true`. A late answer is ignored. |
+| **The client answers with a JSON-RPC error** (for example it can't show the form) | The question is returned as an ordinary `input-required` result with the IDs, and the conversation continues the 3.1 way. |
+| **More than `maxElicitationRounds` questions** (default 3) | The extra question is returned as an ordinary `input-required` result with the IDs. |
+| **`notifications/cancelled` for the call, or a new `tools/call`** | The open question is dropped. Cancelling also clears the remembered context. |
+
+Answers and resumed streams are bound to the session and its `sessionKeyHeader` identity, and only the current question's ID is accepted. An answer is sent to the broker at most once.
+
+This mode is **experimental**. It needs a client that supports elicitation and `Last-Event-ID` resumption. Test it with your target client (9) before you turn it on.
 
 ---
 
@@ -149,6 +177,9 @@ Only translated `tools/call` requests are changed. Their `A2A-Version` header an
 | `sessionStoreMode` | No | `disabled` | Optional gateway-side memory of the last conversation per MCP session, for clients that never send `context_id` back. `local` keeps it in memory on each gateway replica; `remote` needs gateway Shared Storage (Redis). | `disabled` |
 | `sessionTtlSeconds` | No | `1800` | How long, in seconds, a remembered conversation lasts (60–86400). Used only with a session store. | `1800` |
 | `sessionKeyHeader` | No | empty | Request header whose value is mixed into the session key, so a remembered conversation is tied to the caller. When set, this is enforced: a request without the header gets no session and can't use or end one. Used only with a session store. | `client_id` |
+| `enableElicitation` | No | `false` | **Experimental.** Ask the broker's `input-required` questions through MCP elicitation (3.2). Needs a session store and a client that declared elicitation. Leave it off for ChatGPT. | `false` |
+| `elicitationTimeoutSeconds` | No | `300` | How long the user has to answer an elicited question (30–1800, capped by `sessionTtlSeconds`). After that the conversation ends. | `300` |
+| `maxElicitationRounds` | No | `3` | Questions asked through elicitation per `tools/call` (1–10). A further question is returned as an ordinary tool result with the IDs. | `3` |
 
 **Limits, sessions and protocol checks**
 - **Gateway version.** 1.1.0 and later need Flex Gateway **1.11.0 or later**. It reads the request body before choosing which headers to change, and Flex 1.10.x doesn't support that: the gateway logs `FlexAbiHandler: command 'flex_enable_stop_iteration' unknown` and doesn't start the API. Stay on policy 1.0.x until the gateway is upgraded.
@@ -275,7 +306,7 @@ The policy is a single-tool adapter. It covers the common case, where one questi
 | **Delivery** | Buffers the broker's answer, including a streamed (SSE) one, and returns one MCP result. | No progress or partial output reaches the client. The answer arrives when the broker finishes (or times out). |
 | **Size** | Answers must fit in 1 MB once converted. | Large answers are truncated with a note, or replaced by a tool error. |
 | **Content** | Text parts become `content[].text`, and data parts become JSON text plus `structuredContent.data`. A file part becomes a line with its name, media type and URL; inline file bytes are left out. Artifacts are flattened into the text after updates are folded together. | Inline file content, artifact names and metadata, and part metadata are not passed to the client. |
-| **Follow-up questions** | Returns the question, the state and the IDs (`input-required`). Doesn't send MCP elicitation. | The client collects the answer and calls the tool again (see 3.1). |
+| **Follow-up questions** | By default returns the question, the state and the IDs (`input-required`). Experimental MCP elicitation is opt-in (`enableElicitation`), needs a session store and an elicitation-capable client, and asks for one free-text answer. | The client collects the answer and calls the tool again (see 3.1). ChatGPT always works this way. Elicitation (3.2) uses a resumable stream instead of keeping the call open, so the client must support `Last-Event-ID`. |
 | **Authorization** | Reports `auth-required` with instructions. Doesn't run any authentication flow. | The user completes authorization outside the conversation. Never send secrets in a message. |
 | **Bindings and versions** | Translated calls use A2A JSON-RPC, v1.0 or v0.3 (configured). Native HTTP+JSON, JSON-RPC and gRPC are passed through unchanged in Mode 2. MCP revisions 2025-06-18, 2025-03-26 and 2024-11-05, over Streamable HTTP only. | The broker must accept JSON-RPC for translated calls. Clients that need the legacy HTTP+SSE transport (pre-2025-03-26) aren't supported. |
 | **Sessions** | Optional gateway memory of the last context and pending task per `Mcp-Session-Id`. `local` is per replica, while `remote` (Redis) is shared. | With `local` and several replicas, a follow-up can land on a replica that doesn't know the session and gets `404`. Use `remote`, or have clients pass `context_id`/`task_id`, which always works. |
@@ -294,3 +325,4 @@ Run these against the deployed proxy before sharing it with clients.
 6. **Sessions (if enabled).** `initialize` returns `Mcp-Session-Id`. A follow-up with it continues the conversation. A `DELETE` with it returns `204`, after which the same ID gets `404`.
 7. **Native A2A (Mode 2 only).** An A2A client's `SendMessage`, and the agent card, still work unchanged on the same URL.
 8. **Timeout.** A long multi-agent question completes within the response timeout.
+9. **Elicitation (only if `enableElicitation` is on).** With the target client, ask something the broker answers with a follow-up question. Confirm the client shows a form, that answering continues the same task, and that declining ends the conversation. With ChatGPT, confirm the result is still the 3.1 JSON result with `taskId`.
