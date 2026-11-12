@@ -1601,12 +1601,11 @@ fn accepted_answer_resumes_the_task_and_the_result_arrives_on_the_resumed_stream
     );
     assert!(backend.next().is_none());
 
-    // The conversation goes on in the same context.
+    // The conversation goes on in the same context, and the completed task is not continued.
     call_in(&mut tester, &sid, 6, json!({ "message": "Thanks" }));
-    assert_eq!(
-        json_body(&backend.next().unwrap())["params"]["message"]["contextId"],
-        "ctx-1"
-    );
+    let next = json_body(&backend.next().unwrap());
+    assert_eq!(next["params"]["message"]["contextId"], "ctx-1");
+    assert_eq!(next["params"]["message"].get("taskId"), None);
 }
 
 #[test]

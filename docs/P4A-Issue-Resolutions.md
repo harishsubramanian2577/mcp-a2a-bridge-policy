@@ -593,4 +593,19 @@ The second review of PR #15 (at `9dff842`) found seven more problems. It also fl
 
 **Known limitation:** a question that has been answered but whose result hasn't been fetched yet can still be replaced by a new call's question.
 
-**Still open:** interop with an MCP SDK client has not been tested end to end. The elicitation checks use a scripted client (see the verification boundary under #13).
+### End-to-end test with a real MCP SDK client
+
+`make test-shared-storage` now also drives the gateway with the official MCP Python SDK (`mcp` 2.3.0, pinned), after `check.py`. The script is `tests/shared-storage/sdk_check.py`. It runs in a `python:3.12-slim` container on the compose network and installs the SDK from PyPI; `SKIP_SDK=1` skips it. The SDK runs its own handshake, Streamable HTTP transport, elicitation callback and SSE resumption (GET with `Last-Event-ID` after the question stream ends), with nothing scripted:
+
+| Scenario | Checks |
+|---|---|
+| No elicitation (ChatGPT-style, the default path) | The SDK negotiates `2025-06-18`. `tools/list` lists `ask_agent`. A question comes back as an `input-required` result with `taskId` and `contextId`. Passing them back continues the same task. |
+| Elicitation, accept | The SDK gets one `elicitation/create` with the agent's question and an `answer` field. The call resumes and returns the agent's final answer. The answer reaches the agent once, on the asking task. The next call continues the same context, without the finished task. |
+| Elicitation, decline | The call ends with `{"state":"ended","reason":"declined"}`. The next call starts a new context. |
+
+**Bug found and fixed.** The SDK closes the connection as soon as it receives the `202` for its answer. The response filter committed the `202` headers before reading the agent's reply, so Envoy tore the stream down while the filter was still writing the session:
+
+- If the teardown came before the reply was stored, the question stayed in `Answering`, and the resumed stream waited until the SDK timed out.
+- If it came after, the result arrived, but the session still held the finished task. The next call sent that task to the agent.
+
+The scripted client reads the whole body, so `check.py` never saw this. Now the answer leg holds its headers (the combined headers+body state) until the reply is settled and the session is updated, and only then sends the `202` (`response_filter` in `src/lib.rs`). The other modes keep the split flow. The PDK notes report the combined state hanging on the response leg on Flex 1.12.1. That doesn't happen here: the full suite, SDK checks included, passes on 1.11.0 (3 runs), 1.12.1 (2 runs) and 1.13.0 (1 run). Before the fix, the accept scenario failed on every run. `tests::accepted_answer_resumes_the_task_and_the_result_arrives_on_the_resumed_stream` now also checks the next call, but `pdk-unit` doesn't model a client disconnect, so the SDK scenario is the regression test for this bug.

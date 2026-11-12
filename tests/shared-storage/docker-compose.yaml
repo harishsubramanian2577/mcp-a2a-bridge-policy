@@ -2,7 +2,7 @@
 #
 # Two Flex Gateway replicas sharing one Redis, in front of a recording mock A2A agent.
 # Both replicas mount the same registration, as replicas of one gateway do.
-# Driven by run.sh (`make test-shared-storage`).
+# Driven by run.sh (`make test-shared-storage`). The sdk service runs only on demand (`run`).
 services:
   redis:
     image: redis:7-alpine
@@ -37,3 +37,13 @@ services:
       - 28082:8082
       - 28083:8083
     depends_on: [redis, agent]
+  sdk:
+    # The official MCP Python SDK as a real client (sdk_check.py). Pinned so results are reproducible.
+    image: python:3.12-slim
+    profiles: [sdk]
+    environment:
+      MCP_SDK_VERSION: ${MCP_SDK_VERSION:-2.3.0}
+    command: ["sh", "-c", "pip install -q --disable-pip-version-check --root-user-action=ignore mcp==$$MCP_SDK_VERSION && python -I -u /sdk_check.py"]
+    volumes:
+      - ./sdk_check.py:/sdk_check.py:ro
+    depends_on: [flex-1, agent]

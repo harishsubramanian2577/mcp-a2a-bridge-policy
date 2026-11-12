@@ -1015,9 +1015,31 @@ async fn response_filter(
         return;
     }
 
+    // A client may close the connection as soon as it sees the 202 for its answer, which abandons
+    // this filter. The headers are held until the agent's reply is settled, so the resumed stream
+    // never waits on a reply that was dropped and a finished task is never continued.
+    if let Mode::Answer { stream, round } = &transcoded.mode {
+        let state = headers_state.into_headers_body_state().await;
+        let handler = state.handler();
+        let parsed =
+            a2a::parse_agent_response(status, &content_type, &handler.body(), &transcoded.rpc_id);
+        if let Err(message) = &parsed {
+            logger::warn!("A2A call failed: {}", message);
+        }
+        let outcome = parsed.map_err(|message| mcp::tool_error_result(&message));
+        settle_answer(bridge, &transcoded, stream, *round, outcome).await;
+        handler.set_header(":status", "202");
+        handler.remove_header("content-type");
+        handler.remove_header("content-length");
+        if let Err(err) = handler.set_body(b"") {
+            logger::error!("Failed to write the MCP result: {:?}", err);
+        }
+        return;
+    }
+
     // Headers are committed before the body is read, so the content type follows the mode: the
     // MCP client always gets an in-band JSON-RPC answer at HTTP 200, as JSON or as an SSE stream
-    // when a question may be asked, and an answer to a question gets a bodyless 202.
+    // when a question may be asked.
     let handler = headers_state.handler();
     handler.remove_header("content-length");
     match &transcoded.mode {
@@ -1031,10 +1053,7 @@ async fn response_filter(
                 handler.set_header(&name, &value);
             }
         }
-        Mode::Answer { .. } => {
-            handler.set_header(":status", "202");
-            handler.remove_header("content-type");
-        }
+        Mode::Answer { .. } => {}
     }
 
     let body_state = headers_state.into_body_state().await;
@@ -1053,12 +1072,6 @@ async fn response_filter(
     }
 
     match &transcoded.mode {
-        Mode::Answer { stream, round } => {
-            let outcome = parsed.map_err(|message| mcp::tool_error_result(&message));
-            settle_answer(bridge, &transcoded, stream, *round, outcome).await;
-            write(b"");
-            return;
-        }
         Mode::MayElicit => {
             if let Some(reply) = parsed
                 .as_ref()
@@ -1071,7 +1084,7 @@ async fn response_filter(
                 }
             }
         }
-        Mode::Plain => {}
+        Mode::Plain | Mode::Answer { .. } => {}
     }
 
     let (result, reply) = match parsed {
