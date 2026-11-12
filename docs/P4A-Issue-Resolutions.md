@@ -627,6 +627,8 @@ Found in manual testing with MCP Inspector against 1.3.1. After a question, the 
 
 `make test-shared-storage` (44 checks, both SDKs included) passes on Flex 1.11.0 (2 runs), 1.12.1 and 1.13.0. `cargo test --lib`: 112 passed.
 
-### Release 1.3.2
+### Release 1.3.3
 
-1.3.2 adds the waiting-stream fix above to 1.3.1. Use 1.3.2 with MCP Inspector or any client built on the MCP TypeScript SDK; 1.3.1 times out there when the user answers after the client's first resume.
+1.3.3 adds the waiting-stream fix above to 1.3.1. Use 1.3.3 with MCP Inspector or any client built on the MCP TypeScript SDK; 1.3.1 times out there when the user answers after the client's first resume.
+
+1.3.3 has the same code as 1.3.2. Only half of the 1.3.2 release reached Exchange: the definition published, then the CLI failed on the implementation (`TypeError: Cannot read properties of undefined (reading 'data')`). Exchange versions can't be replaced, so the release went out again as 1.3.3. Don't use definition 1.3.2; it has no implementation.

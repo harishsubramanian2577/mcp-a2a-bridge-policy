@@ -2195,7 +2195,7 @@ dependencies = [
 
 [[package]]
 name = "mcp_a2a_bridge_policy"
-version = "1.3.2"
+version = "1.3.3"
 dependencies = [
  "anyhow",
  "getrandom 0.2.17",
