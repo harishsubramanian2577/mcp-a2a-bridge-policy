@@ -7,7 +7,7 @@ It is a **single-tool adapter**, not a full MCP↔A2A protocol translation: each
 | | |
 |---|---|
 | Exchange assets | `mcp-a2a-bridge-policy` (definition), `mcp-atoa-bridge-policy-flex` (implementation) |
-| Version | 1.3.1 |
+| Version | 1.3.2 |
 | Category | Transformation |
 | API instance types | MCP, A2A (v0.3), A2A (v1.0) |
 | PDK | 1.8.0 |

@@ -626,3 +626,7 @@ Found in manual testing with MCP Inspector against 1.3.1. After a question, the 
 - The unit tests that resume while a question is open now check that the waiting stream repeats the event id.
 
 `make test-shared-storage` (44 checks, both SDKs included) passes on Flex 1.11.0 (2 runs), 1.12.1 and 1.13.0. `cargo test --lib`: 112 passed.
+
+### Release 1.3.2
+
+1.3.2 adds the waiting-stream fix above to 1.3.1. Use 1.3.2 with MCP Inspector or any client built on the MCP TypeScript SDK; 1.3.1 times out there when the user answers after the client's first resume.
