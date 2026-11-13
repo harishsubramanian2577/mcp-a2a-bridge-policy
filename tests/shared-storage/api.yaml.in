@@ -1,0 +1,77 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+#
+# Three API instances with the same policy and the same Redis. "hr" binds sessions to the
+# x-client-id header; "finance" does not; "support" also turns on experimental elicitation. run.sh writes config/api.yaml from this file with POLICY_REF replaced.
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: ApiInstance
+metadata:
+  name: hr-agent
+spec:
+  address: http://0.0.0.0:8081/hr
+  services:
+    upstream:
+      address: http://agent:8080
+      routes:
+        - config:
+            destinationPath: /
+  policies:
+    - policyRef:
+        name: POLICY_REF
+      config:
+        toolName: ask_agent
+        a2aProtocolVersion: "1.0"
+        passThroughA2A: false
+        a2aPath: ""
+        sessionStoreMode: remote
+        sessionTtlSeconds: 600
+        sessionKeyHeader: x-client-id
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: ApiInstance
+metadata:
+  name: finance-agent
+spec:
+  address: http://0.0.0.0:8082/finance
+  services:
+    upstream:
+      address: http://agent:8080
+      routes:
+        - config:
+            destinationPath: /
+  policies:
+    - policyRef:
+        name: POLICY_REF
+      config:
+        toolName: ask_agent
+        a2aProtocolVersion: "1.0"
+        passThroughA2A: false
+        a2aPath: ""
+        sessionStoreMode: remote
+        sessionTtlSeconds: 600
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: ApiInstance
+metadata:
+  name: support-agent
+spec:
+  address: http://0.0.0.0:8083/support
+  services:
+    upstream:
+      address: http://agent:8080
+      routes:
+        - config:
+            destinationPath: /
+  policies:
+    - policyRef:
+        name: POLICY_REF
+      config:
+        toolName: ask_agent
+        a2aProtocolVersion: "1.0"
+        passThroughA2A: false
+        a2aPath: ""
+        sessionStoreMode: remote
+        sessionTtlSeconds: 600
+        sessionKeyHeader: x-client-id
+        enableElicitation: true
+        elicitationTimeoutSeconds: 60

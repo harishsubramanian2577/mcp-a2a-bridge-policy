@@ -2,6 +2,9 @@ export PDK_COMPATIBILITY_VERSION = 1.4.0
 TARGET                	:= wasm32-wasip1
 TARGET_DIR            	:= target/$(TARGET)/release
 CARGO_ANYPOINT        	:= cargo-anypoint
+# Lowest Flex Gateway that can load the policy. enable_stop_iteration needs 1.11.0.
+# Written into target/implementation*/metadata.yaml, which publish and release upload.
+MIN_RUNTIME_VERSION    	:= 1.11.0
 DEFINITION_NAME        	= $(shell anypoint-cli-v4 pdk policy-project definition get gcl-metadata-name)
 DEFINITION_NAMESPACE   	= $(shell anypoint-cli-v4 pdk policy-project definition get gcl-metadata-namespace)
 DEFINITION_SRC_GCL_PATH = $(shell anypoint-cli-v4 pdk policy-project locate-gcl definition-src)
@@ -52,6 +55,10 @@ endif
 test: build ## Run integration tests
 	@cargo test -- --nocapture
 
+.PHONY: test-shared-storage
+test-shared-storage: build ## Run the two-replica shared Redis session test (Docker)
+	@tests/shared-storage/run.sh
+
 FORMAT     ?=
 OUTPUT_PATH ?=
 
@@ -62,17 +69,22 @@ _COVERAGE_OUTPUT = $(if $(OUTPUT_PATH),--output-path $(OUTPUT_PATH),)
 test-coverage: build ## Run tests with coverage. Opts: FORMAT=json|html, OUTPUT_PATH=/my/path
 	cargo llvm-cov test $(_COVERAGE_FORMAT) $(_COVERAGE_OUTPUT) --ignore-filename-regex config.rs -- --nocapture
 
+.PHONY: validate-definition
+validate-definition: ## Check the definition metadata against Exchange's rules before publishing
+	@python3 scripts/validate-definition.py "$(DEFINITION_SRC_GCL_PATH)" Cargo.toml
+
 .PHONY: publish
-publish: build ## Publish a development version of the policy
+publish: validate-definition build ## Publish a development version of the policy
 	anypoint-cli-v4 pdk policy-project publish --binary-path $(TARGET_DIR)/$(CRATE_NAME).wasm --implementation-gcl-path $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml
 
 .PHONY: release
-release: build ## Publish a release version
+release: validate-definition build ## Publish a release version
 	anypoint-cli-v4 pdk policy-project release --binary-path $(TARGET_DIR)/$(CRATE_NAME).wasm --implementation-gcl-path $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml
 
 .PHONY: build-asset-files
 build-asset-files: $(DEFINITION_SRC_GCL_PATH)
 	@anypoint-cli-v4 pdk policy-project build-asset-files --metadata '$(ANYPOINT_METADATA_JSON)'
+	@python3 scripts/check-min-runtime.py --write $(MIN_RUNTIME_VERSION)
 	@cargo anypoint config-gen -p -m $(DEFINITION_SRC_GCL_PATH) -o src/generated/config.rs
 
 .PHONY: install-cargo-anypoint

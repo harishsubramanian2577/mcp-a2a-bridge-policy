@@ -1,0 +1,60 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+#
+# Two Flex Gateway replicas sharing one Redis, in front of a recording mock A2A agent.
+# Both replicas mount the same registration, as replicas of one gateway do.
+# Driven by run.sh (`make test-shared-storage`). The sdk and ts-sdk services run only on demand (`run`).
+services:
+  redis:
+    image: redis:7-alpine
+  agent:
+    image: python:3.12-alpine
+    command: ["python", "-u", "/agent.py"]
+    volumes:
+      - ./agent.py:/agent.py:ro
+    ports:
+      - 18090:8080
+  flex-1:
+    image: mulesoft/flex-gateway:${FLEX_VERSION:-1.11.0}
+    environment:
+      FLEX_NAME: flex-1
+    volumes:
+      - ./config:/usr/local/share/mulesoft/flex-gateway/conf.d/
+      - ${REGISTRATION:?set REGISTRATION}:/etc/mulesoft/flex-gateway/conf.d/registration.yaml:ro
+    ports:
+      - 18081:8081
+      - 18082:8082
+      - 18083:8083
+    depends_on: [redis, agent]
+  flex-2:
+    image: mulesoft/flex-gateway:${FLEX_VERSION:-1.11.0}
+    environment:
+      FLEX_NAME: flex-2
+    volumes:
+      - ./config:/usr/local/share/mulesoft/flex-gateway/conf.d/
+      - ${REGISTRATION:?set REGISTRATION}:/etc/mulesoft/flex-gateway/conf.d/registration.yaml:ro
+    ports:
+      - 28081:8081
+      - 28082:8082
+      - 28083:8083
+    depends_on: [redis, agent]
+  sdk:
+    # The official MCP Python SDK as a real client (sdk_check.py). Pinned so results are reproducible.
+    image: python:3.12-slim
+    profiles: [sdk]
+    environment:
+      MCP_SDK_VERSION: ${MCP_SDK_VERSION:-2.3.0}
+    command: ["sh", "-c", "pip install -q --disable-pip-version-check --root-user-action=ignore mcp==$$MCP_SDK_VERSION && python -I -u /sdk_check.py"]
+    volumes:
+      - ./sdk_check.py:/sdk_check.py:ro
+    depends_on: [flex-1, agent]
+  ts-sdk:
+    # The official MCP TypeScript SDK (the client in MCP Inspector) as a real client (ts_check.mjs).
+    image: node:22-slim
+    profiles: [sdk]
+    environment:
+      MCP_TS_SDK_VERSION: ${MCP_TS_SDK_VERSION:-1.32.2}
+    working_dir: /check
+    command: ["sh", "-c", "npm install --silent --no-audit --no-fund @modelcontextprotocol/sdk@$$MCP_TS_SDK_VERSION >/dev/null && cp /ts_check.mjs . && node ts_check.mjs"]
+    volumes:
+      - ./ts_check.mjs:/ts_check.mjs:ro
+    depends_on: [flex-1, agent]
