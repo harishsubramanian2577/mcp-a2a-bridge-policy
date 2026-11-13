@@ -55,7 +55,7 @@ spec:
         - local
         - remote
       default: disabled
-      description: Optional server-side map from MCP session to A2A contextId/taskId, used only when the client omits context_id. Session ids are random, issued at initialize and scoped to this API instance and policy. local is per-replica in-memory; remote shares sessions across replicas and requires Flex Gateway Shared Storage (Redis) and will fail policy startup if it is not configured.
+      description: Optional server-side map from MCP session to A2A contextId/taskId, used only when the client omits context_id. Session ids are random, issued at initialize and scoped to this API instance and policy. local is per-replica in-memory; remote shares sessions across replicas through the gateway's shared storage: built in on managed Omni Gateway, which always runs at least two replicas; on self-managed gateways configure Shared Storage (Redis or distributed), or policy startup fails.
     sessionTtlSeconds:
       type: integer
       default: 1800

@@ -25,7 +25,7 @@ It is a **single-tool adapter**, not a full MCP↔A2A protocol translation: each
 - To continue a conversation, the client passes `context_id`.
 - To answer an `input-required` question from the broker, the client passes `task_id`, plus `context_id` when one was returned. By default the client collects the answer from the user, and the policy never sends elicitation requests ([example](docs/MCP-A2A-Bridge-Policy.md#31-client-managed-follow-up-questions)). This is how ChatGPT works. With the experimental `enableElicitation` setting, clients that declare elicitation get the question as an `elicitation/create` form on a resumable SSE stream instead ([details](docs/MCP-A2A-Bridge-Policy.md#32-experimental-mcp-elicitation-enableelicitation)).
 - `auth-required` is completed by the user outside the conversation. Never send secrets in a message.
-- An optional session store (`local`, or `remote` via Redis) can remember the last context and pending task for each `Mcp-Session-Id`. This helps clients that never send IDs back. Session IDs are random, issued at `initialize`, scoped to the API instance and policy, and bound to `sessionKeyHeader` when it is set. An unknown, expired, ended or other caller's session ID gets `404`, so the client starts again with `initialize`.
+- An optional session store (`local`, or `remote` through the gateway's shared storage, which managed Omni Gateways have built in and self-managed ones get from Redis) can remember the last context and pending task for each `Mcp-Session-Id`. This helps clients that never send IDs back. Session IDs are random, issued at `initialize`, scoped to the API instance and policy, and bound to `sessionKeyHeader` when it is set. An unknown, expired, ended or other caller's session ID gets `404`, so the client starts again with `initialize`.
 
 **Size limit.** Converted answers always fit the gateway's 1 MB body limit. The policy drops duplicated data, truncates the text, or as a last resort returns a tool error, so the client never gets the raw A2A reply.
 
@@ -54,7 +54,7 @@ The full guide, with diagrams, every property, policy-order tables, limitations 
 | `passThroughA2A` | `false` | Forward native A2A traffic (Mode 2) |
 | `a2aPath` | empty | Path, relative to the upstream URL, that converted calls are sent to (native A2A traffic is never rewritten) |
 | `includeStructuredContent` | `true` | Add `state`, `contextId`, `taskId` (when present) and data parts to tool results |
-| `sessionStoreMode` | `disabled` | `disabled`, `local` or `remote` |
+| `sessionStoreMode` | `disabled` | `disabled`, `local` or `remote`. Use `remote` on managed gateways (always 2+ replicas) and with elicitation |
 | `sessionTtlSeconds` | `1800` | Session store TTL (60–86400) |
 | `sessionKeyHeader` | empty | Header hashed into the session key, for example `client_id`. Enforced: without it, a request gets no session |
 | `enableElicitation` | `false` | Experimental: ask `input-required` questions through MCP elicitation. Needs a session store; leave off for ChatGPT |

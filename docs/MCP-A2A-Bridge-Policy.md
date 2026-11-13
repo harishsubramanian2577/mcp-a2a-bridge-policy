@@ -72,7 +72,7 @@ This is the default, and the mode to use with ChatGPT. The policy never asks the
 Off by default. **Leave it off for ChatGPT**, which doesn't support MCP elicitation; the client-managed mode in 3.1 is what ChatGPT uses, and it is unchanged when this setting is on.
 
 When `enableElicitation` is `true`, the policy asks the user the broker's question itself, through the MCP client's form, but only when all of these hold:
-- a session store is configured (`sessionStoreMode` `local` or `remote`; use `remote` with more than one replica);
+- a session store is configured (`sessionStoreMode` `local` or `remote`). Use `remote` whenever the gateway has more than one replica, which is always the case on a managed Omni Gateway (5.3);
 - the client negotiated MCP `2025-06-18` or later and declared `capabilities.elicitation` at `initialize`;
 - the `tools/call` accepts `text/event-stream`;
 - the broker answered `input-required` with a task ID. `auth-required` is never turned into a form.
@@ -91,9 +91,12 @@ How it works. A gateway policy can't hold a response open while the user thinks,
 | **No answer in time, or the client disconnects and never comes back** | After `elicitationTimeoutSeconds` (default 300) the conversation ends the same way, with `reason: "timeout"` and `isError: true`. A late answer is ignored. |
 | **The client answers with a JSON-RPC error** (for example it can't show the form) | The question is returned as an ordinary `input-required` result with the IDs, and the conversation continues the 3.1 way. |
 | **More than `maxElicitationRounds` questions** (default 3) | The extra question is returned as an ordinary `input-required` result with the IDs. |
-| **`notifications/cancelled` for the call, or a new `tools/call`** | The open question is dropped. Cancelling also clears the remembered context. |
+| **A new `tools/call` while a question is open** | A call that would continue the waiting conversation gets a tool error asking the user to answer or cancel first; the question and its stream stay open. An independent call (`new_conversation: true`, or other explicit IDs) runs normally, without a form. |
+| **`notifications/cancelled` for the call** | The open question is dropped and the remembered context is cleared. |
 
 Answers and resumed streams are bound to the session and its `sessionKeyHeader` identity, and only the current question's ID is accepted. An answer is sent to the broker at most once.
+
+**Remembered conversation.** With a session store, a call without `context_id` continues the conversation remembered for the MCP session, so asking the same question again in the same session may get an answer straight away instead of a form. To start over, pass `new_conversation: true` (the tool advertises this argument only when a session store is configured), or reconnect to get a new session.
 
 This mode is **experimental**. It needs a client that supports elicitation and `Last-Event-ID` resumption. Test it with your target client (9) before you turn it on.
 
@@ -174,8 +177,8 @@ Only translated `tools/call` requests are changed. Their `A2A-Version` header an
 | `passThroughA2A` | No | `false` | `false`: accept MCP traffic only (Mode 1). `true`: also forward native A2A traffic unchanged (Mode 2). | Mode 1: `false` / Mode 2: `true` |
 | `a2aPath` | No | empty | Path on the upstream (broker) URL that converted calls are sent to. Empty forwards the path the client used. `/` sends every call to the broker's root URL. Native A2A traffic is never rewritten. | Mode 1: `/` / Mode 2: empty / custom: `/<a2a-sub-path>` |
 | `includeStructuredContent` | No | `true` | Adds `state`, plus `contextId` and `taskId` when present, to each tool result. The text always includes the continuation hint, but keep this on so clients can read the IDs reliably. | `true` |
-| `sessionStoreMode` | No | `disabled` | Optional gateway-side memory of the last conversation per MCP session, for clients that never send `context_id` back. `local` keeps it in memory on each gateway replica; `remote` needs gateway Shared Storage (Redis). | `disabled` |
-| `sessionTtlSeconds` | No | `1800` | How long, in seconds, a remembered conversation lasts (60–86400). Used only with a session store. | `1800` |
+| `sessionStoreMode` | No | `disabled` | Optional gateway-side memory of the last conversation per MCP session, for clients that never send `context_id` back. `local` keeps it in memory on each gateway replica; `remote` uses the gateway's shared storage, so every replica sees it (5.3). Required for elicitation. | `remote` |
+| `sessionTtlSeconds` | No | `1800` | How long, in seconds, a session lasts after its last `tools/call` or elicitation answer (60–86400). `tools/list`, `ping` and resumed streams don't extend it. Used only with a session store. | `1800` |
 | `sessionKeyHeader` | No | empty | Request header whose value is mixed into the session key, so a remembered conversation is tied to the caller. When set, this is enforced: a request without the header gets no session and can't use or end one. Used only with a session store. | `client_id` |
 | `enableElicitation` | No | `false` | **Experimental.** Ask the broker's `input-required` questions through MCP elicitation (3.2). Needs a session store and a client that declared elicitation. Leave it off for ChatGPT. | `false` |
 | `elicitationTimeoutSeconds` | No | `300` | How long the user has to answer an elicited question (30–1800, capped by `sessionTtlSeconds`). After that the conversation ends. | `300` |
@@ -222,6 +225,18 @@ The API Manager form shows this field on a single line, so write the rules inlin
 - **Local Mode is different.** MCP Support isn't supported in Local Mode. For local tests (the PDK playground and `make test`), apply the bridge without it, after any authentication policy.
 - **Authentication must run before the bridge.** The bridge answers `initialize` and `tools/list` itself, so any policy placed after it never runs for those requests.
 - **Raise the response timeout.** Questions that span several systems can take 30–60 s, and the default MCP timeout is shorter.
+
+### 5.3 Session store and gateway replicas
+
+| Gateway | Replicas | `sessionStoreMode` | Shared storage |
+|---|---|---|---|
+| **Managed Omni Gateway (CloudHub)** | Always at least two, across availability zones; Large and Extra Large add more under load. Runtime Manager doesn't show or set a replica count. | `remote` | Built in. The replicas share it with each other, with nothing to configure. |
+| **Self-managed, one replica** | One | `local` or `remote` | `local` needs none |
+| **Self-managed, several replicas** | Several | `remote` | Configure Shared Storage on every replica: Redis, or the built-in `distributed://` object store |
+
+- **Why `local` fails with several replicas.** Requests are load-balanced across replicas, and each replica's `local` store holds only the sessions it issued. A request that lands on another replica gets `404` "Session not found". On a managed gateway that is most requests: on a three-replica gateway, 33 of 50 `tools/list` calls on one session got `404` with `local`, and 50 of 50 succeeded with `remote`.
+- **`remote` without shared storage.** On a self-managed gateway with no Shared Storage configured, PDK stops the policy at startup, so the misconfiguration shows up at deployment rather than at runtime.
+- **Verified on a managed gateway (policy 1.3.3, `remote`):** 50 `tools/list` calls on one session, 20 new sessions each used immediately after `initialize`, the client-managed flow (3.1) with and without `context_id`, and an elicitation answered 70 s after the form appeared, while the client resumed the stream about every 2 s across replicas.
 
 ---
 
@@ -309,7 +324,7 @@ The policy is a single-tool adapter. It covers the common case, where one questi
 | **Follow-up questions** | By default returns the question, the state and the IDs (`input-required`). Experimental MCP elicitation is opt-in (`enableElicitation`), needs a session store and an elicitation-capable client, and asks for one free-text answer. | The client collects the answer and calls the tool again (see 3.1). ChatGPT always works this way. Elicitation (3.2) uses a resumable stream instead of keeping the call open, so the client must support `Last-Event-ID`. |
 | **Authorization** | Reports `auth-required` with instructions. Doesn't run any authentication flow. | The user completes authorization outside the conversation. Never send secrets in a message. |
 | **Bindings and versions** | Translated calls use A2A JSON-RPC, v1.0 or v0.3 (configured). Native HTTP+JSON, JSON-RPC and gRPC are passed through unchanged in Mode 2. MCP revisions 2025-06-18, 2025-03-26 and 2024-11-05, over Streamable HTTP only. | The broker must accept JSON-RPC for translated calls. Clients that need the legacy HTTP+SSE transport (pre-2025-03-26) aren't supported. |
-| **Sessions** | Optional gateway memory of the last context and pending task per `Mcp-Session-Id`. `local` is per replica, while `remote` (Redis) is shared. | With `local` and several replicas, a follow-up can land on a replica that doesn't know the session and gets `404`. Use `remote`, or have clients pass `context_id`/`task_id`, which always works. |
+| **Sessions** | Optional gateway memory of the last context and pending task per `Mcp-Session-Id`. `local` is per replica, while `remote` (gateway shared storage) is shared. The session lasts `sessionTtlSeconds` after its last `tools/call` or answer. | With `local` and several replicas, including every managed gateway, a request can land on a replica that doesn't know the session and gets `404`. Use `remote` (5.3), or have clients pass `context_id`/`task_id` with no session store, which always works. A client that only lists tools or pings for longer than the TTL gets `404` and must `initialize` again. |
 | **Retries** | Doesn't retry, and doesn't deduplicate retries. | If the client or network retries a `tools/call` after a timeout, the broker may act on the message twice. Be careful with agents that take actions (payments, record changes). |
 | **Client responsibilities** | Returns interrupted states (`input-required`, `auth-required`, `working`) as normal results with instructions. | The client must show them to the user and continue with the returned IDs. It must not invent IDs, or treat an interrupted result as final. |
 
@@ -325,4 +340,5 @@ Run these against the deployed proxy before sharing it with clients.
 6. **Sessions (if enabled).** `initialize` returns `Mcp-Session-Id`. A follow-up with it continues the conversation. A `DELETE` with it returns `204`, after which the same ID gets `404`.
 7. **Native A2A (Mode 2 only).** An A2A client's `SendMessage`, and the agent card, still work unchanged on the same URL.
 8. **Timeout.** A long multi-agent question completes within the response timeout.
-9. **Elicitation (only if `enableElicitation` is on).** With the target client, ask something the broker answers with a follow-up question. Confirm the client shows a form, that answering continues the same task, and that declining ends the conversation. With ChatGPT, confirm the result is still the 3.1 JSON result with `taskId`.
+9. **Elicitation (only if `enableElicitation` is on).** With the target client, ask something the broker answers with a follow-up question. Confirm the client shows a form, that answering continues the same task, and that declining ends the conversation. With ChatGPT, confirm the result is still the 3.1 JSON result with `taskId`. To test with MCP Inspector, first raise its request timeout: it is set per server (server card **Settings** → Timeouts → Request Timeout, while disconnected) and defaults to 60 s, and Inspector doesn't extend it while the form is open, so a slower answer fails in Inspector even though the gateway still accepts it.
+10. **Replicas (session store on).** On one session, run 50 `tools/list` calls with the same `Mcp-Session-Id`. All must return `200`; any `404` means the store isn't shared across replicas (5.3).

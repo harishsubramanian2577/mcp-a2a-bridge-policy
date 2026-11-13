@@ -632,3 +632,15 @@ Found in manual testing with MCP Inspector against 1.3.1. After a question, the 
 1.3.3 adds the waiting-stream fix above to 1.3.1. Use 1.3.3 with MCP Inspector or any client built on the MCP TypeScript SDK; 1.3.1 times out there when the user answers after the client's first resume.
 
 1.3.3 has the same code as 1.3.2. Only half of the 1.3.2 release reached Exchange: the definition published, then the CLI failed on the implementation (`TypeError: Cannot read properties of undefined (reading 'data')`). Exchange versions can't be replaced, so the release went out again as 1.3.3. Don't use definition 1.3.2; it has no implementation.
+
+### Managed Omni Gateway: `local` sessions get `404`, `remote` works without Redis
+
+Found in manual testing with MCP Inspector on a managed (CloudHub) Omni Gateway with `sessionStoreMode: local`. After a working elicitation, later requests on the same session often got `404` "Session not found". A managed gateway always runs at least two replicas across availability zones and balances requests across them, and Runtime Manager doesn't show the count. Each replica's `local` store only knows the sessions it issued. On that gateway, 33 of 50 `tools/list` calls on one session got `404`. The same policy on one local Flex replica returned 100 of 100.
+
+Managed replicas share storage with each other, with nothing to configure, and PDK `remote` storage uses it. No Redis is needed. A second API instance on the same gateway with `sessionStoreMode: remote` passed:
+- 50 of 50 `tools/list` calls on one session, and 20 new sessions each used immediately after `initialize`;
+- the client-managed flow (guide 3.1) from curl and Postman, with and without `context_id`;
+- elicitation in MCP Inspector: accept, decline or cancel, and two tabs at once;
+- an elicitation answered 70 s after the form appeared, with the MCP TypeScript SDK resuming the stream about every 2 s across replicas.
+
+No code change. The guide now has "5.3 Session store and gateway replicas", says `remote` uses the gateway's shared storage rather than only Redis, describes the remembered conversation and `new_conversation`, says which requests extend `sessionTtlSeconds`, notes Inspector's 60 s per-server request timeout, and adds checklist item 10. The `sessionStoreMode` description in `gcl.yaml` was updated the same way and ships with the next release. The guide's 3.2 table also now describes what a new `tools/call` does while a question is open, as changed in the PR #15 follow-up.
