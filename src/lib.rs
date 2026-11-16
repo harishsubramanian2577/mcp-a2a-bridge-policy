@@ -245,8 +245,7 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
                 let key = Identity::of(bridge, handler).session_key(bridge, &session_id);
                 return match key {
                     Some(key) if store.load(&key).await.is_some() => {
-                        store.remove(&key).await;
-                        plain_status(204)
+                        plain_status(if store.remove(&key).await { 204 } else { 503 })
                     }
                     _ => plain_status(404),
                 };
@@ -532,6 +531,7 @@ async fn response_filter(
     // The MCP client always gets an in-band JSON-RPC answer at HTTP 200.
     let handler = headers_state.handler();
     handler.remove_header("content-length");
+    handler.remove_header("content-encoding");
     handler.set_header(":status", "200");
     handler.set_header("content-type", JSON_CONTENT_TYPE);
 

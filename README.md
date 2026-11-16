@@ -11,6 +11,8 @@ A custom [Omni Gateway (Flex Gateway)](https://docs.mulesoft.com/gateway/latest/
 | PDK | 1.8.0 |
 | Flex Gateway | 1.11.0 or later (1.10.x can't load 1.1.0) |
 
+**Verified 2026-11-16:** PR14 Nov 16 worktree based on source HEAD `e1b5d0921c158922abc0d71e057ca46fbb7cc18c`: `make build`, formatting and clippy passed; 70 unit tests and one Docker integration test passed on Flex 1.11.0. The prior-session shared-storage run passed all 18 checks on two Flex 1.11.0 replicas with Redis. Managed-gateway testing and live configuration migration were not run for this follow-up. These are precommit worktree results, not a final commit, publication or merge claim. See [verification details](docs/P4A-Issue-Resolutions.md#nov-16-follow-up-verification).
+
 ## What it does
 
 | MCP client sends | Policy does |
@@ -54,6 +56,14 @@ The full guide, with diagrams, every property and policy-order tables, is in [do
 | `sessionStoreMode` | `disabled` | `disabled`, `local` or `remote` |
 | `sessionTtlSeconds` | `1800` | Session store TTL (60–86400) |
 | `sessionKeyHeader` | empty | Header hashed into the session key, for example `client_id`. Enforced: without it, a request gets no session |
+
+Remote sessions share a namespace only across replicas with the same API/policy scope and
+effective `sessionTtlSeconds`. Changing the remote TTL selects a new namespace, so clients must
+`initialize` again. Old entries expire under their original TTL; rolling back to the old TTL can
+make unexpired old sessions visible again. This is not seamless session preservation.
+Session `DELETE` returns `204` only after a conditional tombstone write succeeds, `404` for an
+unknown/expired/terminated session or the wrong caller, and `503` if termination cannot be
+confirmed (including a concurrent update). Retry `DELETE` after `503`.
 
 ## Repository layout
 

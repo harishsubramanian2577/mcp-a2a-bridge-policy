@@ -7,7 +7,7 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 | Reviewed version | 1.0.3 (commit `3d61a41`) |
 | Fixed in | 1.1.0, branch `fix/p4a-priority-issues` |
 | Priority issues | [#1](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/1), [#4](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/4), [#12](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/12) |
-| Test baseline | 32 unit tests on 1.0.3, 61 on 1.1.0, all passing |
+| Test baseline | 32 unit tests on 1.0.3; 70 passing on the PR14 follow-up (61 before the follow-up) |
 | Minimum gateway | Flex Gateway 1.11.0 (1.1.0 uses PDK stop-iteration, which 1.10.x doesn't support) |
 
 ## Status
@@ -23,7 +23,7 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 1. **Unit and filter tests.**
    - The tests drive the real policy entrypoint through the PDK 1.8.0 `pdk-unit` harness.
    - Command: `cargo test --lib`.
-   - Result: 61 passed, 0 failed.
+    - PR14 follow-up result (2026-11-16): 70 passed, 0 failed. `make build`, `cargo fmt --all -- --check`, and `cargo clippy --lib --tests -- -D warnings` also passed. The Docker integration test passed too; see the current verification summary below.
 2. **Baseline check.**
    - The new filter-level regression tests were copied unchanged onto the 1.0.3 code (`main` at `3d61a41`) and run there.
    - 13 of the 14 failed, each with the bug the issue reports.
@@ -33,10 +33,10 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
    - Command: `make build`.
    - Result: succeeded. The only new host import is WASI `random_get`, which Flex Gateway/Envoy provides.
 4. **Integration tests.**
-   - `make test` passes on Flex 1.11.0: 61 unit tests and the `tools_call_round_trip` integration test.
+    - Current PR14 follow-up (2026-11-16): 70 unit tests and the one `tools_call_round_trip` Docker integration test passed on Flex 1.11.0. The historical pre-follow-up run had 61 passing unit tests plus that integration test.
    - The first live run found a bug in the test itself. pdk-test puts the API path in the upstream `destinationPath`, so the gateway has no base path in local mode and `a2aPath` can't be applied. The test now calls the agent's path with `a2aPath` empty. The `a2aPath` rewrite is covered by unit tests.
    - `make test` needs a Flex registration: put a local-mode `registration.yaml` in `tests/config/` (gitignored), which is mounted into the gateway.
-5. **Shared-storage test.** `make test-shared-storage` passes on Flex 1.11.0, 1.12.0 and 1.13.0 (see issue #12 below).
+5. **Shared-storage test.** The prior-session PR14 follow-up run passed all 18 checks on two Flex 1.11.0 replicas sharing Redis. The older 1.11.0/1.12.0/1.13.0 transcript under #12 remains historical, not evidence of rerunning the current follow-up on all three versions.
 6. **Minimum gateway version.** The same harness on Flex 1.10.6 fails at load time with `FlexAbiHandler: command 'flex_enable_stop_iteration' unknown`. The request filter needs PDK's stop-iteration feature (the #4 fix), so 1.1.0 requires Flex Gateway 1.11.0 or later. The README and customer guide say so, and both integration tests and the playground are pinned to 1.11.0.
 7. **Published runtime metadata.**
    - PDK's `build-asset-files` always writes `minRuntimeVersion: 1.6.1` into `target/implementation/metadata.yaml` and `target/implementation-dev/metadata.yaml`, and `publish`/`release` upload those files as they are.
@@ -66,6 +66,7 @@ The policy logged the error, but it had already changed the headers to `200` / `
   3. Replace the result with a small tool error.
 - [x] Added `mcp::deliver_result`. If the write still fails, it writes a minimal tool-error envelope, so the original A2A body is never released.
 - [x] Moved the session update so it runs only after a successful delivery of the real answer (full or reduced), never after a replacement or a failure.
+- [x] Rewritten responses drop upstream `Content-Encoding` along with `Content-Length`. Compressed, unparseable responses become plain JSON tool errors, not plain JSON mislabeled as gzip. Native A2A responses keep their headers.
 - [x] On the request side, a generated A2A request that would exceed the limit now gets `-32602` before any rewrite. Previously it got a `-32603` after a failed write.
 
 ### Files
@@ -135,11 +136,11 @@ The detailed reproductions in the issue were withheld pending a private channel.
 - [x] **Unambiguous session keys.** The key is a hex SHA-256 over a versioned, length-prefixed encoding of (scope, session ID, identity-or-none). This replaces `"<sid>:<DefaultHasher(identity)>"`, which could collide and used a non-cryptographic hash.
 - [x] **Unpredictable, globally unique session IDs.** They are random v4 UUIDs from the host's secure random source (`getrandom`, which is WASI `random_get`) and do not depend on `x-request-id` or any other caller-controlled data. If randomness is unavailable, no session is issued. A2A `messageId` values are random too.
 - [x] **Only issued sessions are honoured.** `initialize` registers the new session (`StoreMode::Absent`). `tools/call` and `DELETE` act only on a live, registered entry for the same caller, so a caller can't plant a chosen session ID.
-- [x] **Delete-safe updates.** The response side updates the entry with compare-and-swap (`StoreMode::Cas`). A session deleted while a call was in flight stays deleted. This also covers part of the concurrency finding in #5.
-- [x] **Scoped shared storage.** The namespace is `mcp-a2a-sessions/<api-id>/<policy-name>.<policy-namespace>`, falling back to the base path when the API ID is unknown in local mode. The same scope is hashed into each key. Two API instances that share Redis are isolated, while replicas of one instance share the same namespace, so sessions continue across replicas.
+- [x] **Delete-safe updates.** Both updates and termination use compare-and-swap (`StoreMode::Cas`). Termination writes the existing `SessionEntry` layout with empty IDs and `touched_at: 0`; liveness excludes this tombstone. PDK 1.8 remote `delete` swallows errors, so it is not used. `204` requires a successful tombstone write; a failed or conflicting write returns `503`, which the caller can retry. Stale CAS updates cannot overwrite the tombstone, and later updates ignore it.
+- [x] **Scoped shared storage.** The base scope is `mcp-a2a-sessions/<api-id>/<policy-name>.<policy-namespace>`, falling back to the base path when the API ID is unknown in local mode. The same scope is hashed into each key. Remote storage adds `/ttl-<effective-seconds>` to the namespace. Two API instances that share Redis are isolated; replicas of one instance with the same effective TTL share sessions.
 - [x] **Configured expiry.**
   - The TTL is clamped to 60–86400 seconds. The same value sets the Redis TTL (`remote_ttl_millis`) and the liveness check.
-  - Entries store `touched_at`, and the liveness check compares it with the TTL in the current configuration rather than the TTL used when the entry was written. A unit test covers this: an entry written under a long TTL is treated as expired once the configured TTL is lowered. Changing the TTL on a running gateway has not been tested live.
+  - Entries store `touched_at`, and local liveness checks use the current configured TTL. The PDK 1.8 high-level API only sets remote TTL when a store is first created, with no supported TTL-update method. A changed remote TTL therefore selects a new namespace and requires reinitialization; it does not preserve existing sessions seamlessly. Old entries expire under their original TTL, and rollback to that TTL can expose unexpired old sessions again. Unit tests cover both lower and higher TTL namespace changes; live reconfiguration has not been tested.
 - [x] **Logs** carry only a short prefix of the hashed key, never the session ID or identity.
 - [x] **Two-replica shared Redis test added** (`make test-shared-storage`, in `tests/shared-storage/`). `pdk-test` 1.8.0 has no Redis service and its service traits are private, so this is a Docker Compose harness: Redis, two Flex Gateway replicas, two API instances (`hr`, bound to `x-client-id`, and `finance`) and a mock A2A agent that records what it receives. `check.py` verifies:
   - a session issued on flex-1 continues on flex-2;
@@ -148,7 +149,7 @@ The detailed reproductions in the issue were withheld pending a private channel.
   - Redis keys contain neither the session ID nor the identity, and their TTL matches `sessionTtlSeconds`;
   - the session survives a restart of flex-1;
   - only the owner can `DELETE` it, and once deleted on flex-2 it is gone on flex-1 too.
-- [x] **Live run of that test: passed.** It ran on 2026-11-11 against Flex Gateway 1.11.0, 1.12.0 and 1.13.0 in local mode, with a local-mode registration mounted read-only (`REGISTRATION=<path>`). The harness refuses to run if Flex starts in connected mode. All 18 checks pass:
+- [x] **Historical live run of that test: passed.** It ran on 2026-11-11, before the checked-tombstone and TTL-qualified-namespace follow-up, against Flex Gateway 1.11.0, 1.12.0 and 1.13.0 in local mode, with a local-mode registration mounted read-only (`REGISTRATION=<path>`). The harness refuses to run if Flex starts in connected mode. All 18 checks passed at that revision; this is not live evidence for the follow-up:
 
   ```
   Replica continuity (hr, bound to x-client-id)
@@ -212,3 +213,21 @@ The detailed reproductions in the issue were withheld pending a private channel.
 
 ### Upgrade note
 1.1.0 uses a new store namespace and key format. Sessions remembered by 1.0.x are not read after the upgrade, so clients start a new MCP session the next time they call `initialize`. Conversations that pass `context_id` explicitly are not affected.
+
+The PR14 follow-up also adds a TTL suffix to remote namespaces, so sessions from the earlier
+unsuffixed PR14 revision are not read. The serialized `SessionEntry` fields are unchanged.
+Follow-up regressions cover gzip error encoding, successful rewrite/native header isolation,
+percent-encoded version query names, failed/conflicting termination CAS, stale and later updates
+after termination, and remote namespace changes on TTL reconfiguration. Docker integration has
+now passed for this follow-up; live configuration migration has not been run.
+
+## Nov 16 follow-up verification
+
+Evidence recorded on 2026-11-16 for the PR14 Nov 16 worktree based on source HEAD `e1b5d0921c158922abc0d71e057ca46fbb7cc18c`, including the uncommitted follow-up changes. A final commit identifier is unavailable precommit; these results do not claim publication or merge.
+
+| Check | Verified evidence |
+|---|---|
+| Build and static checks | `make build`, `cargo fmt --all -- --check`, and `cargo clippy --lib --tests -- -D warnings` passed. |
+| Unit and Docker integration | 70 unit tests and one `tools_call_round_trip` Docker integration test passed; the integration fixture uses Flex 1.11.0. |
+| Shared storage | Prior-session `make test-shared-storage`: all 18 checks passed on two Flex 1.11.0 replicas sharing Redis in Local Mode. |
+| Not run | Managed-gateway testing and live configuration migration, including TTL changes on a running deployment. Namespace-change regressions are unit evidence, not live migration evidence. |

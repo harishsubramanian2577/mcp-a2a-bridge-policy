@@ -2,6 +2,8 @@
 //! Filter-level tests: drive the real entrypoint through pdk-unit and assert what reaches the
 //! upstream Agent Broker and what the MCP client gets back.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use pdk_unit::{TraceBackend, UnitHttpMessage, UnitHttpRequest, UnitHttpResponse, UnitTestBuilder};
@@ -410,6 +412,58 @@ fn assert_bounded_mcp_answer(response: &pdk_unit::UnitHttpResponse, id: i64) -> 
 }
 
 #[test]
+fn review_rereview_rewritten_error_must_not_retain_gzip_encoding() {
+    let backend = Rc::new(TraceBackend::new(
+        UnitHttpResponse::new(200)
+            .with_header("content-type", "application/json")
+            .with_header("content-encoding", "gzip")
+            .with_body(vec![0x1f, 0x8b, 0x08, 0x00, 0xff, 0x00]),
+    ));
+    let mut tester = UnitTestBuilder::default()
+        .with_config(config("disabled"))
+        .with_backend(Rc::clone(&backend))
+        .with_entrypoint(crate::configure);
+
+    let response = tester.request(mcp_post(tools_call(14, json!({ "message": "hi" }))));
+
+    let mcp = assert_bounded_mcp_answer(&response, 14);
+    assert_eq!(mcp["result"]["isError"], true);
+    assert!(mcp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("non-JSON response"));
+    assert_ne!(
+        response.header("content-encoding"),
+        Some("gzip"),
+        "the replacement MCP error is plain JSON, not gzip"
+    );
+}
+
+#[test]
+fn rewritten_results_drop_encoding_but_native_responses_keep_it() {
+    let backend = Rc::new(TraceBackend::new(
+        UnitHttpResponse::new(200)
+            .with_header("content-type", "application/json")
+            .with_header("content-encoding", "identity")
+            .with_header("content-length", SAMPLE_RESPONSE.len().to_string())
+            .with_body(SAMPLE_RESPONSE),
+    ));
+    let mut tester = UnitTestBuilder::default()
+        .with_config(config("disabled"))
+        .with_backend(Rc::clone(&backend))
+        .with_entrypoint(crate::configure);
+    let response = tester.request(mcp_post(tools_call(1, json!({ "message": "hi" }))));
+    assert_eq!(json_body(&response)["result"]["isError"], false);
+    assert_eq!(response.header("content-encoding"), None);
+    assert_eq!(response.header("content-length"), None);
+    let native = tester.request(mcp_post(
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "SendMessage", "params": {} }),
+    ));
+    assert_eq!(native.header("content-encoding"), Some("identity"));
+    assert_eq!(native.body(), SAMPLE_RESPONSE.as_bytes());
+}
+
+#[test]
 fn large_data_part_json_reply_becomes_a_bounded_mcp_result() {
     // Reproduction from issue #1: 600,000-character data part → 1,200,306 bytes once converted.
     let reply = task_reply("ctx-big", json!([{ "data": "x".repeat(600_000) }]));
@@ -658,6 +712,175 @@ fn translated_v03_call_drops_a_conflicting_client_version() {
     let body = json_body(&upstream);
     assert_eq!(body["method"], "message/send");
     assert_eq!(body["params"]["message"]["role"], "user");
+}
+
+#[test]
+fn translated_calls_strip_encoded_version_query_names() {
+    for version in ["1.0", "0.3"] {
+        let backend = agent(SAMPLE_RESPONSE);
+        let mut tester = shared_tester(version, json!({ "a2aPath": "/a2a" }), &backend);
+        tester.request(mcp_post_at(
+            "/agent/mcp?%41%32%41%2dVersion=0.3&x=%26%3D&a2a-%76ersion=1.0",
+            tools_call(1, json!({ "message": "hi" })),
+        ));
+        let upstream = backend.next().unwrap();
+        assert_eq!(upstream.header(":path"), Some("/agent/a2a?x=%26%3D"));
+        assert_eq!(
+            upstream.header("a2a-version"),
+            (version == "1.0").then_some("1.0")
+        );
+    }
+}
+
+// Models the public shared-storage HTTP contract with opaque PDK-serialized objects and CAS.
+// Deliberately rejects DELETE: termination must use a checked conditional PUT instead.
+#[derive(Default)]
+pub(crate) struct RemoteStorage {
+    entries: RefCell<HashMap<String, (Value, u64)>>,
+    ttls: RefCell<HashMap<String, u64>>,
+    fail_cas: Cell<Option<u32>>,
+}
+
+impl pdk_unit::Backend for RemoteStorage {
+    fn call(&self, request: UnitHttpRequest) -> UnitHttpResponse {
+        let path = request.header(":path").unwrap();
+        match request.header(":method").unwrap() {
+            "PUT" if !path.contains("/keys/") => {
+                let body = json_body(&request);
+                self.ttls
+                    .borrow_mut()
+                    .entry(path.to_string())
+                    .or_insert(body["defaultTtlSeconds"].as_u64().unwrap());
+                UnitHttpResponse::new(201)
+            }
+            "PUT" => {
+                let mut entries = self.entries.borrow_mut();
+                let existing = entries.get(path);
+                if let Some(cas) = request.header("if-match") {
+                    if let Some(status) = self.fail_cas.take() {
+                        return UnitHttpResponse::new(status);
+                    }
+                    if existing.is_none_or(|(_, version)| version.to_string() != cas) {
+                        return UnitHttpResponse::new(412);
+                    }
+                } else if request.header("if-none-match").is_some() && existing.is_some() {
+                    return UnitHttpResponse::new(412);
+                }
+                // Force the real PDK to create the store (and set its TTL) on its first write.
+                let store_path = path.split_once("/partitions/").unwrap().0;
+                if !self.ttls.borrow().contains_key(store_path) {
+                    return UnitHttpResponse::new(404)
+                        .with_body(r#"{"message":"store not found"}"#);
+                }
+                let version = existing.map_or(1, |(_, version)| version + 1);
+                entries.insert(path.to_string(), (json_body(&request), version));
+                UnitHttpResponse::new(201)
+            }
+            "GET" => match self.entries.borrow().get(path) {
+                Some((body, version)) => UnitHttpResponse::new(200)
+                    .with_header("etag", version.to_string())
+                    .with_body(body.to_string()),
+                None => UnitHttpResponse::new(404)
+                    .with_body(r#"{"message":"object with key not found"}"#),
+            },
+            _ => UnitHttpResponse::new(503),
+        }
+    }
+}
+
+fn remote_tester(
+    ttl: u64,
+    storage: &Rc<RemoteStorage>,
+    backend: &Rc<TraceBackend<UnitHttpResponse>>,
+) -> pdk_unit::UnitTest {
+    UnitTestBuilder::default()
+        .with_config(bridge_only_config(json!({
+            "sessionStoreMode": "remote", "sessionTtlSeconds": ttl,
+        })))
+        .with_http_upstream("x-flex-keyvalue-store", Rc::clone(storage))
+        .with_backend(Rc::clone(backend))
+        .with_entrypoint(crate::configure)
+}
+
+#[test]
+fn remote_termination_requires_a_successful_cas_write() {
+    let storage = Rc::new(RemoteStorage::default());
+    let backend = agent(SAMPLE_RESPONSE);
+    let mut tester = remote_tester(1800, &storage, &backend);
+    let session = start_session(&mut tester, &[]);
+    let headers = [("mcp-session-id", session.as_str())];
+    call_context(&mut tester, &backend, &headers);
+    for status in [503, 412] {
+        storage.fail_cas.set(Some(status));
+        let response = tester.request(with_headers(
+            UnitHttpRequest::delete().with_path("/mcp"),
+            &headers,
+        ));
+        assert_eq!(
+            response.status_code(),
+            503,
+            "a failed CAS is not a successful termination"
+        );
+        assert_eq!(
+            call_context(&mut tester, &backend, &headers),
+            "59ec80cd-988c-47fd-8917-1f84dd3bd409"
+        );
+    }
+    assert_eq!(
+        tester
+            .request(with_headers(
+                UnitHttpRequest::delete().with_path("/mcp"),
+                &headers
+            ))
+            .status_code(),
+        204
+    );
+    assert_eq!(call_context(&mut tester, &backend, &headers), Value::Null);
+    assert_eq!(
+        tester
+            .request(with_headers(
+                UnitHttpRequest::delete().with_path("/mcp"),
+                &headers
+            ))
+            .status_code(),
+        404
+    );
+}
+
+#[test]
+fn remote_ttl_reconfiguration_uses_a_new_store_and_invalidates_old_sessions() {
+    let storage = Rc::new(RemoteStorage::default());
+    let backend = agent(SAMPLE_RESPONSE);
+    let mut tester = remote_tester(1800, &storage, &backend);
+    let session = start_session(&mut tester, &[]);
+    let headers = [("mcp-session-id", session.as_str())];
+    call_context(&mut tester, &backend, &headers);
+    // Another replica with the same config can use the persisted session.
+    let mut tester = remote_tester(1800, &storage, &backend);
+    assert_eq!(
+        call_context(&mut tester, &backend, &headers),
+        "59ec80cd-988c-47fd-8917-1f84dd3bd409"
+    );
+    let mut tester = remote_tester(60, &storage, &backend);
+    assert_eq!(call_context(&mut tester, &backend, &headers), Value::Null);
+    start_session(&mut tester, &[]);
+    let ttls = storage.ttls.borrow();
+    assert_eq!(ttls.len(), 2);
+    assert!(ttls
+        .iter()
+        .any(|(path, ttl)| path.ends_with("%2Fttl-1800") && *ttl == 1800));
+    assert!(ttls
+        .iter()
+        .any(|(path, ttl)| path.ends_with("%2Fttl-60") && *ttl == 60));
+    drop(ttls);
+    let mut tester = remote_tester(3600, &storage, &backend);
+    assert_eq!(call_context(&mut tester, &backend, &headers), Value::Null);
+    start_session(&mut tester, &[]);
+    assert!(storage
+        .ttls
+        .borrow()
+        .iter()
+        .any(|(path, ttl)| path.ends_with("%2Fttl-3600") && *ttl == 3600));
 }
 
 // ---- Issue #12: sessions are random, registered, identity-bound and scoped.

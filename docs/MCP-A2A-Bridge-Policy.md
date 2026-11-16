@@ -10,6 +10,8 @@ A custom Omni Gateway (Flex Gateway) policy that lets MCP clients use an A2A age
 | Applies to API instance types | MCP, A2A (v0.3), A2A (v1.0) |
 | Gateway | Omni Gateway / Flex Gateway (managed or self-managed), **1.11.0 or later** for policy 1.1.0 |
 
+**Verified 2026-11-16:** PR14 Nov 16 worktree based on source HEAD `e1b5d0921c158922abc0d71e057ca46fbb7cc18c` passed `make build`, formatting, clippy, 70 unit tests and one Docker integration test on Flex 1.11.0. The prior-session shared-storage run passed 18 checks on two Flex 1.11.0 replicas with Redis. Managed-gateway testing and live configuration migration were not run for this follow-up. No final commit identifier is available precommit; this is not a claim that the follow-up is published or merged. See [verification details](P4A-Issue-Resolutions.md#nov-16-follow-up-verification).
+
 ---
 
 ## 1. Purpose
@@ -93,7 +95,7 @@ How the policy decides what to do with each request:
 1. **The request is MCP**, for example `initialize`, `tools/list` or `tools/call`. The policy answers it itself or converts it, as in section 3.
 2. **The request is native A2A**, for example a `SendMessage` or `message/send` JSON-RPC call, an HTTP+JSON call such as `POST /message:send`, or the agent card. With `passThroughA2A: true`, the policy recognises it before any MCP handling and forwards it to the broker untouched. It does not add or change the `A2A-Version` header, the path or the body, and the broker's response goes back unchanged.
 
-Only translated `tools/call` requests are changed. Their `A2A-Version` header and query parameter always match the configured `a2aProtocolVersion`: `1.0` sets the header to `1.0`, and `0.3` removes it.
+Only translated `tools/call` requests are changed. Their version follows the configured `a2aProtocolVersion`: `1.0` sets the `A2A-Version` header to `1.0`, and `0.3` removes it. Both remove all `A2A-Version` query parameters, including percent-encoded names, while preserving unrelated query parameters.
 
 - **When to use:** you want a single endpoint for every client, or you can't create a second API instance.
 - **Key settings:** `passThroughA2A: true` and `a2aPath` left empty. MCP clients call the A2A base URL, with the trailing slash.
@@ -120,7 +122,9 @@ Only translated `tools/call` requests are changed. Their `A2A-Version` header an
 **Limits and session security (1.1.0)**
 - **Gateway version.** 1.1.0 needs Flex Gateway **1.11.0 or later**. It reads the request body before choosing which headers to change, and Flex 1.10.x doesn't support that: the gateway logs `FlexAbiHandler: command 'flex_enable_stop_iteration' unknown` and doesn't start the API. Stay on policy 1.0.x until the gateway is upgraded.
 - **Response size.** The gateway can't write a body of 1 MB or more. If a converted answer would be too large, the policy first drops `structuredContent.data` (data parts are also in the text), then truncates the answer text with a note, and as a last resort returns a tool error. The client always gets a valid MCP result, never the raw A2A reply. The remembered conversation is updated only after the answer is delivered. A `tools/call` message too large to forward gets error `-32602`.
-- **Sessions.** `Mcp-Session-Id` values are random UUIDs, issued at `initialize` and registered in the store. The policy ignores any other value a client sends. Store keys are a SHA-256 hash of the API/policy scope, session ID and identity. The store namespace is specific to the API instance and policy, so two APIs that share one Redis don't share sessions, while replicas of the same API do. Expiry uses the TTL configured now, so a lower `sessionTtlSeconds` also shortens existing entries. `DELETE` with `Mcp-Session-Id` returns `204` for the owner and `404` otherwise.
+- **Response encoding.** Rewritten MCP bodies are plain JSON, so their upstream `Content-Encoding` and `Content-Length` headers are removed. Compressed upstream bytes that cannot be parsed become an uncompressed MCP tool error; this policy does not decompress them. Native A2A responses remain unchanged.
+- **Sessions.** `Mcp-Session-Id` values are random UUIDs, issued at `initialize` and registered in the store. The policy ignores any other value a client sends. Store keys are a SHA-256 hash of the API/policy scope, session ID and identity. The store namespace is specific to the API instance and policy, so two APIs that share one Redis don't share sessions. Remote replicas must also use the same effective TTL to share sessions. Changing remote `sessionTtlSeconds` selects a new namespace and requires clients to initialize again, rather than preserving sessions with a changed TTL. Old entries expire under their original TTL; rolling back to that TTL can expose unexpired old sessions again. Local liveness checks use the currently configured TTL.
+- **Termination.** `DELETE` with `Mcp-Session-Id` returns `204` only after a checked compare-and-swap writes a termination tombstone. It returns `404` for the wrong caller or an unknown, expired or already terminated session, and `503` if the write fails or races with an update; retry after `503`. Tombstones are never live and prevent late agent replies from restoring the session. Remote tombstones expire through Redis TTL; local tombstones are removed by periodic sweeping.
 
 ### 5.1 Writing a good `toolDescription`
 

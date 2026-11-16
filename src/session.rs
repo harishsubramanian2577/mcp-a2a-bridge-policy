@@ -35,14 +35,13 @@ pub struct SessionEntry {
     pub context_id: Option<String>,
     /// Only set while the agent is waiting on the caller (input-required / auth-required).
     pub task_id: Option<String>,
-    /// Last write, in Unix seconds. Expiry is judged against the TTL configured now, so lowering
-    /// `sessionTtlSeconds` also shortens the life of entries written before the change.
+    /// Last write, in Unix seconds. Zero is a termination tombstone, never a live session.
     pub touched_at: u64,
 }
 
 impl SessionEntry {
     pub fn is_live(&self, now: u64, ttl_seconds: u64) -> bool {
-        now < self.touched_at.saturating_add(ttl_seconds)
+        self.touched_at != 0 && now < self.touched_at.saturating_add(ttl_seconds)
     }
 }
 
@@ -69,7 +68,10 @@ impl SessionStore {
         let ttl_seconds = clamp_ttl(ttl_seconds);
         let backend = match mode {
             "local" => Backend::Local(builder.local(namespace)),
-            "remote" => Backend::Remote(builder.remote(namespace, remote_ttl_millis(ttl_seconds))),
+            "remote" => Backend::Remote(builder.remote(
+                remote_namespace(namespace, ttl_seconds),
+                remote_ttl_millis(ttl_seconds),
+            )),
             _ => return None,
         };
         Some(SessionStore {
@@ -145,14 +147,18 @@ impl SessionStore {
         self.put(key, &StoreMode::Cas(cas), &entry).await;
     }
 
-    pub async fn remove(&self, key: &str) {
-        let removed = match &self.backend {
-            Backend::Local(s) => s.delete(key).await,
-            Backend::Remote(s) => s.delete(key).await,
+    /// A checked CAS write ends the session without PDK 1.8's remote delete swallowing errors.
+    /// Keeping the versioned tombstone also prevents an in-flight update from resurrecting it.
+    pub async fn remove(&self, key: &str) -> bool {
+        let Some((_, cas)) = self.get(key).await else {
+            return false;
         };
-        if let Err(err) = removed {
-            logger::warn!("Session store delete failed for {}: {}", key_hint(key), err);
-        }
+        let tombstone = SessionEntry {
+            context_id: None,
+            task_id: None,
+            touched_at: 0,
+        };
+        self.put(key, &StoreMode::Cas(cas), &tombstone).await
     }
 
     async fn sweep_if_due(&self) {
@@ -185,6 +191,12 @@ pub fn clamp_ttl(ttl_seconds: u64) -> u64 {
 /// The Redis TTL matches the configured TTL that `is_live` checks, so both expire together.
 pub fn remote_ttl_millis(ttl_seconds: u64) -> u32 {
     u32::try_from(clamp_ttl(ttl_seconds) * 1000).unwrap_or(u32::MAX)
+}
+
+/// PDK 1.8 sets TTL only when creating a remote store. A changed TTL must use a new store;
+/// replicas with the same effective TTL share it, but reconfiguration does not preserve sessions.
+pub fn remote_namespace(namespace: &str, ttl_seconds: u64) -> String {
+    format!("{}/ttl-{}", namespace, clamp_ttl(ttl_seconds))
 }
 
 /// One namespace per API instance and policy. Replicas of the same instance share it; other
@@ -317,6 +329,88 @@ mod tests {
         assert_eq!(clamp_ttl(1_000_000), 86_400);
         assert_eq!(remote_ttl_millis(1800), 1_800_000);
         assert_eq!(remote_ttl_millis(1_000_000), 86_400_000);
+    }
+
+    #[test]
+    fn remote_namespace_follows_the_effective_ttl() {
+        let scope = namespace(Some("api-1"), None, "p");
+        assert_eq!(
+            remote_namespace(&scope, 1800),
+            remote_namespace(&scope, 1800)
+        );
+        assert_ne!(remote_namespace(&scope, 1800), remote_namespace(&scope, 60));
+        assert_eq!(remote_namespace(&scope, 0), remote_namespace(&scope, 60));
+        assert_eq!(
+            remote_namespace(&scope, 1800),
+            format!("{}/ttl-1800", scope)
+        );
+    }
+
+    #[test]
+    fn tombstones_are_never_live_even_near_the_epoch() {
+        let tombstone = SessionEntry {
+            context_id: None,
+            task_id: None,
+            touched_at: 0,
+        };
+        for now in [0, 1, 60, u64::MAX] {
+            assert!(!tombstone.is_live(now, MAX_TTL_SECONDS));
+        }
+    }
+
+    async fn check_remote_tombstone(
+        launcher: pdk::hl::Launcher,
+        builder: DataStorageBuilder,
+    ) -> anyhow::Result<()> {
+        let store =
+            SessionStore::from_config(&builder, "remote", 1800, "termination-test").unwrap();
+        launcher
+            .launch(pdk::hl::on_request(|_: pdk::hl::RequestState| async {
+                assert!(store.register("session").await);
+                let (_, stale_cas) = store.get("session").await.unwrap();
+                assert!(store.remove("session").await);
+                let Backend::Remote(storage) = &store.backend else {
+                    panic!("remote backend expected");
+                };
+                let (tombstone, _) = storage
+                    .get::<SessionEntry>("session")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(tombstone.touched_at, 0);
+                assert_eq!(tombstone.context_id, None);
+                assert!(
+                    !store
+                        .put(
+                            "session",
+                            &StoreMode::Cas(stale_cas),
+                            &store.fresh_entry(Some("late".into()), None)
+                        )
+                        .await
+                );
+                store.update("session", "later".into(), None).await;
+                assert!(store.load("session").await.is_none());
+                assert!(!store.remove("session").await);
+                pdk::hl::Flow::Break::<()>(pdk::hl::Response::new(204))
+            }))
+            .await?;
+        Ok(())
+    }
+
+    #[test]
+    fn remote_tombstone_rejects_stale_and_later_updates() {
+        let mut tester = pdk_unit::UnitTestBuilder::default()
+            .with_http_upstream(
+                "x-flex-keyvalue-store",
+                crate::tests::RemoteStorage::default(),
+            )
+            .with_entrypoint(check_remote_tombstone);
+        assert_eq!(
+            tester
+                .request(pdk_unit::UnitHttpRequest::post())
+                .status_code(),
+            204
+        );
     }
 
     #[test]

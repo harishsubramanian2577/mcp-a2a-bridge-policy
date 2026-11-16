@@ -83,8 +83,8 @@ pub fn is_http_json_route(http_method: &str, path: &str) -> bool {
     }
 }
 
-/// Removes an `A2A-Version` query parameter (any case), which would otherwise contradict the
-/// version of a request the bridge generated itself.
+/// Removes an `A2A-Version` query parameter (any case, including percent-encoded names), which
+/// would otherwise contradict the version of a request the bridge generated itself.
 pub fn strip_version_query(path: &str) -> String {
     let Some((base, query)) = path.split_once('?') else {
         return path.to_string();
@@ -93,7 +93,22 @@ pub fn strip_version_query(path: &str) -> String {
         .split('&')
         .filter(|kv| {
             let key = kv.split_once('=').map_or(*kv, |(k, _)| k);
-            !kv.is_empty() && !key.eq_ignore_ascii_case(A2A_VERSION_HEADER)
+            let mut bytes = key.bytes();
+            let decoded: Option<Vec<u8>> = std::iter::from_fn(|| {
+                bytes.next().map(|byte| match byte {
+                    b'%' => {
+                        let high = char::from(bytes.next()?).to_digit(16)?;
+                        let low = char::from(bytes.next()?).to_digit(16)?;
+                        Some((high * 16 + low) as u8)
+                    }
+                    b'+' => Some(b' '),
+                    _ => Some(byte),
+                })
+            })
+            .collect();
+            !kv.is_empty()
+                && !decoded
+                    .is_some_and(|key| key.eq_ignore_ascii_case(A2A_VERSION_HEADER.as_bytes()))
         })
         .collect();
     if kept.is_empty() {
@@ -804,5 +819,27 @@ mod tests {
         );
         assert_eq!(strip_version_query("/a?x=1"), "/a?x=1");
         assert_eq!(strip_version_query("/a"), "/a");
+    }
+
+    #[test]
+    fn version_query_decodes_names_once_and_preserves_other_parameters() {
+        assert_eq!(
+            strip_version_query(
+                "/a?%412A%2dVersion=0.3&x=%26%3D&%61%32%61-version=1.0&A2A-Version"
+            ),
+            "/a?x=%26%3D"
+        );
+        for query in [
+            "A2A%252DVersion=1.0",
+            "A2A+Version=1.0",
+            "A2A-Version%=1.0",
+            "A2A-Version%2=1.0",
+            "A2A-Version%GG=1.0",
+            "%FF=1.0",
+            "x=A2A-Version",
+        ] {
+            let path = format!("/a?{}", query);
+            assert_eq!(strip_version_query(&path), path);
+        }
     }
 }

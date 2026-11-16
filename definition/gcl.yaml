@@ -61,7 +61,7 @@ spec:
       default: 1800
       minimum: 60
       maximum: 86400
-      description: Idle time after which a stored session-to-context mapping expires.
+      description: Idle time after which a stored session-to-context mapping expires. In remote mode, changing this value selects a new storage namespace and clients must initialize again; all replicas must use the same TTL to share sessions.
     sessionKeyHeader:
       type: string
       default: ""
