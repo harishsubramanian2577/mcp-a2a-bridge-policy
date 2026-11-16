@@ -83,8 +83,8 @@ pub fn is_http_json_route(http_method: &str, path: &str) -> bool {
     }
 }
 
-/// Removes an `A2A-Version` query parameter (any case), which would otherwise contradict the
-/// version of a request the bridge generated itself.
+/// Removes an `A2A-Version` query parameter (any case, including percent-encoded names), which
+/// would otherwise contradict the version of a request the bridge generated itself.
 pub fn strip_version_query(path: &str) -> String {
     let Some((base, query)) = path.split_once('?') else {
         return path.to_string();
@@ -93,7 +93,22 @@ pub fn strip_version_query(path: &str) -> String {
         .split('&')
         .filter(|kv| {
             let key = kv.split_once('=').map_or(*kv, |(k, _)| k);
-            !kv.is_empty() && !key.eq_ignore_ascii_case(A2A_VERSION_HEADER)
+            let mut bytes = key.bytes();
+            let decoded: Option<Vec<u8>> = std::iter::from_fn(|| {
+                bytes.next().map(|byte| match byte {
+                    b'%' => {
+                        let high = char::from(bytes.next()?).to_digit(16)?;
+                        let low = char::from(bytes.next()?).to_digit(16)?;
+                        Some((high * 16 + low) as u8)
+                    }
+                    b'+' => Some(b' '),
+                    _ => Some(byte),
+                })
+            })
+            .collect();
+            !kv.is_empty()
+                && !decoded
+                    .is_some_and(|key| key.eq_ignore_ascii_case(A2A_VERSION_HEADER.as_bytes()))
         })
         .collect();
     if kept.is_empty() {
@@ -227,6 +242,8 @@ impl TaskState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentReply {
     pub state: TaskState,
+    /// Trusted upstream opt-in for the current question, not inferred from its prose.
+    pub safe_elicitation: bool,
     pub context_id: Option<String>,
     pub task_id: Option<String>,
     pub texts: Vec<String>,
@@ -237,6 +254,7 @@ impl AgentReply {
     fn empty(state: TaskState) -> Self {
         AgentReply {
             state,
+            safe_elicitation: false,
             context_id: None,
             task_id: None,
             texts: Vec::new(),
@@ -308,6 +326,19 @@ fn optional_string(
     }
 }
 
+fn safe_elicitation(obj: &Map<String, Value>) -> Result<bool, String> {
+    let metadata = match obj.get("metadata") {
+        None => return Ok(false),
+        Some(Value::Object(metadata)) => metadata,
+        Some(_) => return Err(invalid("metadata is not an object")),
+    };
+    match metadata.get("p4a.elicitationSafe") {
+        None => Ok(false),
+        Some(Value::Bool(safe)) => Ok(*safe),
+        Some(_) => Err(invalid("metadata p4a.elicitationSafe is not a boolean")),
+    }
+}
+
 fn parts(obj: &Map<String, Value>, what: &str) -> Result<Vec<Value>, String> {
     let Some(Value::Array(parts)) = obj.get("parts") else {
         return Err(invalid(format!("{} has no parts array", what)));
@@ -330,16 +361,21 @@ fn check_part(part: &Value) -> Result<(), String> {
         Some(Value::String(_)) => Ok(true),
         Some(_) => Err(format!("a part whose {} is not a string", key)),
     };
-    for key in ["kind", "mediaType", "filename"] {
+    for key in ["kind", "mediaType", "filename", "text", "url", "raw"] {
         string(key)?;
     }
-    if string("text")? || string("url")? || string("raw")? {
-        return Ok(());
+    let content = ["text", "data", "file", "url", "raw"];
+    if content.iter().filter(|key| obj.contains_key(**key)).count() != 1 {
+        return Err("a part without exactly one content member".to_string());
+    }
+    if let Some(kind) = obj.get("kind").and_then(Value::as_str) {
+        if !matches!(kind, "text" | "data" | "file") || !obj.contains_key(kind) {
+            return Err("a part whose kind does not match its content".to_string());
+        }
     }
     if let Some(data) = obj.get("data") {
         // v0.3 data parts hold an object; v1.0 holds any JSON value.
         return match (obj.get("kind").and_then(Value::as_str), data) {
-            (_, Value::Null) => Err("a data part with null data".to_string()),
             (Some("data"), data) if !data.is_object() => {
                 Err("a v0.3 data part whose data is not an object".to_string())
             }
@@ -356,11 +392,11 @@ fn check_part(part: &Value) -> Result<(), String> {
             }
         }
         return match (file.get("uri"), file.get("bytes")) {
-            (Some(Value::String(_)), _) | (_, Some(Value::String(_))) => Ok(()),
+            (Some(Value::String(_)), None) | (None, Some(Value::String(_))) => Ok(()),
             _ => Err("a file part with no uri or bytes string".to_string()),
         };
     }
-    Err("a part with no text, data, file, url or raw content".to_string())
+    Ok(())
 }
 
 /// A Message: a recognised `role`, a non-empty `messageId` and valid parts. Returns its parts.
@@ -406,7 +442,10 @@ struct Artifact {
 fn artifact(value: &Value) -> Result<Artifact, String> {
     let obj = object(value, "an artifact")?;
     Ok(Artifact {
-        id: optional_string(obj, "artifactId", "the artifact")?,
+        id: Some(
+            optional_string(obj, "artifactId", "the artifact")?
+                .ok_or_else(|| invalid("the artifact has no artifactId"))?,
+        ),
         parts: parts(obj, "an artifact")?,
     })
 }
@@ -416,6 +455,7 @@ fn artifact(value: &Value) -> Result<Artifact, String> {
 #[derive(Debug, Clone, PartialEq)]
 struct Snapshot {
     state: TaskState,
+    safe_elicitation: bool,
     context_id: Option<String>,
     task_id: Option<String>,
     artifacts: Vec<Artifact>,
@@ -429,6 +469,7 @@ impl Snapshot {
     fn new(state: TaskState) -> Self {
         Snapshot {
             state,
+            safe_elicitation: false,
             context_id: None,
             task_id: None,
             artifacts: Vec::new(),
@@ -439,6 +480,7 @@ impl Snapshot {
 
     fn into_reply(self) -> AgentReply {
         let mut reply = AgentReply::empty(self.state);
+        reply.safe_elicitation = self.safe_elicitation;
         reply.context_id = self.context_id;
         reply.task_id = self.task_id;
         for artifact in &self.artifacts {
@@ -459,6 +501,7 @@ impl Snapshot {
     fn apply_status(&mut self, update: &Value) -> Result<(), String> {
         let obj = object(update, "a status update")?;
         let (state, message_parts) = task_status(obj, "status update")?;
+        self.safe_elicitation = safe_elicitation(obj)?;
         self.state = state;
         self.status_parts = message_parts;
         self.adopt_ids(obj)
@@ -490,6 +533,9 @@ impl Snapshot {
     fn adopt_ids(&mut self, update: &Map<String, Value>) -> Result<(), String> {
         let context_id = optional_string(update, "contextId", "the stream update")?;
         let task_id = optional_string(update, "taskId", "the stream update")?;
+        if context_id.is_none() || task_id.is_none() {
+            return Err(invalid("the stream update requires taskId and contextId"));
+        }
         self.check_ids(context_id.as_deref(), task_id.as_deref())?;
         if self.context_id.is_none() {
             self.context_id = context_id;
@@ -524,31 +570,34 @@ fn task_snapshot(value: &Value) -> Result<Snapshot, String> {
     };
     Ok(Snapshot {
         state,
+        safe_elicitation: safe_elicitation(task)?,
         context_id: optional_string(task, "contextId", "the task")?,
         task_id: Some(task_id),
         artifacts,
         status_parts,
-        history_parts: last_agent_message_parts(task),
+        history_parts: last_agent_message_parts(task)?,
     })
 }
 
-/// History is only a fallback, so it is read leniently.
-fn last_agent_message_parts(task: &Map<String, Value>) -> Vec<Value> {
-    let last = task
-        .get("history")
-        .and_then(Value::as_array)
-        .and_then(|history| {
-            history.iter().rev().find(|m| {
-                matches!(
-                    m.get("role").and_then(Value::as_str),
-                    Some("ROLE_AGENT") | Some("agent")
-                )
-            })
-        });
-    last.and_then(|m| m.get("parts"))
-        .and_then(Value::as_array)
-        .map(|parts| parts.iter().filter(|p| p.is_object()).cloned().collect())
-        .unwrap_or_default()
+/// History can supply the answer, so its messages use the same validation as other messages.
+fn last_agent_message_parts(task: &Map<String, Value>) -> Result<Vec<Value>, String> {
+    let history = match task.get("history") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(history)) => history,
+        Some(_) => return Err(invalid("the task history is not an array")),
+    };
+    let mut last = Vec::new();
+    for message in history {
+        let message = object(message, "a history message")?;
+        let parts = message_parts(message, "a history message")?;
+        if matches!(
+            message.get("role").and_then(Value::as_str),
+            Some("ROLE_AGENT" | "agent")
+        ) {
+            last = parts;
+        }
+    }
+    Ok(last)
 }
 
 /// A bare Message reply ends the interaction: there is no task to continue.
@@ -565,6 +614,7 @@ fn message_snapshot(value: &Value) -> Result<Snapshot, String> {
 /// returns the Task or Message itself, discriminated by `kind`.
 fn result_snapshot(result: &Value) -> Result<Snapshot, String> {
     let obj = object(result, "the result")?;
+    check_result_payload(obj)?;
     if let Some(task) = obj.get("task") {
         return task_snapshot(task);
     }
@@ -578,6 +628,18 @@ fn result_snapshot(result: &Value) -> Result<Snapshot, String> {
         None if obj.contains_key("parts") => message_snapshot(result),
         _ => Err(invalid("the result is neither a Task nor a Message")),
     }
+}
+
+fn check_result_payload(obj: &Map<String, Value>) -> Result<(), String> {
+    if ["task", "message", "statusUpdate", "artifactUpdate"]
+        .iter()
+        .filter(|key| obj.contains_key(**key))
+        .count()
+        > 1
+    {
+        return Err(invalid("the result has conflicting payload members"));
+    }
+    Ok(())
 }
 
 /// Checks the JSON-RPC envelope of an agent response and returns its `result`. The id must be
@@ -713,6 +775,7 @@ fn parse_sse_body(body: &[u8], expected_id: &Value) -> Result<Snapshot, String> 
             ))
         })?;
         let result = rpc_result(&json, expected_id)?;
+        check_result_payload(object(result, "the stream result")?)?;
         if let Some(update) = stream_update(result, "statusUpdate", "status-update") {
             snapshot
                 .get_or_insert_with(|| Snapshot::new(TaskState::Unknown))
@@ -980,7 +1043,7 @@ mod tests {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "result": {
             "kind": "task", "id": "t1", "contextId": "c1",
             "status": { "state": "completed" },
-            "artifacts": [{ "parts": [{ "kind": "text", "text": "done" }] }]
+            "artifacts": [{ "artifactId": "a1", "parts": [{ "kind": "text", "text": "done" }] }]
         }});
         let reply = parse_json(&body, &json!(1)).unwrap();
         assert_eq!(reply.state, TaskState::Completed);
@@ -1115,7 +1178,7 @@ mod tests {
     fn folds_sse_stream_updates() {
         let body = concat!(
             "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"t\",\"contextId\":\"c\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\r\n\r\n",
-            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"artifactUpdate\":{\"taskId\":\"t\",\"contextId\":\"c\",\"artifact\":{\"parts\":[{\"text\":\"part one\"}]}}}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"artifactUpdate\":{\"taskId\":\"t\",\"contextId\":\"c\",\"artifact\":{\"artifactId\":\"a1\",\"parts\":[{\"text\":\"part one\"}]}}}}\n\n",
             "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"statusUpdate\":{\"taskId\":\"t\",\"contextId\":\"c\",\"status\":{\"state\":\"TASK_STATE_COMPLETED\"}}}}\n\n",
         );
         let reply = parse_sse(body).unwrap();
@@ -1208,7 +1271,7 @@ mod tests {
         let body = [
             event(json!({ "task": { "id": "t", "status": { "state": "TASK_STATE_WORKING",
                 "message": { "role": "ROLE_AGENT", "messageId": "m1", "parts": [{ "text": "Looking it up…" }] } } } })),
-            event(json!({ "statusUpdate": { "taskId": "t", "status": { "state": "TASK_STATE_INPUT_REQUIRED",
+            event(json!({ "statusUpdate": { "taskId": "t", "contextId": "c", "status": { "state": "TASK_STATE_INPUT_REQUIRED",
                 "message": { "role": "ROLE_AGENT", "messageId": "m2", "parts": [{ "text": "Which account?" }] } } } })),
         ]
         .concat();
@@ -1224,10 +1287,10 @@ mod tests {
             json!({ "jsonrpc": "2.0", "id": 1, "result": { "task": { "id": "t", "contextId": "c",
             "status": { "state": "TASK_STATE_WORKING" } } } })
             .to_string();
-        let artifact = json!({ "jsonrpc": "2.0", "id": 1, "result": { "artifactUpdate": {
+        let artifact = json!({ "jsonrpc": "2.0", "id": 1, "result": { "artifactUpdate": { "taskId": "t", "contextId": "c",
             "artifact": { "artifactId": "a", "parts": [{ "text": "answer" }] } } } })
         .to_string();
-        let done = json!({ "jsonrpc": "2.0", "id": 1, "result": { "statusUpdate": {
+        let done = json!({ "jsonrpc": "2.0", "id": 1, "result": { "statusUpdate": { "taskId": "t", "contextId": "c",
             "status": { "state": "TASK_STATE_COMPLETED" } } } })
         .to_string();
         for eol in ["\n", "\r\n", "\r"] {
@@ -1252,7 +1315,7 @@ mod tests {
     fn corrupt_or_truncated_streams_are_errors() {
         let valid = event(json!({ "task": { "id": "t", "contextId": "c",
             "status": { "state": "TASK_STATE_COMPLETED" },
-            "artifacts": [{ "parts": [{ "text": "earlier answer" }] }] } }));
+            "artifacts": [{ "artifactId": "a1", "parts": [{ "text": "earlier answer" }] }] } }));
         for (case, tail) in [
             ("malformed JSON", "data: {not json\n\n".to_string()),
             (
@@ -1414,6 +1477,198 @@ mod tests {
         assert_eq!(TaskState::parse("unknown"), Some(TaskState::Unknown));
         assert_eq!(TaskState::parse("TASK_STATE_UNSPECIFIED"), None);
         assert_eq!(TaskState::parse("done"), None);
+    }
+
+    // Regressions from the adversarial parser review.
+    #[test]
+    fn review_rereview_safe_elicitation_requires_boolean_metadata_opt_in() {
+        let task = json!({ "id": "t", "status": { "state": "TASK_STATE_INPUT_REQUIRED" } });
+        assert!(!task_snapshot(&task).unwrap().into_reply().safe_elicitation);
+        for safe in [true, false] {
+            let mut task = task.clone();
+            task["metadata"] = json!({ "p4a.elicitationSafe": safe, "extension": 42 });
+            assert_eq!(
+                task_snapshot(&task).unwrap().into_reply().safe_elicitation,
+                safe
+            );
+        }
+        for metadata in [
+            json!(null),
+            json!([]),
+            json!(42),
+            json!({ "p4a.elicitationSafe": "true" }),
+            json!({ "p4a.elicitationSafe": null }),
+        ] {
+            let mut task = task.clone();
+            task["metadata"] = metadata;
+            assert!(task_snapshot(&task).is_err());
+        }
+        let message = json!({ "role": "ROLE_AGENT", "messageId": "m", "parts": [{ "text": "question" }],
+            "metadata": { "p4a.elicitationSafe": true } });
+        assert!(
+            !message_snapshot(&message)
+                .unwrap()
+                .into_reply()
+                .safe_elicitation
+        );
+    }
+
+    #[test]
+    fn review_rereview_status_marker_is_current_not_inherited() {
+        let task = json!({ "id": "t", "contextId": "c", "status": { "state": "working" },
+            "metadata": { "p4a.elicitationSafe": true } });
+        let mut snapshot = task_snapshot(&task).unwrap();
+        for marker in [None, Some(false), Some(true), None] {
+            let mut update = json!({ "taskId": "t", "contextId": "c",
+                "status": { "state": "TASK_STATE_INPUT_REQUIRED" } });
+            if let Some(marker) = marker {
+                update["metadata"] = json!({ "p4a.elicitationSafe": marker });
+            }
+            snapshot.apply_status(&update).unwrap();
+            assert_eq!(snapshot.safe_elicitation, marker.unwrap_or(false));
+        }
+        let update = json!({ "taskId": "t", "contextId": "c", "status": { "state": "input-required" },
+            "metadata": { "p4a.elicitationSafe": 1 } });
+        assert!(snapshot.apply_status(&update).is_err());
+    }
+
+    #[test]
+    fn review_rereview_malformed_history_must_not_be_success() {
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "result": { "task": {
+            "id": "t1", "contextId": "bad-context",
+            "status": { "state": "TASK_STATE_COMPLETED" },
+            "history": [{ "role": "ROLE_AGENT", "messageId": 42,
+                "parts": [{ "text": 42 }] }]
+        } } });
+        let actual = parse_json(&body, &json!(1));
+        assert!(actual.is_err(), "malformed history accepted: {:?}", actual);
+    }
+
+    #[test]
+    fn review_rereview_conflicting_task_message_must_be_rejected() {
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "result": {
+            "task": { "id": "t1", "status": { "state": "TASK_STATE_COMPLETED" } },
+            "message": { "role": "ROLE_AGENT", "messageId": "m1", "contextId": "c1",
+                "parts": [{ "text": "The operation failed" }] }
+        } });
+        let actual = parse_json(&body, &json!(1));
+        assert!(
+            actual.is_err(),
+            "conflicting payloads accepted: {:?}",
+            actual
+        );
+    }
+
+    #[test]
+    fn review_rereview_conflicting_part_variants_must_be_rejected() {
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "result": { "message": {
+            "role": "ROLE_AGENT", "messageId": "m1", "contextId": "c1",
+            "parts": [{ "text": "Approved", "data": { "approved": false } }]
+        } } });
+        let actual = parse_json(&body, &json!(1));
+        assert!(actual.is_err(), "conflicting part accepted: {:?}", actual);
+    }
+
+    #[test]
+    fn review_rereview_mistyped_secondary_part_content_must_be_rejected() {
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "result": { "message": {
+            "role": "ROLE_AGENT", "messageId": "m1", "contextId": "c1",
+            "parts": [{ "text": "Approved", "url": 42 }]
+        } } });
+        let actual = parse_json(&body, &json!(1));
+        assert!(
+            actual.is_err(),
+            "mistyped secondary content accepted: {:?}",
+            actual
+        );
+    }
+
+    #[test]
+    fn review_rereview_missing_sse_ids_must_be_rejected() {
+        let body = [
+            event(json!({ "task": { "id": "t1", "contextId": "c1",
+                "status": { "state": "TASK_STATE_WORKING" } } })),
+            event(json!({ "artifactUpdate": { "artifact": {
+                "parts": [{ "data": { "approved": true } }] } } })),
+            event(json!({ "artifactUpdate": { "artifact": {
+                "parts": [{ "data": { "approved": false } }] } } })),
+            event(json!({ "statusUpdate": {
+                "status": { "state": "TASK_STATE_COMPLETED" } } })),
+        ]
+        .concat();
+        let actual = parse_sse(&body);
+        assert!(
+            actual.is_err(),
+            "unidentified updates accepted: {:?}",
+            actual
+        );
+    }
+
+    #[test]
+    fn review_rereview_valid_v1_null_data_must_be_accepted() {
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "result": { "task": {
+            "id": "t1", "status": { "state": "TASK_STATE_COMPLETED" },
+            "artifacts": [{ "artifactId": "a1", "parts": [{ "data": null }] }]
+        } } });
+        let actual = parse_json(&body, &json!(1));
+        assert!(actual.is_ok(), "valid v1 null data rejected: {:?}", actual);
+        assert_eq!(actual.unwrap().data, vec![Value::Null]);
+    }
+
+    #[test]
+    fn review_rereview_each_required_update_id_is_checked() {
+        let status = json!({ "taskId": "t", "contextId": "c",
+            "status": { "state": "TASK_STATE_COMPLETED" } });
+        let artifact = json!({ "taskId": "t", "contextId": "c",
+            "artifact": { "artifactId": "a", "parts": [{ "text": "answer" }] } });
+        for (key, update) in [("statusUpdate", status), ("artifactUpdate", artifact)] {
+            for id in ["taskId", "contextId"] {
+                for bad in [None, Some(Value::Null), Some(json!("")), Some(json!(42))] {
+                    let mut update = update.clone();
+                    match bad {
+                        None => {
+                            update.as_object_mut().unwrap().remove(id);
+                        }
+                        Some(value) => {
+                            update[id] = value;
+                        }
+                    }
+                    let mut result = json!({});
+                    result[key] = update;
+                    assert!(parse_sse(&event(result)).is_err(), "{} without {}", key, id);
+                }
+            }
+        }
+        let result = json!({ "artifactUpdate": { "taskId": "t", "contextId": "c",
+            "artifact": { "parts": [{ "text": "answer" }] } } });
+        assert!(parse_sse(&event(result)).is_err());
+    }
+
+    #[test]
+    fn review_rereview_history_and_extension_compatibility() {
+        for role in ["ROLE_AGENT", "agent"] {
+            let body = json!({ "jsonrpc": "2.0", "id": 1, "result": {
+                "id": "t", "status": { "state": "completed" },
+                "history": [{ "role": role, "messageId": "m",
+                    "parts": [{ "text": "answer", "metadata": { "custom": true }, "extension": 42 }] }],
+                "extension": { "custom": true }
+            } });
+            assert_eq!(parse_json(&body, &json!(1)).unwrap().texts, vec!["answer"]);
+        }
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "result": { "kind": "message",
+            "role": "agent", "messageId": "m", "parts": [{ "kind": "data", "data": null }] } });
+        assert!(parse_json(&body, &json!(1)).is_err());
+    }
+
+    #[test]
+    fn review_rereview_conflicting_stream_payloads_must_be_rejected() {
+        let result = json!({
+            "statusUpdate": { "taskId": "t", "contextId": "c",
+                "status": { "state": "completed" } },
+            "artifactUpdate": { "taskId": "t", "contextId": "c",
+                "artifact": { "artifactId": "a", "parts": [{ "text": "answer" }] } }
+        });
+        assert!(parse_sse(&event(result)).is_err());
     }
 
     #[test]

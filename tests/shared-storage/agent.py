@@ -59,6 +59,7 @@ class Agent(BaseHTTPRequestHandler):
             "result": {"task": {
                 "id": message.get("taskId") or f"task-{len(received)}",
                 "contextId": context_id,
+                "metadata": {"p4a.elicitationSafe": True} if asking else {},
                 "status": {
                     "state": "TASK_STATE_INPUT_REQUIRED" if asking else "TASK_STATE_COMPLETED",
                     "message": {"messageId": f"m-{len(received)}", "role": "ROLE_AGENT",

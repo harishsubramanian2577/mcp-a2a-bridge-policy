@@ -2,13 +2,15 @@
 
 This document tracks the fixes for the P4A review findings on the MCP A2A Bridge Policy.
 
+**Evidence scope:** release-era test counts, PASS transcripts and deployment reports below are historical evidence for the named original builds. Current PR #15 results are recorded separately in [Nov 16 follow-up](#nov-16-follow-up-2026-11-16): 137 unit tests, one Docker integration test and 46 shared-storage/official-SDK checks passed. Current behavior supersedes older implementation descriptions where noted; managed-gateway testing and live configuration migration were not run for this follow-up.
+
 | | |
 |---|---|
 | Reviewed version | 1.0.3 (commit `3d61a41`) |
 | Fixed in | 1.1.0, branch `fix/p4a-priority-issues` (priority issues)<br>1.3.0, branch `fix/p4a-remaining-issues` (remaining issues; the interim 1.2.0 was never published) |
 | Priority issues | [#1](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/1), [#4](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/4), [#12](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/12) |
 | Remaining issues | [#2](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/2), [#3](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/3), [#5](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/5), [#6](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/6), [#7](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/7), [#8](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/8), [#9](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/9), [#10](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/10), [#11](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/11), [#13](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/13) |
-| Test baseline | 32 unit tests on 1.0.3, 61 on 1.1.0, 105 on 1.3.0, 112 after the PR #15 review follow-up, all passing |
+| Test baseline | Historical: 32 unit tests on 1.0.3, 61 on 1.1.0, 105 on 1.3.0, 112 after the original PR #15 review follow-up. Current Nov 16 worktree: 137 unit tests and one Docker integration test passed; final shared-storage/SDK run passed 46 checks (evidence below). |
 | Minimum gateway | Flex Gateway 1.11.0 (1.1.0 and later use PDK stop-iteration, which 1.10.x doesn't support) |
 
 ## Status
@@ -31,7 +33,7 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 
 ## How the fixes were verified
 
-This section covers 1.1.0. For 1.3.0, see [Verification of 1.3.0](#verification-of-130).
+This section records the original 1.1.0 runs. For original 1.3.0 evidence, see [Verification of 1.3.0](#verification-of-130); neither section verifies the Nov 16 changes.
 
 1. **Unit and filter tests.**
    - The tests drive the real policy entrypoint through the PDK 1.8.0 `pdk-unit` harness.
@@ -148,11 +150,11 @@ The detailed reproductions in the issue were withheld pending a private channel.
 - [x] **Unambiguous session keys.** The key is a hex SHA-256 over a versioned, length-prefixed encoding of (scope, session ID, identity-or-none). This replaces `"<sid>:<DefaultHasher(identity)>"`, which could collide and used a non-cryptographic hash.
 - [x] **Unpredictable, globally unique session IDs.** They are random v4 UUIDs from the host's secure random source (`getrandom`, which is WASI `random_get`) and do not depend on `x-request-id` or any other caller-controlled data. If randomness is unavailable, no session is issued. A2A `messageId` values are random too.
 - [x] **Only issued sessions are honoured.** `initialize` registers the new session (`StoreMode::Absent`). `tools/call` and `DELETE` act only on a live, registered entry for the same caller, so a caller can't plant a chosen session ID.
-- [x] **Delete-safe updates.** The response side updates the entry with compare-and-swap (`StoreMode::Cas`). A session deleted while a call was in flight stays deleted. This also covers part of the concurrency finding in #5.
-- [x] **Scoped shared storage.** The namespace is `mcp-a2a-sessions/<api-id>/<policy-name>.<policy-namespace>`, falling back to the base path when the API ID is unknown in local mode. The same scope is hashed into each key. Two API instances that share Redis are isolated, while replicas of one instance share the same namespace, so sessions continue across replicas.
+- [x] **Delete-safe updates.** The response side uses compare-and-swap (`StoreMode::Cas`). Current PR #15 transitions re-read the live unified entry and recheck generation and pending stream/round ownership as applicable before CAS, with bounded retries; they do not rely on a CAS token captured at request start. A successfully stored termination tombstone blocks late updates. This also covers #5.
+- [x] **Scoped shared storage.** The original namespace was `mcp-a2a-sessions/<api-id>/<policy-name>.<policy-namespace>`. PR #15 now uses `mcp-a2a-sessions-v2/<api-id>/<policy-name>.<policy-namespace>/retention-<seconds>`, falling back to the base path when the API ID is unknown in local mode. API/policy scope is hashed into each key. Two API instances that share Redis are isolated, while consistently configured replicas of one instance share sessions. Old sessions are not migrated.
 - [x] **Configured expiry.**
-  - The TTL is clamped to 60–86400 seconds. The same value sets the Redis TTL (`remote_ttl_millis`) and the liveness check.
-  - Entries store `touched_at`, and the liveness check compares it with the TTL in the current configuration rather than the TTL used when the entry was written. A unit test covers this: an entry written under a long TTL is treated as expired once the configured TTL is lowered. Changing the TTL on a running gateway has not been tested live.
+  - Logical idle TTL is clamped to 60–86400 seconds. Current remote physical retention is TTL + 1800 seconds with `enableElicitation`, otherwise TTL. Pending questions retain state through their deadline plus a replay window of one TTL; completed streams remain for one TTL after settlement. This does not lengthen ordinary idle expiry.
+  - The liveness check uses `touched_at` and pending retention. Physical retention is part of the namespace, so changing `sessionTtlSeconds` or `enableElicitation` so that retention changes requires clients to reinitialize, not an in-place TTL change to old sessions. The original lower-TTL unit test is historical evidence, not a live configuration-migration test.
 - [x] **Logs** carry only a short prefix of the hashed key, never the session ID or identity.
 - [x] **Two-replica shared Redis test added** (`make test-shared-storage`, in `tests/shared-storage/`). `pdk-test` 1.8.0 has no Redis service and its service traits are private, so this is a Docker Compose harness: Redis, two Flex Gateway replicas, two API instances (`hr`, bound to `x-client-id`, and `finance`) and a mock A2A agent that records what it receives. `check.py` verifies:
   - a session issued on flex-1 continues on flex-2;
@@ -161,7 +163,7 @@ The detailed reproductions in the issue were withheld pending a private channel.
   - Redis keys contain neither the session ID nor the identity, and their TTL matches `sessionTtlSeconds`;
   - the session survives a restart of flex-1;
   - only the owner can `DELETE` it, and once deleted on flex-2 it is gone on flex-1 too.
-- [x] **Live run of that test: passed.** It ran on 2026-11-11 against Flex Gateway 1.11.0, 1.12.0 and 1.13.0 in local mode, with a local-mode registration mounted read-only (`REGISTRATION=<path>`). The harness refuses to run if Flex starts in connected mode. All 18 checks pass:
+- [x] **Original live run of that test: passed.** It ran on 2026-11-11 against Flex Gateway 1.11.0, 1.12.0 and 1.13.0 in local mode, with a local-mode registration mounted read-only (`REGISTRATION=<path>`). The harness refuses to run if Flex starts in connected mode. All 18 checks passed on that build; the following old-namespace transcript is not a current retention check:
 
   ```
   Replica continuity (hr, bound to x-client-id)
@@ -201,7 +203,7 @@ The detailed reproductions in the issue were withheld pending a private channel.
   All shared-storage checks passed.
   ```
 
-  Each session entry is stored under `<namespace>:<SHA-256 key>` with the Redis TTL set to `sessionTtlSeconds`. The two `index` keys are Flex's own per-namespace key index, which the gateway manages and which has no TTL. In local mode the API ID and base path are not known, so the namespace is told apart by the policy instance name (`hr-agent-p1.default` and `finance-agent-p1.default`).
+  In that original run, each entry used `<namespace>:<SHA-256 key>` with Redis TTL equal to `sessionTtlSeconds`. The two `index` keys were Flex's own per-namespace key index, with no TTL. The current namespace and physical/logical retention contract are described above; these old TTL values do not verify it. In local mode the policy instance name distinguished `hr-agent-p1.default` and `finance-agent-p1.default` when the API ID and base path were unavailable.
 - [x] **Private security reporting channel.** GitHub private vulnerability reporting is enabled, and [`SECURITY.md`](../SECURITY.md) describes how to report. The repository visibility is unchanged.
 
 ### Files
@@ -226,9 +228,13 @@ The detailed reproductions in the issue were withheld pending a private channel.
 ### Upgrade note
 1.1.0 uses a new store namespace and key format. Sessions remembered by 1.0.x are not read after the upgrade, so clients start a new MCP session the next time they call `initialize`. Conversations that pass `context_id` explicitly are not affected.
 
+PR #15 introduces the unified v2 namespace and retention suffix. Sessions from earlier builds are not read after this upgrade either. Clients must reinitialize after the upgrade or a retention-changing TTL/elicitation configuration update. Explicit continuation IDs can be used in a new session, but pending forms and replay state are not migrated.
+
 ---
 
 ## Verification of 1.3.0
+
+These are the original 1.3.0 verification results, not a rerun of the Nov 16 worktree.
 
 1. **Unit and filter tests.**
    - Command: `cargo test --lib`.
@@ -336,7 +342,7 @@ After `DELETE` (`204`), a call with the same session ID still reached the agent 
 
 ### Resolution steps
 - [x] **Session lifecycle is separate from context fallback.** When a session store is configured, an `Mcp-Session-Id` that is unknown, expired, deleted or bound to another identity gets HTTP `404` with JSON-RPC `-32001` "Session not found", and the agent is not called. The client starts a new session with `initialize`, as the MCP session rules require.
-- [x] **Late answers can't revive a session.** The response side updates the session only with compare-and-swap against the entry read when the call started (added in 1.1.0 for #12). A session deleted while the call was in flight stays deleted. The in-flight call still gets its answer.
+- [x] **Late answers can't revive a session.** Current PR #15 updates re-read the live entry and recheck generation/pending ownership before CAS, rather than reuse the entry's CAS token from request start. `DELETE` returns `204` only after a checked CAS stores the termination tombstone; a failed write returns `503` for the client to retry. An unknown or unauthorized session gets `404`. After successful termination, an in-flight plain call can still deliver its answer but cannot restore the session.
 - [x] Without a session store, session IDs are ignored as before. The bridge issues none, so none can end.
 
 ### Files
@@ -363,7 +369,7 @@ The pdk-unit harness runs a call to completion in one step, so it can't run a `D
 
 ### Resolution steps
 - [x] `a2a::rpc_result` checks the agent's envelope. `jsonrpc` must be `"2.0"`, the response must have exactly one of `result` or `error`, and the id must match the one the bridge sent. An error may carry a `null` id, as JSON-RPC allows.
-- [x] The result must be a valid Task or Message, wrapped (`{task}`, `{message}`) or bare, in v1.0 or v0.3 form. Required members are type-checked: status, state, parts, artifacts and roles.
+- [x] The result must be a valid Task or Message, wrapped (`{task}`, `{message}`) or bare, in v1.0 or v0.3 form. Current validation enforces exactly one supported result/part variant (oneof), validates every history message even when other content supplies the answer, and requires non-empty artifact IDs and streamed update task/context IDs. Update IDs must correlate across the stream. A v1.0 data part accepts any JSON value, including `null`; v0.3 `kind: "data"` requires an object.
 - [x] Anything invalid becomes an MCP tool error (`isError: true`), "The A2A agent returned an invalid response: ...", and the session is not updated.
 - [x] Test fixtures and mocks now answer with the request's id instead of a fixed one.
 
@@ -468,7 +474,7 @@ A Task with `id: t9`, state `input-required` and no `contextId` produced only th
 - [x] **New "8. Limitations" section** in the customer guide. It covers:
   - polling, cancel and push not supported;
   - buffered rather than streamed MCP delivery;
-  - no elicitation or auth orchestration;
+  - client-managed questions by default, experimental gated elicitation, and no auth orchestration;
   - lossy artifact and file projection;
   - supported bindings and versions;
   - session fallback;
@@ -513,27 +519,29 @@ A Task with `id: t9`, state `input-required` and no `contextId` produced only th
 | Question | Decision |
 |---|---|
 | Target clients | The customer's primary MCP client is ChatGPT, which doesn't support MCP elicitation. So `enableElicitation` is **off by default**, and the client-managed mode (`structuredContent` with `contextId`/`taskId`, guide 3.1) stays the default and is unchanged. Elicitation is experimental, for clients that declare it. |
-| Form and answers | One required free-text field, `answer`, with the agent's question as the message. Nothing is inferred from the agent's text, because A2A doesn't say what shape of answer it wants. The answer is sent to the agent as a plain text part of the same task (`taskId`, plus `contextId` when known), which is exactly what a client-managed follow-up sends. The field description tells the user never to enter passwords, tokens or other secrets, and `auth-required` is never turned into a form. |
-| Timeout | `elicitationTimeoutSeconds`, default **300**, range 30–1800, capped by `sessionTtlSeconds`. Five minutes covers a person reading and typing without leaving a stale task waiting at the agent. |
+| Form and answers | One required free-text field, `answer`, with the agent's question as the message. Every question requires a trusted upstream boolean `Task.metadata["p4a.elicitationSafe"]: true`; streamed status updates must opt in afresh. Missing/false markers fall back to client-managed handling, while malformed metadata is an invalid response. The answer is sent as a plain text part of the same task (`taskId`, plus `contextId` when known). The warning tells users never to enter secrets and `auth-required` never elicits, but the bridge does not detect secrets in arbitrary text: the marker is an upstream assertion, not a full no-secrets guarantee. |
+| Timeout | `elicitationTimeoutSeconds`, default **300**, range 30–1800, independent of `sessionTtlSeconds`. Only unanswered questions are input-timed-out. Once accepted, the answer waits under the upstream response timeout. Pending state is retained through its deadline plus a replay window of one session TTL. |
 | Repeated questions | `maxElicitationRounds`, default **3**, range 1–10, per `tools/call`. A further question comes back as an ordinary `input-required` result with the IDs, so a looping agent can't keep the user in forms. |
-| Decline, cancel, disconnect | The conversation ends: the result says why (`structuredContent: {state: "ended", reason}`), and the session's context and task are cleared, so the next call starts fresh. A disconnect is not a cancellation in MCP, so a client that never comes back is treated as a timeout. `notifications/cancelled` for the call ends it at once. A JSON-RPC error from the client (for example it can't show the form) is not a refusal: the question falls back to the client-managed result and the conversation goes on. |
+| Decline, cancel, disconnect | The question's conversation ends with `structuredContent: {state: "ended", reason}`. Context/task are cleared only while that question owns the session generation; newer independent context is preserved. A disconnect is not cancellation: an unanswered question eventually times out, whereas an accepted answer waits under the upstream timeout. `notifications/cancelled` ends the question. A JSON-RPC error from the client falls back to client-managed handling rather than refuse the conversation. |
 
 ### Resolution steps
-- [x] **Opt-in and gating.** `enableElicitation` (default `false`) is honoured only with a session store, a client that negotiated `2025-06-18` or later and declared `capabilities.elicitation`, and a `tools/call` that accepts `text/event-stream`. Otherwise behaviour is unchanged.
+- [x] **Opt-in and gating.** `enableElicitation` (default `false`) is honoured only with a session store, a client that negotiated `2025-06-18` or later and declared `capabilities.elicitation`, a `tools/call` that accepts `text/event-stream`, and a fresh trusted upstream safety marker on each `input-required` question. An open or retained completed stream is not replaced; a new question during completed-stream retention falls back to client-managed handling.
 - [x] **Resumable stream instead of a held connection.** A policy can't keep a response open while waiting for the user, so the bridge uses Streamable HTTP resumption:
   - the `tools/call` gets an SSE stream with one `elicitation/create` (event `id: <stream>-<n>`) and a `retry` hint, and the stream ends;
   - the client POSTs its response and gets `202`;
   - an accepted answer goes to the agent;
   - the client resumes with `GET` and `Last-Event-ID`, and gets the next question or the final result under the original request ID.
-- [x] **State in the session store.** The open question is stored next to the session, under a separate namespace, so any replica can take the answer or resume the stream. It is bound to the session's identity. Sessions stored by earlier builds stay readable.
-- [x] **Exactly-once answers.** The question is claimed with compare-and-swap before the answer is forwarded. A duplicate or concurrent answer, an answer to another or an old question ID, and a late answer after timeout or decline are acknowledged with `202` and never reach the agent. A malformed answer gets `400` and the question stays open.
+- [x] **State in the session store.** Continuation, generation, negotiated elicitation capability and pending question/result now share a single CAS-protected v2 session entry, bound to the session's identity. Consistently configured replicas can answer/resume it. Sessions stored by earlier builds are not readable after the upgrade; clients must reinitialize. Retention-changing configuration updates also require reinitialization.
+- [x] **At-most-once answer forwarding.** The question is claimed with compare-and-swap before the answer is forwarded. A duplicate or concurrent answer, an answer to another or an old question ID, and a late answer after timeout or decline are acknowledged with `202` and never reach the agent. A malformed answer gets `400` and the question stays open. This deduplicates the answer claim; it is not guaranteed delivery or exactly-once execution at the upstream.
 - [x] **Open questions are protected.** A `tools/call` that would continue the waiting conversation gets a tool error asking the user to answer or cancel first, and the question and its stream stay intact. An independent call (`new_conversation`, or other explicit IDs) runs without eliciting. `notifications/cancelled` with the call's `requestId` ends the question and clears the context, if it still belongs to that conversation. (Changed in the PR #15 review follow-up; 1.3.0 dropped the open question on any new call.)
 - [x] **Configuration and docs.** New `gcl.yaml` properties: `enableElicitation`, `elicitationTimeoutSeconds` and `maxElicitationRounds`. Updated the customer guide (new "3.2 Experimental: MCP elicitation", configuration table, Limitations, checklist item 9) and the README.
 
 ### Files
-`src/elicitation.rs` (new), `src/lib.rs` (`resume_stream`, `answer_elicitation`, `cancel_elicitation`, `start_elicitation`, `settle_answer`), `src/session.rs` (elicitation namespace, `update_elicitation`), `definition/gcl.yaml`, `tests/shared-storage/`, docs.
+`src/elicitation.rs`, `src/lib.rs` (`resume_stream`, `answer_elicitation`, `cancel_elicitation`, `start_elicitation`, `settle_answer`), `src/session.rs` (unified v2 entry, generation, CAS updates and retention namespace), `src/a2a.rs` (upstream safety marker and validation), `definition/gcl.yaml`, `tests/shared-storage/`, docs.
 
 ### Tests
+The following list and transcript record the original elicitation coverage. They do not establish current Nov 16 results or safety-marker fixture coverage.
+
 | Test | What it proves |
 |---|---|
 | `tests::elicitation_is_off_by_default_and_questions_stay_tool_results` | ChatGPT path: with the default config, even a client that declares elicitation gets the JSON result with `taskId` and `contextId` |
@@ -565,7 +573,7 @@ Client-managed fallback on the same API (ChatGPT-style client)
   PASS  a client without the capability gets a JSON tool result with the ids
 ```
 
-**Verification boundary:** the live checks use a scripted MCP client. No shipping MCP client that supports elicitation and `Last-Event-ID` resumption has been tried yet, which is why the feature is marked experimental. ChatGPT is unaffected, because it never declares the capability and the setting is off by default.
+**Original verification boundary:** these initial live checks used a scripted MCP client. Later historical SDK and MCP Inspector checks are recorded below. They do not verify the current safety-marker, CAS and retention changes. ChatGPT remains on client-managed handling because it does not declare the capability and elicitation defaults off.
 
 ## PR #15 review follow-up
 
@@ -584,18 +592,18 @@ The second review of PR #15 (at `9dff842`) found seven more problems. It also fl
 | 7 | SSE folding combines different tasks | A stream whose events name a different task or context than the earlier events is rejected. | `tests::review_sse_task_ids_must_match` |
 | 8 | Inherited runtime metadata blocker | Merged from PR #14. `make build` writes `minRuntimeVersion: 1.11.0` and checks it. | `scripts/check-min-runtime.py` (runs in `make build`) |
 
-**How the fixes were verified:**
+**How the original follow-up fixes were verified (historical):**
 
 - All eight regression tests were copied unchanged onto the pre-fix code and run there. The rewritten cancel test is one of the eight. All of them fail there, and all pass after the fixes.
 - `cargo test --lib`: 112 passed.
 - `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean. So is `cargo clippy --lib --target wasm32-wasip1 -- -D warnings`.
 - `make build` passes its runtime-version check.
 
-**Known limitation:** a question that has been answered but whose result hasn't been fetched yet can still be replaced by a new call's question.
+**Superseded limitation:** the original follow-up could replace an answered question's unfetched result. The Nov 16 changes retain completed streams for one session TTL after settlement, including after fetching; a new question during that window is client-managed and cannot replace the retained result.
 
 ### End-to-end test with a real MCP SDK client
 
-`make test-shared-storage` now also drives the gateway with the official MCP Python SDK (`mcp` 2.3.0, pinned), after `check.py`. The script is `tests/shared-storage/sdk_check.py`. It runs in a `python:3.12-slim` container on the compose network and installs the SDK from PyPI; `SKIP_SDK=1` skips it. The SDK runs its own handshake, Streamable HTTP transport, elicitation callback and SSE resumption (GET with `Last-Event-ID` after the question stream ends), with nothing scripted:
+The original `make test-shared-storage` follow-up added the official MCP Python SDK (`mcp` 2.3.0, pinned), after `check.py`. The script is `tests/shared-storage/sdk_check.py`. It runs in a `python:3.12-slim` container on the compose network and installs the SDK from PyPI; `SKIP_SDK=1` skips it. The SDK handles handshake, Streamable HTTP transport, elicitation callbacks and SSE resumption (GET with `Last-Event-ID` after the question stream ends); the test supplies scripted scenarios and answers:
 
 | Scenario | Checks |
 |---|---|
@@ -644,3 +652,26 @@ Managed replicas share storage with each other, with nothing to configure, and P
 - an elicitation answered 70 s after the form appeared, with the MCP TypeScript SDK resuming the stream about every 2 s across replicas.
 
 No code change. The guide now has "5.3 Session store and gateway replicas", says `remote` uses the gateway's shared storage rather than only Redis, describes the remembered conversation and `new_conversation`, says which requests extend `sessionTtlSeconds`, notes Inspector's 60 s per-server request timeout, and adds checklist item 10. The `sessionStoreMode` description in `gcl.yaml` was updated the same way and ships with the next release. The guide's 3.2 table also now describes what a new `tools/call` does while a question is open, as changed in the PR #15 follow-up.
+
+### Nov 16 follow-up (2026-11-16)
+
+Current PR #15 changes, not a release or live-verification claim:
+
+| Area | Current resolution |
+|---|---|
+| Trusted elicitation | Still off by default. Every `input-required` question requires boolean `Task.metadata["p4a.elicitationSafe"]: true`; status updates do not inherit approval. Missing/false markers return a client-managed result, malformed markers fail validation, and `auth-required` never elicits. Trust the upstream assertion; no arbitrary-text secret detection is promised. |
+| Atomic session transitions | Continuation, generation and pending state share a v2 entry. CAS attempts re-read current state and guard generation plus stream/round ownership as applicable, so stale settlements cannot clear newer context. Earlier namespaces are not migrated: reinitialize. |
+| Retention and configuration | Remote physical retention is TTL + 1800 seconds when elicitation is enabled, otherwise TTL. Logical idle expiry remains TTL, except pending state survives through deadline + replay TTL. Completed streams remain for one TTL after settlement; new questions during retained `Done` state fall back to client-managed results. TTL/`enableElicitation` changes that alter the retention namespace require reinitialization and consistent replica configuration. |
+| Accepted answers and termination | Accepted answers are not input-timed-out; the upstream response timeout applies. `Answering` gets a separate 1800-second processing/recovery deadline from acceptance; an unresolved resume after that deadline attempts to persist an error directing the client to start a new call, not resend the accepted answer. CAS updates retry at most three times; an answer claim/settlement still needing persistence after exhaustion returns `503`, as does failed recovery persistence. `DELETE` acknowledges `204` only after a checked CAS tombstone write, returns `503` on failure (retry), and prevents late revival after successful termination. |
+| Encoding and query keys | Rewritten responses remove `Content-Encoding`; compressed upstream bodies are not decompressed by the bridge. Native pass-through remains unchanged. Version query keys are percent-decoded exactly once before case-insensitive matching, not recursively decoded. |
+| Strict upstream validation | History messages are all validated; result and part oneofs are enforced; artifacts require `artifactId`, and streamed updates require task/context IDs with consistent correlation. Valid v1.0 `data: null` remains accepted; v0.3 data parts require objects. |
+
+**Current verified evidence (2026-11-16):** PR15 Nov 16 worktree based on source HEAD `53cdc2d0a1c647653ab4b36eb210932f3480d952`, including the uncommitted follow-up changes. A final commit identifier is unavailable precommit. These checks do not claim that the changes are published or merged.
+
+| Check | Verified evidence |
+|---|---|
+| Unit/filter and Docker integration | `make test`: 137 unit tests and one `tools_call_round_trip` Docker integration test passed. The integration fixture pins Flex 1.11.0. Coverage includes marker gates, accepted-answer deadline, retained results, short TTL, stale CAS owners, termination/persistence failures, query decoding, history/oneof/update IDs and v1 null data. |
+| Rebuilt WASM and runtime metadata | Final `make test-shared-storage` rebuilt the release WASM successfully; its log reports `minRuntimeVersion 1.11.0` passing the `enable_stop_iteration` runtime check. No additional current PR15 formatting/clippy or separate definition-validation run is asserted here. |
+| Shared storage and official SDK clients | Final `make test-shared-storage`: all 46 logged PASS checks succeeded: 32 scripted shared-storage checks, 12 official Python SDK checks and 2 official TypeScript SDK checks. The two-replica Local Mode compose fixtures default to Flex 1.11.0 and Redis `7-alpine`, Python `mcp` 2.3.0 on `python:3.12-slim`, and `@modelcontextprotocol/sdk` 1.32.2 on `node:22-slim`. The log does not print version overrides; these version values come from the fixture defaults. It verifies v2 retention namespaces, completed-stream preservation/replay, and SDK accept, slow-answer and decline paths with upstream marker fixtures. |
+| Evidence log | `/var/folders/sg/yy2zqfr95mz46qt8pm8kd8yw0000gn/T/opencode/pr15-shared-storage.log`: build/runtime check and all three suite completion messages, with 46 PASS lines. |
+| Not run | Current managed-gateway testing, manual target-client/MCP Inspector verification, and live configuration migration, including reinitialization after TTL/elicitation namespace changes. Unit namespace/retention checks and Local Mode continuity tests do not establish live migration behavior. |

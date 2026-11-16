@@ -138,7 +138,21 @@ def elicitation_checks():
     check("the result arrives on flex-2 under the original call id", status == 200 and result.get("id") == "call-1"
           and result.get("result", {}).get("content", [{}])[0].get("text") == "echo: Paris", str(result)[:120])
 
+    # The completed stream remains replayable for one TTL. A new question in that session
+    # falls back to client-managed mode rather than replacing the original result.
+    print("Elicitation replay retention")
+    status, _, text = raw("POST", url_1, {"jsonrpc": "2.0", "id": "retained-call", "method": "tools/call",
+                                        "params": {"name": "ask_agent", "arguments": {"message": "ask again"}}},
+                         mcp(sid, "alice"))
+    fallback = sse_events(text)[0][1]
+    check("a new question preserves the completed stream", status == 200 and "result" in fallback
+          and fallback["result"].get("structuredContent", {}).get("state") == "input-required")
+    status, _, text = raw("GET", url_2, headers={**mcp(sid, "alice"), "last-event-id": event_id})
+    check("the original result can still be replayed", status == 200
+          and sse_events(text)[0][1].get("id") == "call-1")
+
     print("Elicitation decline")
+    _, sid = initialize(url_1, "alice", {"elicitation": {}})
     status, _, text = raw("POST", url_1, {"jsonrpc": "2.0", "id": "call-2", "method": "tools/call",
                                          "params": {"name": "ask_agent", "arguments": {"message": "ask again"}}},
                           mcp(sid, "alice"))
@@ -233,7 +247,8 @@ def main():
     check("no key contains a session id", not any(s in k for k in keys for s in (sid, fsid)))
     check("no key contains the client identity", not any("alice" in k for k in keys))
     ttls = [int(redis("PTTL", k)[0]) for k in entries]
-    check("every session entry expires within sessionTtlSeconds", all(0 < t <= TTL_MILLIS for t in ttls), f"{min(ttls)}-{max(ttls)} ms")
+    limits = [TTL_MILLIS + (1_800_000 if "support-agent" in k else 0) for k in entries]
+    check("every entry has bounded physical retention", all(0 < t <= limit for t, limit in zip(ttls, limits)), f"{min(ttls)}-{max(ttls)} ms")
     for k in indexes:
         print(f"         index {k.rsplit(':', 1)[-1]}: type {redis('TYPE', k)[0]}, TTL {redis('PTTL', k)[0]}")
     namespaces = {k.rsplit(":", 1)[0] for k in entries}

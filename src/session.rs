@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::elicitation::Pending;
 
-const NAMESPACE_PREFIX: &str = "mcp-a2a-sessions";
+const NAMESPACE_PREFIX: &str = "mcp-a2a-sessions-v2";
 const KEY_FORMAT: &[u8] = b"mcp-a2a-session-key/v1";
 /// Local storage has no TTL, so expired entries are swept every this many writes.
 const LOCAL_SWEEP_INTERVAL: u32 = 256;
@@ -40,12 +40,13 @@ pub struct SessionEntry {
     pub task_id: Option<String>,
     /// Last write, in Unix seconds.
     pub touched_at: u64,
+    pub generation: u64,
+    pub elicitation: bool,
+    pub pending: Option<Pending>,
 }
 
-/// Elicitation state of a session, kept in its own namespace so the session entry format (and
-/// sessions stored by earlier versions) stays unchanged. Its presence means the client declared
-/// elicitation at `initialize`. Storage uses bincode, so these types avoid serde features that
-/// need a self-describing format (tags, `Value`, skipped fields).
+/// Elicitation view of the CAS-protected session. Its presence means the client declared
+/// elicitation at `initialize`; pending state and continuation are stored atomically.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElicitationEntry {
     pub pending: Option<Pending>,
@@ -64,15 +65,21 @@ pub trait Touched {
 }
 
 impl Touched for SessionEntry {
-    fn touched_at(&self) -> u64 {
-        self.touched_at
+    fn is_live(&self, now: u64, ttl_seconds: u64) -> bool {
+        self.touched_at != 0
+            && now
+                < self
+                    .pending
+                    .as_ref()
+                    .map_or(self.touched_at.saturating_add(ttl_seconds), |p| {
+                        let retention = if p.is_open() {
+                            p.deadline.saturating_add(ttl_seconds)
+                        } else {
+                            p.deadline
+                        };
+                        self.touched_at.saturating_add(ttl_seconds).max(retention)
+                    })
     }
-    fn touch(&mut self) {
-        self.touched_at = now_seconds();
-    }
-}
-
-impl Touched for ElicitationEntry {
     fn touched_at(&self) -> u64 {
         self.touched_at
     }
@@ -138,16 +145,6 @@ impl Backend {
         }
     }
 
-    async fn delete(&self, key: &str) {
-        let removed = match self {
-            Backend::Local(s) => s.delete(key).await,
-            Backend::Remote(s) => s.delete(key).await,
-        };
-        if let Err(err) = removed {
-            logger::warn!("Session store delete failed for {}: {}", key_hint(key), err);
-        }
-    }
-
     /// Local storage has no TTL, so expired entries are deleted here.
     async fn sweep<T: Touched + DeserializeOwned>(&self, ttl_seconds: u64) {
         let Backend::Local(storage) = self else {
@@ -169,8 +166,6 @@ impl Backend {
 
 pub struct SessionStore {
     backend: Backend,
-    /// Present when elicitation is enabled.
-    elicitations: Option<Backend>,
     ttl_seconds: u64,
     writes: Cell<u32>,
 }
@@ -186,20 +181,16 @@ impl SessionStore {
         elicitation: bool,
     ) -> Option<Self> {
         let ttl_seconds = clamp_ttl(ttl_seconds);
-        let backend = Backend::new(builder, mode, ttl_seconds, namespace)?;
-        let elicitations = if elicitation {
-            Backend::new(
-                builder,
-                mode,
-                ttl_seconds,
-                &format!("{}/elicitation", namespace),
-            )
+        let retention = if elicitation {
+            ttl_seconds.saturating_add(crate::elicitation::MAX_TIMEOUT_SECONDS)
         } else {
-            None
+            ttl_seconds
         };
+        // Remote storage shares namespace-level TTL configuration across instances.
+        let namespace = format!("{}/retention-{}", namespace, retention);
+        let backend = Backend::new(builder, mode, retention, &namespace)?;
         Some(SessionStore {
             backend,
-            elicitations,
             ttl_seconds,
             writes: Cell::new(0),
         })
@@ -222,16 +213,12 @@ impl SessionStore {
             context_id: None,
             task_id: None,
             touched_at: now_seconds(),
+            generation: 0,
+            elicitation,
+            pending: None,
         };
         if !self.put(key, &StoreMode::Absent, &entry).await {
             return false;
-        }
-        if let (true, Some(elicitations)) = (elicitation, &self.elicitations) {
-            let entry = ElicitationEntry {
-                pending: None,
-                touched_at: now_seconds(),
-            };
-            elicitations.put(key, &StoreMode::Always, &entry).await;
         }
         true
     }
@@ -241,77 +228,81 @@ impl SessionStore {
         self.get(key).await.map(|(entry, _)| entry)
     }
 
+    pub fn ttl_seconds(&self) -> u64 {
+        self.ttl_seconds
+    }
+
     /// Remembers the latest context and pending task. A session deleted (or expired) while the
     /// call was in flight stays deleted: the compare-and-swap only updates the entry that is still
     /// there, so a late answer cannot bring a terminated session back.
-    pub async fn update(&self, key: &str, context_id: Option<String>, task_id: Option<String>) {
-        self.update_with(key, |entry| {
-            entry.context_id = context_id;
-            entry.task_id = task_id;
-            true
-        })
-        .await;
-    }
-
     /// Changes the live entry with `change`, which returns `false` to leave it as it is. The
-    /// compare-and-swap means a change decided on a stale entry is dropped, not merged.
+    /// Each of at most three CAS attempts re-reads the entry and rechecks the guard. The closure
+    /// must be retry-safe; captured outputs are valid only when this method returns `true`.
     /// Returns `true` when the change was stored.
     pub async fn update_with(
         &self,
         key: &str,
-        change: impl FnOnce(&mut SessionEntry) -> bool,
+        mut change: impl FnMut(&mut SessionEntry) -> bool,
     ) -> bool {
-        let Some((mut entry, cas)) = self.get(key).await else {
-            logger::debug!(
-                "Session {} ended before the agent answered; not remembered.",
-                key_hint(key)
-            );
-            return false;
-        };
-        if !change(&mut entry) {
-            return false;
+        for _ in 0..3 {
+            let Some((mut entry, cas)) = self.get(key).await else {
+                return false;
+            };
+            if !change(&mut entry) {
+                return false;
+            }
+            entry.touch();
+            if self.put(key, &StoreMode::Cas(cas), &entry).await {
+                return true;
+            }
         }
-        entry.touch();
-        self.put(key, &StoreMode::Cas(cas), &entry).await
+        false
     }
 
     /// The elicitation state of a session whose client declared elicitation; `None` otherwise.
     /// Callers check that the session itself is live first.
     pub async fn load_elicitation(&self, key: &str) -> Option<ElicitationEntry> {
-        let elicitations = self.elicitations.as_ref()?;
-        elicitations
-            .get(key, self.ttl_seconds)
-            .await
-            .map(|(entry, _)| entry)
+        let entry = self.load(key).await?;
+        entry.elicitation.then_some(ElicitationEntry {
+            pending: entry.pending,
+            touched_at: entry.touched_at,
+        })
     }
 
     /// Like [`update_with`](Self::update_with), for the elicitation state.
     pub async fn update_elicitation(
         &self,
         key: &str,
-        change: impl FnOnce(&mut ElicitationEntry) -> bool,
+        mut change: impl FnMut(&mut ElicitationEntry) -> bool,
     ) -> bool {
-        let Some(elicitations) = &self.elicitations else {
-            return false;
-        };
-        let Some((mut entry, cas)) = elicitations
-            .get::<ElicitationEntry>(key, self.ttl_seconds)
-            .await
-        else {
-            return false;
-        };
-        if !change(&mut entry) {
-            return false;
-        }
-        entry.touch();
-        elicitations.put(key, &StoreMode::Cas(cas), &entry).await
+        self.update_with(key, |entry| {
+            if !entry.elicitation {
+                return false;
+            }
+            let mut state = ElicitationEntry {
+                pending: entry.pending.clone(),
+                touched_at: entry.touched_at,
+            };
+            if !change(&mut state) {
+                return false;
+            }
+            entry.pending = state.pending;
+            true
+        })
+        .await
     }
 
-    pub async fn remove(&self, key: &str) {
-        self.backend.delete(key).await;
-        if let Some(elicitations) = &self.elicitations {
-            elicitations.delete(key).await;
-        }
+    pub async fn remove(&self, key: &str) -> bool {
+        let Some((mut entry, cas)) = self.get(key).await else {
+            return false;
+        };
+        entry.context_id = None;
+        entry.task_id = None;
+        entry.pending = None;
+        entry.elicitation = false;
+        entry.touched_at = 0;
+        // Do not touch the tombstone: a late CAS writer must observe the termination.
+        self.put(key, &StoreMode::Cas(cas), &entry).await
     }
 
     async fn sweep_if_due(&self) {
@@ -324,11 +315,6 @@ impl SessionStore {
             return;
         }
         self.backend.sweep::<SessionEntry>(self.ttl_seconds).await;
-        if let Some(elicitations) = &self.elicitations {
-            elicitations
-                .sweep::<ElicitationEntry>(self.ttl_seconds)
-                .await;
-        }
     }
 }
 
@@ -336,9 +322,13 @@ pub fn clamp_ttl(ttl_seconds: u64) -> u64 {
     ttl_seconds.clamp(MIN_TTL_SECONDS, MAX_TTL_SECONDS)
 }
 
-/// The Redis TTL matches the configured TTL that `is_live` checks, so both expire together.
+/// Physical retention also leaves a window to deliver expired questions and replay results.
 pub fn remote_ttl_millis(ttl_seconds: u64) -> u32 {
-    u32::try_from(clamp_ttl(ttl_seconds) * 1000).unwrap_or(u32::MAX)
+    let retention = ttl_seconds.clamp(
+        MIN_TTL_SECONDS,
+        MAX_TTL_SECONDS + crate::elicitation::MAX_TIMEOUT_SECONDS,
+    );
+    u32::try_from(retention * 1000).unwrap_or(u32::MAX)
 }
 
 /// One namespace per API instance and policy. Replicas of the same instance share it; other
@@ -434,6 +424,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_tombstone_rejects_stale_and_later_updates() {
+        use pdk::hl::*;
+
+        async fn check(launcher: Launcher, builder: DataStorageBuilder) -> anyhow::Result<()> {
+            let store = SessionStore::from_config(&builder, "remote", 60, "test-v2", true).unwrap();
+            launcher
+                .launch(on_request(|_: RequestState| async {
+                    assert!(store.register("session", true).await);
+                    let (mut stale, cas) = store.get("session").await.unwrap();
+                    assert!(store.remove("session").await);
+                    let Backend::Remote(storage) = &store.backend else {
+                        panic!("remote expected")
+                    };
+                    let (tombstone, _) = storage
+                        .get::<SessionEntry>("session")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(tombstone.touched_at, 0);
+                    assert_eq!(tombstone.context_id, None);
+                    assert_eq!(tombstone.task_id, None);
+                    assert_eq!(tombstone.pending, None);
+                    stale.context_id = Some("late".into());
+                    assert!(!store.put("session", &StoreMode::Cas(cas), &stale).await);
+                    assert!(!store.update_with("session", |_| true).await);
+                    assert!(store.load("session").await.is_none());
+                    assert!(!store.remove("session").await);
+                    Flow::Break::<()>(Response::new(204))
+                }))
+                .await?;
+            Ok(())
+        }
+
+        let mut tester = pdk_unit::UnitTestBuilder::default()
+            .with_http_upstream(
+                "x-flex-keyvalue-store",
+                crate::tests::RemoteStorage::default(),
+            )
+            .with_entrypoint(check);
+        assert_eq!(
+            tester
+                .request(pdk_unit::UnitHttpRequest::post())
+                .status_code(),
+            204
+        );
+    }
+
+    #[test]
     fn session_key_binds_scope_session_and_identity() {
         let a = session_key("scope", "s1", Some("client-a"));
         assert_eq!(a, session_key("scope", "s1", Some("client-a")));
@@ -474,11 +512,14 @@ mod tests {
     #[test]
     fn namespace_is_per_api_instance_and_policy() {
         let a = namespace(Some("api-1"), Some("/hr"), "bridge.default");
-        assert_eq!(a, "mcp-a2a-sessions/api-1/bridge.default");
+        assert_eq!(a, "mcp-a2a-sessions-v2/api-1/bridge.default");
         assert_ne!(a, namespace(Some("api-2"), Some("/hr"), "bridge.default"));
         assert_ne!(a, namespace(Some("api-1"), Some("/hr"), "other.default"));
-        assert_eq!(namespace(None, Some("/hr"), "p"), "mcp-a2a-sessions//hr/p");
-        assert_eq!(namespace(Some(""), None, "p"), "mcp-a2a-sessions/-/p");
+        assert_eq!(
+            namespace(None, Some("/hr"), "p"),
+            "mcp-a2a-sessions-v2//hr/p"
+        );
+        assert_eq!(namespace(Some(""), None, "p"), "mcp-a2a-sessions-v2/-/p");
     }
 
     #[test]
@@ -487,7 +528,7 @@ mod tests {
         assert_eq!(clamp_ttl(1800), 1800);
         assert_eq!(clamp_ttl(1_000_000), 86_400);
         assert_eq!(remote_ttl_millis(1800), 1_800_000);
-        assert_eq!(remote_ttl_millis(1_000_000), 86_400_000);
+        assert_eq!(remote_ttl_millis(1_000_000), 88_200_000);
     }
 
     #[test]
@@ -496,6 +537,9 @@ mod tests {
             context_id: None,
             task_id: None,
             touched_at: 1_000,
+            generation: 0,
+            elicitation: false,
+            pending: None,
         };
         assert!(entry.is_live(1_000 + 1_799, 1_800));
         assert!(!entry.is_live(1_000 + 1_800, 1_800));

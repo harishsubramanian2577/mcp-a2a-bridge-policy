@@ -70,7 +70,7 @@ test-coverage: build ## Run tests with coverage. Opts: FORMAT=json|html, OUTPUT_
 	cargo llvm-cov test $(_COVERAGE_FORMAT) $(_COVERAGE_OUTPUT) --ignore-filename-regex config.rs -- --nocapture
 
 .PHONY: validate-definition
-validate-definition: ## Check the definition metadata against Exchange's rules before publishing
+validate-definition: build-asset-files ## Parse the definition and check Exchange metadata before publishing
 	@python3 scripts/validate-definition.py "$(DEFINITION_SRC_GCL_PATH)" Cargo.toml
 
 .PHONY: publish

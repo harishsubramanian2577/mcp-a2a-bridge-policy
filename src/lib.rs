@@ -161,6 +161,7 @@ struct Transcoded {
     rpc_id: Value,
     session_key: Option<String>,
     mode: Mode,
+    generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -326,6 +327,12 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
             // is the spec answer, except to resume the stream of a question (elicitation).
             // Other GETs (e.g. the A2A agent card) belong to the agent.
             let wants_sse = accepts_sse(handler);
+            if wants_sse || !bridge.pass_through_a2a {
+                let version = handler.header(mcp::PROTOCOL_VERSION_HEADER);
+                if let Err(message) = mcp::check_protocol_version_header(version.as_deref()) {
+                    return http_error(400, None, mcp::INVALID_REQUEST, &message);
+                }
+            }
             if let (true, Some(_), Some(last_event_id)) = (
                 wants_sse,
                 &bridge.elicitation,
@@ -351,8 +358,7 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
                 let key = Identity::of(bridge, handler).session_key(bridge, &session_id);
                 return match key {
                     Some(key) if store.load(&key).await.is_some() => {
-                        store.remove(&key).await;
-                        plain_status(204)
+                        plain_status(if store.remove(&key).await { 204 } else { 503 })
                     }
                     _ => plain_status(404),
                 };
@@ -603,12 +609,16 @@ async fn transcode_tool_call(
     let mut open_question = None;
     if let (Some(store), Some(key), Some(_)) = (&bridge.sessions, &session_key, &bridge.elicitation)
     {
-        if let Some(state) = store.load_elicitation(key).await {
+        if let Some(state) = entry.as_ref().filter(|e| e.elicitation) {
             elicits = true;
-            match state.pending.filter(Pending::is_open) {
-                Some(pending) if session::now_seconds() >= pending.deadline => {
+            match state.pending.clone().filter(Pending::is_open) {
+                Some(pending) if pending.is_expired() => {
                     end_conversation(bridge, store, key, &pending, Ending::TimedOut).await;
                     entry = store.load(key).await;
+                    let Some(current) = &entry else {
+                        return plain_status(503);
+                    };
+                    open_question = current.pending.clone().filter(Pending::is_open);
                 }
                 pending => open_question = pending,
             }
@@ -618,6 +628,7 @@ async fn transcode_tool_call(
     // Explicit arguments replace the stored continuation as a whole: a task named by the caller
     // is never paired with a context the bridge remembered for something else.
     let explicit = call.context_id.is_some() || call.task_id.is_some();
+    let expected_entry = entry.clone();
     let (context_id, task_id) = match entry {
         _ if explicit => (call.context_id.clone(), call.task_id.clone()),
         Some(entry) if !call.new_conversation => (entry.context_id, entry.task_id),
@@ -654,6 +665,35 @@ async fn transcode_tool_call(
         );
     }
 
+    let mut generation = None;
+    if let (Some(store), Some(key), Some(expected)) =
+        (&bridge.sessions, &session_key, expected_entry)
+    {
+        let claimed = store
+            .update_with(key, |entry| {
+                if *entry != expected {
+                    return false;
+                }
+                let Some(next_generation) = entry.generation.checked_add(1) else {
+                    return false;
+                };
+                entry.generation = next_generation;
+                generation = Some(entry.generation);
+                entry.context_id = context_id.clone();
+                entry.task_id = task_id.clone();
+                true
+            })
+            .await;
+        if !claimed {
+            return rpc_result(
+                &id,
+                mcp::tool_error_result(
+                    "The session changed while starting this call; retry the call.",
+                ),
+            );
+        }
+    }
+
     if forward_to_agent(bridge, handler, headers, &a2a_request).is_err() {
         return rpc_error(
             &id,
@@ -671,6 +711,7 @@ async fn transcode_tool_call(
         rpc_id: id,
         session_key,
         mode,
+        generation,
     }))
 }
 
@@ -681,25 +722,6 @@ const QUESTION_OPEN_TEXT: &str = "The agent is waiting for the user to answer it
 fn continues(pending: &Pending, context_id: Option<&str>, task_id: Option<&str>) -> bool {
     task_id == Some(pending.task_id.as_str())
         || (context_id.is_some() && context_id == pending.context_id.as_deref())
-}
-
-/// Drops the session's stored continuation if it still belongs to the question's conversation;
-/// a call made since in another conversation keeps its own.
-async fn forget_conversation(store: &SessionStore, key: &str, pending: &Pending) {
-    store
-        .update_with(key, |entry| {
-            if !continues(
-                pending,
-                entry.context_id.as_deref(),
-                entry.task_id.as_deref(),
-            ) {
-                return false;
-            }
-            entry.context_id = None;
-            entry.task_id = None;
-            true
-        })
-        .await;
 }
 
 /// Replaces the request with `a2a_request` for the agent. The generated body decides the
@@ -754,10 +776,21 @@ async fn settle(
     let response = mcp::result_envelope(&pending.call_id(), result).to_string();
     let mut settled = None;
     let stored = store
-        .update_elicitation(key, |entry| match entry.pending.as_mut() {
-            Some(p) if p.stream == pending.stream && p.is_open() => {
-                p.finish(response);
+        .update_with(key, |entry| match entry.pending.as_mut() {
+            Some(p)
+                if p.stream == pending.stream
+                    && p.round == pending.round
+                    && p.step == pending.step
+                    && p.is_open() =>
+            {
+                p.finish(response.clone());
+                p.deadline = session::now_seconds().saturating_add(store.ttl_seconds());
                 settled = Some(p.clone());
+                if end && entry.generation == pending.generation {
+                    entry.context_id = None;
+                    entry.task_id = None;
+                    entry.generation = entry.generation.saturating_add(1);
+                }
                 true
             }
             _ => false,
@@ -765,9 +798,6 @@ async fn settle(
         .await;
     if !stored {
         return pending_of(store, key).await;
-    }
-    if end {
-        forget_conversation(store, key, pending).await;
     }
     logger::debug!("Elicitation settled (conversation ended: {}).", end);
     settled
@@ -800,7 +830,7 @@ async fn answer_elicitation(
     let Some(request_id) = envelope.get("id").and_then(Value::as_str) else {
         return plain_status(202);
     };
-    let Some(pending) = pending_of(store, &key)
+    let Some(mut pending) = pending_of(store, &key)
         .await
         .filter(|p| p.asked_request_id() == Some(request_id))
     else {
@@ -811,7 +841,7 @@ async fn answer_elicitation(
         Ok(answer) => answer,
         Err(message) => return http_error(400, None, mcp::INVALID_PARAMS, &message),
     };
-    if session::now_seconds() >= pending.deadline {
+    if pending.is_expired() {
         end_conversation(bridge, store, &key, &pending, Ending::TimedOut).await;
         return plain_status(202);
     }
@@ -856,16 +886,32 @@ async fn answer_elicitation(
     // Claiming the question first means a repeated answer is never sent to the agent twice.
     let claimed = store
         .update_elicitation(&key, |entry| match entry.pending.as_mut() {
-            Some(p) if p.asked_request_id() == Some(request_id) => {
+            Some(p) if p.asked_request_id() == Some(request_id) && !p.is_expired() => {
                 p.step = Step::Answering;
+                // Separate processing/recovery window; never reuse the user's answer deadline.
+                p.deadline =
+                    session::now_seconds().saturating_add(elicitation::MAX_TIMEOUT_SECONDS);
                 true
             }
             _ => false,
         })
         .await;
     if !claimed {
-        return plain_status(202);
+        let current = store.load(&key).await;
+        return plain_status(
+            if current.is_some_and(|entry| {
+                entry
+                    .pending
+                    .as_ref()
+                    .is_none_or(|p| p.asked_request_id() != Some(request_id))
+            }) {
+                202
+            } else {
+                503
+            },
+        );
     }
+    pending.step = Step::Answering;
     if forward_to_agent(bridge, handler, headers, &a2a_request).is_err() {
         let result = mcp::tool_error_result("Failed to forward the answer to the A2A agent");
         settle(store, &key, &pending, result, false).await;
@@ -884,6 +930,7 @@ async fn answer_elicitation(
             stream: pending.stream,
             round: pending.round,
         },
+        generation: Some(pending.generation),
     }))
 }
 
@@ -902,21 +949,23 @@ async fn cancel_elicitation(bridge: &Bridge, key: &str, params: Option<&Value>) 
     if pending.call_id() != *request_id || !pending.is_open() {
         return;
     }
-    let cleared = store
-        .update_elicitation(key, |entry| {
+    store
+        .update_with(key, |entry| {
             let open = entry
                 .pending
                 .as_ref()
                 .is_some_and(|p| p.stream == pending.stream && p.is_open());
             if open {
                 entry.pending = None;
+                if entry.generation == pending.generation {
+                    entry.context_id = None;
+                    entry.task_id = None;
+                    entry.generation = entry.generation.saturating_add(1);
+                }
             }
             open
         })
         .await;
-    if cleared {
-        forget_conversation(store, key, &pending).await;
-    }
 }
 
 /// GET with `Last-Event-ID`: the client resumes the stream of a `tools/call` that asked a
@@ -963,10 +1012,21 @@ async fn resume_stream(
     let Some(mut pending) = pending_of(store, &key).await.filter(|p| p.stream == stream) else {
         return unknown();
     };
-    if pending.is_open() && session::now_seconds() >= pending.deadline {
+    if pending.is_expired() {
         match end_conversation(bridge, store, &key, &pending, Ending::TimedOut).await {
             Some(latest) if latest.stream == pending.stream => pending = latest,
             _ => return unknown(),
+        }
+        if pending.is_expired() {
+            return plain_status(503);
+        }
+    } else if pending.step == Step::Answering && session::now_seconds() >= pending.deadline {
+        let result = mcp::tool_error_result("The agent's answer could not be persisted in time. Start a new call; do not resend the accepted answer.");
+        match settle(store, &key, &pending, result, true).await {
+            Some(latest) if latest.stream == pending.stream && latest.step != Step::Answering => {
+                pending = latest
+            }
+            _ => return plain_status(503),
         }
     }
     let fresh = last_seq < pending.seq;
@@ -999,6 +1059,8 @@ async fn response_filter(
         .handler()
         .header("content-type")
         .unwrap_or_default();
+    headers_state.handler().remove_header("content-encoding");
+    headers_state.handler().remove_header("transfer-encoding");
 
     if !headers_state.contains_body() {
         let result = mcp::tool_error_result(&format!(
@@ -1006,8 +1068,8 @@ async fn response_filter(
             status
         ));
         if let Mode::Answer { stream, round } = &transcoded.mode {
-            settle_answer(bridge, &transcoded, stream, *round, Err(result)).await;
-            headers_state.send_response(Response::new(202));
+            let settled = settle_answer(bridge, &transcoded, stream, *round, Err(result)).await;
+            headers_state.send_response(Response::new(if settled { 202 } else { 503 }));
             return;
         }
         headers_state.send_response(json_response(
@@ -1030,8 +1092,8 @@ async fn response_filter(
             logger::warn!("A2A call failed: {}", message);
         }
         let outcome = parsed.map_err(|message| mcp::tool_error_result(&message));
-        settle_answer(bridge, &transcoded, stream, *round, outcome).await;
-        handler.set_header(":status", "202");
+        let settled = settle_answer(bridge, &transcoded, stream, *round, outcome).await;
+        handler.set_header(":status", if settled { "202" } else { "503" });
         handler.remove_header("content-type");
         handler.remove_header("content-length");
         if let Err(err) = handler.set_body(b"") {
@@ -1131,22 +1193,31 @@ async fn start_elicitation(
         return None;
     };
     let deadline = session::now_seconds() + settings.timeout_seconds;
-    let pending = Pending::first(session::random_uuid()?, &transcoded.rpc_id, reply, deadline)?;
+    let mut pending = Pending::first(session::random_uuid()?, &transcoded.rpc_id, reply, deadline)?;
+    pending.generation = transcoded.generation?;
     let stream = elicitation::question_stream(&pending)?;
     // Never replaces a question still open, e.g. one asked by a concurrent call.
     let stored = store
-        .update_elicitation(key, |entry| {
-            if entry.pending.as_ref().is_some_and(Pending::is_open) {
+        .update_with(key, |entry| {
+            if entry.generation != pending.generation
+                || entry
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.is_open() || session::now_seconds() < p.deadline)
+            {
                 return false;
             }
-            entry.pending = Some(pending);
+            if reply.context_id.is_some() {
+                entry.context_id = reply.context_id.clone();
+            }
+            entry.task_id = reply.task_id.clone();
+            entry.pending = Some(pending.clone());
             true
         })
         .await;
     if !stored {
         return None;
     }
-    remember(bridge, transcoded, reply).await;
     Some(stream)
 }
 
@@ -1159,13 +1230,13 @@ async fn settle_answer(
     stream: &str,
     round: u32,
     outcome: Result<a2a::AgentReply, Value>,
-) {
+) -> bool {
     let (Some(store), Some(key), Some(settings)) = (
         &bridge.sessions,
         &transcoded.session_key,
         &bridge.elicitation,
     ) else {
-        return;
+        return false;
     };
     let ask_again = matches!(&outcome, Ok(reply) if elicitation::is_elicitable(reply))
         && round < settings.max_rounds;
@@ -1184,27 +1255,45 @@ async fn settle_answer(
         ),
     };
     let deadline = session::now_seconds() + settings.timeout_seconds;
+    let mut superseded = false;
     let stored = store
-        .update_elicitation(key, |entry| match entry.pending.as_mut() {
-            Some(p) if p.stream == stream && p.round == round && p.step == Step::Answering => {
+        .update_with(key, |entry| match entry.pending.as_mut() {
+            Some(p)
+                if p.stream == stream
+                    && p.round == round
+                    && p.step == Step::Answering
+                    && Some(p.generation) == transcoded.generation =>
+            {
                 match &outcome {
                     Ok(reply) if ask_again => p.ask_again(reply, deadline),
-                    _ => p.finish(response),
+                    _ => {
+                        p.finish(response.clone());
+                        p.deadline = session::now_seconds().saturating_add(store.ttl_seconds());
+                    }
+                }
+                if entry.generation == p.generation && fit != mcp::Fit::Replaced {
+                    if let Ok(reply) = &outcome {
+                        if reply.context_id.is_some() {
+                            entry.context_id = reply.context_id.clone();
+                        }
+                        entry.task_id = reply
+                            .task_id
+                            .clone()
+                            .filter(|_| reply.state.awaits_client());
+                    }
                 }
                 true
             }
-            _ => false,
+            _ => {
+                superseded = true;
+                false
+            }
         })
         .await;
-    match outcome {
-        Ok(reply) if stored && fit != mcp::Fit::Replaced => {
-            remember(bridge, transcoded, &reply).await
-        }
-        _ if !stored => {
-            logger::debug!("The question was settled before the agent answered; reply dropped.")
-        }
-        _ => {}
+    if !stored && !superseded {
+        logger::error!("Failed to persist the agent's elicitation reply after bounded retries.");
     }
+    stored || superseded
 }
 
 /// Records the reply's context and, while the agent waits on the caller, its task. A task-only
@@ -1215,18 +1304,24 @@ async fn remember(bridge: &Bridge, transcoded: &Transcoded, reply: &a2a::AgentRe
     let (Some(store), Some(key)) = (&bridge.sessions, &transcoded.session_key) else {
         return;
     };
+    let Some(generation) = transcoded.generation else {
+        return;
+    };
     let pending_task = reply
         .task_id
         .clone()
         .filter(|_| reply.state.awaits_client());
-    if reply.context_id.is_none() && pending_task.is_none() {
-        store
-            .update_with(key, |entry| entry.task_id.take().is_some())
-            .await;
-        return;
-    }
     store
-        .update(key, reply.context_id.clone(), pending_task)
+        .update_with(key, |entry| {
+            if entry.generation != generation {
+                return false;
+            }
+            if reply.context_id.is_some() {
+                entry.context_id = reply.context_id.clone();
+            }
+            entry.task_id = pending_task.clone();
+            true
+        })
         .await;
 }
 

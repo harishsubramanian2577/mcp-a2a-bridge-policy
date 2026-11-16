@@ -55,7 +55,12 @@ spec:
         - local
         - remote
       default: disabled
-      description: Optional server-side map from MCP session to A2A contextId/taskId, used only when the client omits context_id. Session ids are random, issued at initialize and scoped to this API instance and policy. local is per-replica in-memory; remote shares sessions across replicas through the gateway's shared storage: built in on managed Omni Gateway, which always runs at least two replicas; on self-managed gateways configure Shared Storage (Redis or distributed), or policy startup fails.
+      description: >-
+        Optional server-side continuation when the client omits both context_id and task_id.
+        Session ids are random, issued at initialize and scoped to this API instance and policy.
+        local is per-replica in-memory; remote shares sessions through the gateway's shared storage:
+        built in on managed Omni Gateway; on self-managed gateways configure Shared Storage.
+        Changing the TTL or elicitation setting requires clients to initialize again.
     sessionTtlSeconds:
       type: integer
       default: 1800
@@ -69,13 +74,13 @@ spec:
     enableElicitation:
       type: boolean
       default: false
-      description: "Experimental. When the agent needs input (input-required), ask the user through MCP elicitation instead of returning the question as a tool result. Used only when a session store is enabled, the client declared the elicitation capability at initialize (protocol 2025-06-18) and supports resuming SSE streams with Last-Event-ID; otherwise the question is returned as a tool result with continuation ids. ChatGPT does not support elicitation, so leave this off for ChatGPT clients."
+      description: "Experimental, off by default. Form elicitation requires a session store, negotiated client support, SSE resumption, and trusted Task metadata p4a.elicitationSafe=true asserting the question requests no sensitive information. Otherwise return a client-managed result. Never mark credential requests as safe. Leave off for ChatGPT."
     elicitationTimeoutSeconds:
       type: integer
       default: 300
       minimum: 30
       maximum: 1800
-      description: How long the bridge waits for the user's answer to one elicitation. When it expires the conversation is ended and the tool call returns a timeout result. Capped by sessionTtlSeconds.
+      description: How long the bridge waits for the user's answer to one elicitation. Accepted answers are governed by the upstream request timeout, not this input deadline. Pending questions retain the session until their deadline plus a result replay window.
     maxElicitationRounds:
       type: integer
       default: 3

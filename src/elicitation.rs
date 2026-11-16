@@ -53,13 +53,13 @@ pub struct Settings {
 
 impl Settings {
     /// `None` unless enabled and a session store exists to hold the question between requests.
-    /// The wait is capped by the session TTL, since an expired session cannot be resumed.
+    /// Pending questions retain the session through their deadline plus a replay window.
     pub fn from_config(
         enabled: bool,
         has_store: bool,
         timeout_seconds: Option<i64>,
         max_rounds: Option<i64>,
-        session_ttl_seconds: u64,
+        _session_ttl_seconds: u64,
     ) -> Option<Self> {
         if !enabled || !has_store {
             return None;
@@ -67,9 +67,7 @@ impl Settings {
         let timeout = timeout_seconds.unwrap_or(300).max(0) as u64;
         let rounds = max_rounds.unwrap_or(3).clamp(1, MAX_ROUNDS_LIMIT as i64) as u32;
         Some(Settings {
-            timeout_seconds: timeout
-                .clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS)
-                .min(session_ttl_seconds),
+            timeout_seconds: timeout.clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS),
             max_rounds: rounds,
         })
     }
@@ -79,6 +77,7 @@ impl Settings {
 /// Plain types only: the store serialises with bincode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pending {
+    pub generation: u64,
     /// Random id of this `tools/call`'s event stream; event ids are `<stream>-<seq>`.
     pub stream: String,
     /// The `tools/call` request id the final result answers, as JSON text.
@@ -118,6 +117,7 @@ impl Pending {
         let task_id = reply.task_id.clone()?;
         let request_id = request_id(&stream, 1);
         Some(Pending {
+            generation: 0,
             stream,
             call_id: call_id.to_string(),
             context_id: reply.context_id.clone(),
@@ -158,6 +158,10 @@ impl Pending {
         !matches!(self.step, Step::Done { .. })
     }
 
+    pub fn is_expired(&self) -> bool {
+        matches!(self.step, Step::Asked { .. }) && crate::session::now_seconds() >= self.deadline
+    }
+
     pub fn asked_request_id(&self) -> Option<&str> {
         match &self.step {
             Step::Asked { request_id, .. } => Some(request_id),
@@ -196,6 +200,7 @@ pub fn version_supports(negotiated: &str) -> bool {
 /// `auth-required` is never elicited, because form mode must not collect credentials.
 pub fn is_elicitable(reply: &AgentReply) -> bool {
     reply.state == TaskState::InputRequired
+        && reply.safe_elicitation
         && reply.task_id.is_some()
         && reply.texts.iter().map(String::len).sum::<usize>() <= MAX_QUESTION_BYTES
 }
@@ -362,6 +367,7 @@ pub fn client_managed_reply(pending: &Pending) -> AgentReply {
         task_id: Some(pending.task_id.clone()),
         texts: vec![question],
         data: Vec::new(),
+        safe_elicitation: false,
     }
 }
 
@@ -376,6 +382,7 @@ mod tests {
             task_id: task.map(str::to_string),
             texts: texts.iter().map(|t| t.to_string()).collect(),
             data: Vec::new(),
+            safe_elicitation: true,
         }
     }
 
@@ -398,12 +405,12 @@ mod tests {
         assert_eq!((s.timeout_seconds, s.max_rounds), (30, 1));
         let s = Settings::from_config(true, true, Some(99_999), Some(99), 1800).unwrap();
         assert_eq!((s.timeout_seconds, s.max_rounds), (1800, 10));
-        // An expired session cannot be resumed, so the TTL caps the wait.
+        // A question's retention outlives the ordinary idle session TTL.
         assert_eq!(
             Settings::from_config(true, true, Some(900), None, 120)
                 .unwrap()
                 .timeout_seconds,
-            120
+            900
         );
     }
 

@@ -24,6 +24,347 @@ fn config(store: &str) -> String {
 
 type Agent = Rc<TraceBackend<Box<dyn Fn(UnitHttpRequest) -> UnitHttpResponse>>>;
 
+// Opaque PDK serialization and conditional writes through the public shared-storage contract.
+// DELETE is deliberately unsupported: termination must perform a checked CAS PUT.
+#[derive(Default)]
+pub(crate) struct RemoteStorage {
+    entries: std::cell::RefCell<std::collections::HashMap<String, (Value, u64)>>,
+    ttls: std::cell::RefCell<std::collections::HashMap<String, u64>>,
+    fail_cas: std::cell::Cell<Option<u32>>,
+    cas_failures: std::cell::RefCell<std::collections::VecDeque<u32>>,
+}
+
+impl pdk_unit::Backend for RemoteStorage {
+    fn call(&self, request: UnitHttpRequest) -> UnitHttpResponse {
+        let path = request.header(":path").unwrap();
+        match request.header(":method").unwrap() {
+            "PUT" if !path.contains("/keys/") => {
+                let body = json_body(&request);
+                self.ttls
+                    .borrow_mut()
+                    .entry(path.to_string())
+                    .or_insert(body["defaultTtlSeconds"].as_u64().unwrap());
+                UnitHttpResponse::new(201)
+            }
+            "PUT" => {
+                let mut entries = self.entries.borrow_mut();
+                if let Some(cas) = request.header("if-match") {
+                    if let Some(status) = self.cas_failures.borrow_mut().pop_front() {
+                        if status == 412 {
+                            // An independent writer advances the opaque session's CAS token.
+                            entries.get_mut(path).unwrap().1 += 1;
+                        }
+                        return UnitHttpResponse::new(status);
+                    }
+                    if let Some(status) = self.fail_cas.take() {
+                        return UnitHttpResponse::new(status);
+                    }
+                    if entries
+                        .get(path)
+                        .is_none_or(|(_, version)| version.to_string() != cas)
+                    {
+                        return UnitHttpResponse::new(412);
+                    }
+                } else if request.header("if-none-match").is_some() && entries.contains_key(path) {
+                    return UnitHttpResponse::new(412);
+                }
+                let store_path = path.split_once("/partitions/").unwrap().0;
+                if !self.ttls.borrow().contains_key(store_path) {
+                    return UnitHttpResponse::new(404)
+                        .with_body(r#"{"message":"store not found"}"#);
+                }
+                let version = entries.get(path).map_or(1, |(_, version)| version + 1);
+                entries.insert(path.to_string(), (json_body(&request), version));
+                UnitHttpResponse::new(201)
+            }
+            "GET" => match self.entries.borrow().get(path) {
+                Some((body, version)) => UnitHttpResponse::new(200)
+                    .with_header("etag", version.to_string())
+                    .with_body(body.to_string()),
+                None => UnitHttpResponse::new(404)
+                    .with_body(r#"{"message":"object with key not found"}"#),
+            },
+            _ => UnitHttpResponse::new(503),
+        }
+    }
+}
+
+#[test]
+fn remote_termination_requires_a_successful_cas_write() {
+    let storage = Rc::new(RemoteStorage::default());
+    let backend = agent(SAMPLE_RESPONSE);
+    let mut tester = UnitTestBuilder::default()
+        .with_config(config("remote"))
+        .with_http_upstream("x-flex-keyvalue-store", Rc::clone(&storage))
+        .with_backend(Rc::clone(&backend))
+        .with_entrypoint(crate::configure);
+    let sid = start_session(&mut tester, &[]);
+    for status in [503, 412] {
+        storage.fail_cas.set(Some(status));
+        assert_eq!(
+            tester
+                .request(in_session(
+                    UnitHttpRequest::delete().with_path("/mcp"),
+                    &sid
+                ))
+                .status_code(),
+            503
+        );
+        assert_eq!(
+            tester
+                .request(in_session(
+                    mcp_post(json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" })),
+                    &sid
+                ))
+                .status_code(),
+            200
+        );
+    }
+    assert_eq!(
+        tester
+            .request(in_session(
+                UnitHttpRequest::delete().with_path("/mcp"),
+                &sid
+            ))
+            .status_code(),
+        204
+    );
+    assert_eq!(
+        tester
+            .request(in_session(
+                mcp_post(tools_call(3, json!({ "message": "Again" }))),
+                &sid
+            ))
+            .status_code(),
+        404
+    );
+    assert_eq!(
+        tester
+            .request(in_session(
+                UnitHttpRequest::delete().with_path("/mcp"),
+                &sid
+            ))
+            .status_code(),
+        404
+    );
+    assert!(backend.next().is_none());
+}
+
+#[test]
+fn remote_answer_settlement_retries_contention_and_reports_exhaustion() {
+    for failures in [vec![412], vec![503, 503, 503]] {
+        crate::session::test_clock::OFFSET.with(|o| o.set(0));
+        let storage = Rc::new(RemoteStorage::default());
+        let upstream_storage = Rc::clone(&storage);
+        let failures = failures.clone();
+        let expected_status = if failures.len() == 1 { 202 } else { 503 };
+        let replies = std::cell::RefCell::new(std::collections::VecDeque::from([
+            asks("City?"),
+            completes("Booked"),
+        ]));
+        let backend: Agent = Rc::new(TraceBackend::new(Box::new(
+            move |request: UnitHttpRequest| {
+                let mut reply = replies.borrow_mut().pop_front().unwrap();
+                reply["id"] = json_body(&request)["id"].clone();
+                if replies.borrow().is_empty() {
+                    upstream_storage
+                        .cas_failures
+                        .borrow_mut()
+                        .extend(failures.clone());
+                }
+                UnitHttpResponse::new(200)
+                    .with_header("content-type", "application/json")
+                    .with_body(reply.to_string())
+            },
+        )));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config_with("remote", json!({ "enableElicitation": true })))
+            .with_http_upstream("x-flex-keyvalue-store", Rc::clone(&storage))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(crate::configure);
+        let sid = elicit_session(&mut tester);
+        let (event, question) =
+            question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+        assert_eq!(
+            respond(&mut tester, &sid, &question["id"], accept("Paris")).status_code(),
+            expected_status
+        );
+        assert!(storage.cas_failures.borrow().is_empty());
+        if expected_status == 202 {
+            assert_eq!(
+                result_on(&resume(&mut tester, &sid, &event), 5)["content"][0]["text"],
+                "Booked"
+            );
+        } else {
+            crate::session::test_clock::advance(crate::elicitation::MAX_TIMEOUT_SECONDS + 1);
+            let recovered = resume(&mut tester, &sid, &event);
+            crate::session::test_clock::OFFSET.with(|o| o.set(0));
+            let result = result_on(&recovered, 5);
+            assert_eq!(result["isError"], true);
+            assert!(result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("do not resend"));
+        }
+    }
+}
+
+#[test]
+fn remote_failed_timeout_cas_never_forwards_the_expired_continuation() {
+    crate::session::test_clock::OFFSET.with(|o| o.set(0));
+    let storage = Rc::new(RemoteStorage::default());
+    let backend = scripted_agent(vec![asks("City?"), completes("Fresh")]);
+    let mut tester = UnitTestBuilder::default()
+        .with_config(config_with(
+            "remote",
+            json!({ "enableElicitation": true, "elicitationTimeoutSeconds": 30 }),
+        ))
+        .with_http_upstream("x-flex-keyvalue-store", Rc::clone(&storage))
+        .with_backend(Rc::clone(&backend))
+        .with_entrypoint(crate::configure);
+    let sid = elicit_session(&mut tester);
+    let (event, _) = question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+    backend.next();
+    crate::session::test_clock::advance(31);
+    storage.cas_failures.borrow_mut().extend([412, 412, 412]);
+    let refused = call_in(&mut tester, &sid, 6, json!({ "message": "Continue" }));
+    assert_eq!(json_body(&refused)["result"]["isError"], true);
+    assert!(
+        backend.next().is_none(),
+        "the expired task must not receive an implicit call"
+    );
+    storage.fail_cas.set(Some(412));
+    call_in(&mut tester, &sid, 7, json!({ "message": "Retry" }));
+    let outbound = json_body(&backend.next().unwrap());
+    assert!(outbound["params"]["message"].get("taskId").is_none());
+    assert!(outbound["params"]["message"].get("contextId").is_none());
+    let timed_out = resume(&mut tester, &sid, &event);
+    crate::session::test_clock::OFFSET.with(|o| o.set(0));
+    assert_eq!(
+        result_on(&timed_out, 5)["structuredContent"]["reason"],
+        "timeout"
+    );
+}
+
+#[test]
+fn remote_retention_is_scoped_to_configuration_and_preserves_timeout_delivery() {
+    crate::session::test_clock::OFFSET.with(|o| o.set(0));
+    let storage = Rc::new(RemoteStorage::default());
+    let backend = scripted_agent(vec![asks("Which city?")]);
+    let mut tester = UnitTestBuilder::default()
+        .with_config(config_with("remote", json!({ "enableElicitation": true, "sessionTtlSeconds": 60, "elicitationTimeoutSeconds": 120 })))
+        .with_http_upstream("x-flex-keyvalue-store", Rc::clone(&storage))
+        .with_backend(Rc::clone(&backend)).with_entrypoint(crate::configure);
+    let sid = elicit_session(&mut tester);
+    let (event, _) = question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+    crate::session::test_clock::advance(121);
+    let response = resume(&mut tester, &sid, &event);
+    crate::session::test_clock::OFFSET.with(|o| o.set(0));
+    assert_eq!(
+        result_on(&response, 5)["structuredContent"]["reason"],
+        "timeout"
+    );
+    assert!(storage
+        .ttls
+        .borrow()
+        .iter()
+        .any(|(path, ttl)| path.ends_with("%2Fretention-1860") && *ttl == 1860));
+    let mut plain = UnitTestBuilder::default()
+        .with_config(config_with("remote", json!({ "sessionTtlSeconds": 60 })))
+        .with_http_upstream("x-flex-keyvalue-store", Rc::clone(&storage))
+        .with_backend(Rc::clone(&backend))
+        .with_entrypoint(crate::configure);
+    assert_eq!(
+        plain
+            .request(in_session(
+                mcp_post(json!({ "jsonrpc": "2.0", "id": 9, "method": "ping" })),
+                &sid
+            ))
+            .status_code(),
+        404
+    );
+    start_session(&mut plain, &[]);
+    assert!(storage
+        .ttls
+        .borrow()
+        .iter()
+        .any(|(path, ttl)| path.ends_with("%2Fretention-60") && *ttl == 60));
+}
+
+#[test]
+fn mcp_get_validates_protocol_before_405_but_native_routes_pass_through() {
+    let backend = agent("{}");
+    let mut tester = tester_for(config("local"), &backend);
+    let request = |path: &str, version: &str| {
+        UnitHttpRequest::get()
+            .with_path(path)
+            .with_header("accept", "text/event-stream")
+            .with_header("mcp-protocol-version", version)
+    };
+    assert_eq!(
+        tester.request(request("/mcp", "bad-version")).status_code(),
+        400
+    );
+    assert_eq!(
+        tester.request(request("/mcp", "2025-06-18")).status_code(),
+        405
+    );
+    assert!(backend.next().is_none());
+    assert_eq!(
+        tester
+            .request(request("/tasks/t1:subscribe", "bad-version"))
+            .status_code(),
+        200
+    );
+    assert_eq!(
+        backend.next().unwrap().header("mcp-protocol-version"),
+        Some("bad-version")
+    );
+}
+
+#[test]
+fn rewritten_responses_remove_encoding_headers_in_every_mode() {
+    let replies = std::cell::RefCell::new(std::collections::VecDeque::from([
+        asks("Which city?"),
+        completes("Booked"),
+        completes("Plain"),
+        completes("Native"),
+    ]));
+    let backend: Agent = Rc::new(TraceBackend::new(Box::new(
+        move |request: UnitHttpRequest| {
+            let mut reply = replies.borrow_mut().pop_front().unwrap();
+            reply["id"] = json_body(&request)["id"].clone();
+            UnitHttpResponse::new(200)
+                .with_header("content-type", "application/json")
+                .with_header("content-encoding", "identity")
+                .with_header("transfer-encoding", "chunked")
+                .with_body(reply.to_string())
+        },
+    )));
+    let mut tester = tester_for(elicit_config(json!({})), &backend);
+    let sid = elicit_session(&mut tester);
+    let response = call_in(&mut tester, &sid, 5, json!({ "message": "Book" }));
+    let (_, question) = question_on(&response);
+    let answer = respond(&mut tester, &sid, &question["id"], accept("Paris"));
+    let plain = tester.request(in_session(
+        UnitHttpRequest::post()
+            .with_path("/mcp")
+            .with_header("content-type", "application/json")
+            .with_header("accept", "application/json")
+            .with_body(tools_call(6, json!({ "message": "Plain" })).to_string()),
+        &sid,
+    ));
+    for rewritten in [response, answer, plain] {
+        assert_eq!(rewritten.header("content-encoding"), None);
+        assert_eq!(rewritten.header("transfer-encoding"), None);
+    }
+    let native = tester.request(mcp_post(
+        json!({ "jsonrpc": "2.0", "id": 7, "method": "SendMessage", "params": {} }),
+    ));
+    assert_eq!(native.header("content-encoding"), Some("identity"));
+    assert_eq!(native.header("transfer-encoding"), Some("chunked"));
+}
+
 /// A mock agent that answers with `body`, relabelled with the JSON-RPC id of the request it
 /// receives, as a real agent would. The bridge checks that the answer matches its request.
 fn agent(body: &str) -> Agent {
@@ -1336,7 +1677,9 @@ fn agent_task(state: &str, task: &str, context: Option<&str>, text: &str) -> Val
 }
 
 fn asks(question: &str) -> Value {
-    agent_task("TASK_STATE_INPUT_REQUIRED", "t1", Some("ctx-1"), question)
+    let mut reply = agent_task("TASK_STATE_INPUT_REQUIRED", "t1", Some("ctx-1"), question);
+    reply["result"]["task"]["metadata"] = json!({ "p4a.elicitationSafe": true });
+    reply
 }
 
 fn completes(text: &str) -> Value {
@@ -1614,6 +1957,289 @@ fn accepted_answer_resumes_the_task_and_the_result_arrives_on_the_resumed_stream
 }
 
 #[test]
+fn review_rereview_accepted_answer_deadline() {
+    use pdk::data_storage::DataStorageBuilder;
+    use pdk::hl::*;
+    use pdk::metadata::Metadata;
+
+    async fn staged_configure(
+        launcher: Launcher,
+        Configuration(bytes): Configuration,
+        builder: DataStorageBuilder,
+        metadata: Metadata,
+    ) -> anyhow::Result<()> {
+        let bridge = crate::Bridge::new(serde_json::from_slice(&bytes)?, &builder, &metadata);
+        let filter = on_request(|state| async {
+            let flow = crate::request_filter(state, &bridge).await;
+            if let Flow::Continue(Some(transcoded)) = &flow {
+                if matches!(transcoded.mode, crate::Mode::Answer { .. }) {
+                    let store = bridge.sessions.as_ref().unwrap();
+                    let key = transcoded.session_key.as_ref().unwrap();
+                    assert_eq!(
+                        crate::pending_of(store, key).await.unwrap().step,
+                        crate::Step::Answering
+                    );
+                    // Test-only staging: the real request filter accepted and claimed the
+                    // answer; leave its agent response pending instead of calling the backend.
+                    return Flow::Break(Response::new(202));
+                }
+            }
+            flow
+        })
+        .on_response(|state, data| crate::response_filter(state, data, &bridge));
+        launcher.launch(filter).await?;
+        Ok(())
+    }
+
+    crate::session::test_clock::OFFSET.with(|o| o.set(0));
+    let backend = scripted_agent(vec![asks("Which city?")]);
+    let mut tester = UnitTestBuilder::default()
+        .with_config(elicit_config(json!({ "elicitationTimeoutSeconds": 30 })))
+        .with_backend(Rc::clone(&backend))
+        .with_entrypoint(staged_configure);
+    let sid = elicit_session(&mut tester);
+    let (event_id, question) =
+        question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+    backend.next().expect("the initial call reached the agent");
+
+    crate::session::test_clock::advance(1);
+    let ack = respond(&mut tester, &sid, &question["id"], accept("Paris"));
+    assert_eq!(ack.status_code(), 202);
+    assert!(
+        backend.next().is_none(),
+        "the agent response is deliberately staged"
+    );
+    // A duplicate is already ignored: the original answer has transitioned to Answering.
+    assert_eq!(
+        respond(&mut tester, &sid, &question["id"], accept("Paris")).status_code(),
+        202
+    );
+    assert!(
+        backend.next().is_none(),
+        "the duplicate must not reach the agent"
+    );
+
+    crate::session::test_clock::advance(31);
+    let resumed = resume(&mut tester, &sid, &event_id);
+    crate::session::test_clock::OFFSET.with(|o| o.set(0));
+
+    assert!(
+        is_waiting(&resumed, &event_id),
+        "an accepted answer awaiting the agent must not become a user-input timeout: {}",
+        String::from_utf8_lossy(resumed.body())
+    );
+}
+
+#[test]
+fn review_rereview_secret_request_must_not_elicit() {
+    let backend = scripted_agent(vec![agent_task(
+        "TASK_STATE_INPUT_REQUIRED",
+        "t1",
+        Some("ctx-1"),
+        "Enter your password",
+    )]);
+    let mut tester = tester_for(elicit_config(json!({})), &backend);
+    let sid = elicit_session(&mut tester);
+    let response = call_in(&mut tester, &sid, 5, json!({ "message": "Sign in" }));
+    backend.next().expect("the call reached the agent");
+    assert!(
+        !String::from_utf8_lossy(response.body()).contains("\"method\":\"elicitation/create\""),
+        "an input-required credential request must not become form elicitation: {}",
+        String::from_utf8_lossy(response.body())
+    );
+}
+
+#[test]
+fn review_completed_stream_survives_a_new_question() {
+    let backend = scripted_agent(vec![
+        asks("Which city?"),
+        completes("Booked"),
+        asks("Which date?"),
+    ]);
+    let mut tester = tester_for(elicit_config(json!({})), &backend);
+    let sid = elicit_session(&mut tester);
+    let (event, question) =
+        question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+    respond(&mut tester, &sid, &question["id"], accept("Paris"));
+    let next = call_in(
+        &mut tester,
+        &sid,
+        6,
+        json!({ "message": "Another booking", "new_conversation": true }),
+    );
+    assert_eq!(
+        result_on(&next, 6)["structuredContent"]["state"],
+        "input-required"
+    );
+    assert_eq!(
+        result_on(&resume(&mut tester, &sid, &event), 5)["content"][0]["text"],
+        "Booked"
+    );
+}
+
+#[test]
+fn review_short_session_ttl_still_delivers_question_timeout() {
+    crate::session::test_clock::OFFSET.with(|o| o.set(0));
+    let backend = scripted_agent(vec![asks("Which city?")]);
+    let mut tester = tester_for(
+        elicit_config(json!({ "sessionTtlSeconds": 60, "elicitationTimeoutSeconds": 120 })),
+        &backend,
+    );
+    let sid = elicit_session(&mut tester);
+    let (event, _) = question_on(&call_in(&mut tester, &sid, 5, json!({ "message": "Book" })));
+    crate::session::test_clock::advance(121);
+    let response = resume(&mut tester, &sid, &event);
+    crate::session::test_clock::OFFSET.with(|o| o.set(0));
+    assert_eq!(
+        result_on(&response, 5)["structuredContent"]["reason"],
+        "timeout"
+    );
+}
+
+#[test]
+fn review_active_session_keeps_negotiated_elicitation() {
+    crate::session::test_clock::OFFSET.with(|o| o.set(0));
+    let backend = scripted_agent(vec![
+        completes("First"),
+        completes("Second"),
+        asks("Which city?"),
+    ]);
+    let mut tester = tester_for(elicit_config(json!({ "sessionTtlSeconds": 60 })), &backend);
+    let sid = elicit_session(&mut tester);
+    for id in [2, 3] {
+        crate::session::test_clock::advance(40);
+        call_in(&mut tester, &sid, id, json!({ "message": "Continue" }));
+    }
+    crate::session::test_clock::advance(40);
+    let response = call_in(&mut tester, &sid, 5, json!({ "message": "Book" }));
+    crate::session::test_clock::OFFSET.with(|o| o.set(0));
+    question_on(&response);
+}
+
+#[test]
+fn review_reset_does_not_restore_context_from_a_contextless_reply() {
+    let backend = scripted_agent(vec![
+        completes("First"),
+        agent_task("TASK_STATE_COMPLETED", "t2", None, "Reset"),
+        completes("Fresh"),
+    ]);
+    let mut tester = tester_for(config("local"), &backend);
+    let sid = start_session(&mut tester, &[]);
+    call_in(&mut tester, &sid, 1, json!({ "message": "Start" }));
+    backend.next();
+    call_in(
+        &mut tester,
+        &sid,
+        2,
+        json!({ "message": "Reset", "new_conversation": true }),
+    );
+    backend.next();
+    call_in(&mut tester, &sid, 3, json!({ "message": "Continue" }));
+    let outbound = json_body(&backend.next().unwrap());
+    assert!(
+        outbound["params"]["message"].get("contextId").is_none(),
+        "{}",
+        outbound
+    );
+}
+
+#[test]
+fn review_correlated_session_transitions_ignore_stale_owners() {
+    use pdk::data_storage::DataStorageBuilder;
+    use pdk::hl::*;
+    use pdk::metadata::Metadata;
+
+    async fn check_transitions(
+        launcher: Launcher,
+        Configuration(bytes): Configuration,
+        builder: DataStorageBuilder,
+        metadata: Metadata,
+    ) -> anyhow::Result<()> {
+        let bridge = crate::Bridge::new(serde_json::from_slice(&bytes)?, &builder, &metadata);
+        launcher
+            .launch(on_request(|_: RequestState| async {
+                let store = bridge.sessions.as_ref().unwrap();
+                let key = "test-owned-session";
+                assert!(store.register(key, true).await);
+                let first = crate::a2a::parse_agent_response(
+                    200,
+                    "application/json",
+                    asks("City?").to_string().as_bytes(),
+                    &json!("x"),
+                )
+                .unwrap();
+                let call = crate::Transcoded {
+                    rpc_id: json!(5),
+                    session_key: Some(key.into()),
+                    mode: crate::Mode::MayElicit,
+                    generation: Some(0),
+                };
+                assert!(crate::start_elicitation(&bridge, &call, &first)
+                    .await
+                    .is_some());
+                let old_question = crate::pending_of(store, key).await.unwrap();
+                assert!(
+                    store
+                        .update_elicitation(key, |entry| {
+                            entry.pending.as_mut().unwrap().step = crate::Step::Answering;
+                            true
+                        })
+                        .await
+                );
+                crate::settle_answer(&bridge, &call, &old_question.stream, 1, Ok(first.clone()))
+                    .await;
+                let current = crate::pending_of(store, key).await.unwrap();
+                assert_eq!(current.round, 2);
+                // A decline/error read from round one cannot settle round two.
+                crate::settle(store, key, &old_question, json!({}), true).await;
+                assert_eq!(crate::pending_of(store, key).await.unwrap(), current);
+                // Another conversation owns the continuation, but not this question's stream.
+                assert!(
+                    store
+                        .update_with(key, |entry| {
+                            entry.generation = 1;
+                            entry.context_id = Some("new-context".into());
+                            entry.task_id = Some("new-task".into());
+                            true
+                        })
+                        .await
+                );
+                let terminal = crate::a2a::parse_agent_response(
+                    200,
+                    "application/json",
+                    agent_task("TASK_STATE_COMPLETED", "old-task", None, "Done")
+                        .to_string()
+                        .as_bytes(),
+                    &json!("x"),
+                )
+                .unwrap();
+                crate::remember(&bridge, &call, &first).await;
+                crate::remember(&bridge, &call, &terminal).await;
+                let latest = store.load(key).await.unwrap();
+                assert_eq!(latest.context_id.as_deref(), Some("new-context"));
+                assert_eq!(latest.task_id.as_deref(), Some("new-task"));
+                // Cancelling the independent old question must preserve the newer conversation.
+                crate::cancel_elicitation(&bridge, key, Some(&json!({ "requestId": 5 }))).await;
+                assert!(crate::pending_of(store, key).await.is_none());
+                crate::remember(&bridge, &call, &first).await;
+                let latest = store.load(key).await.unwrap();
+                assert_eq!(latest.context_id.as_deref(), Some("new-context"));
+                assert_eq!(latest.task_id.as_deref(), Some("new-task"));
+                Flow::Break::<Option<crate::Transcoded>>(Response::new(204))
+            }))
+            .await?;
+        Ok(())
+    }
+    let backend = agent("{}");
+    let mut tester = UnitTestBuilder::default()
+        .with_config(elicit_config(json!({})))
+        .with_backend(Rc::clone(&backend))
+        .with_entrypoint(check_transitions);
+    assert_eq!(tester.request(mcp_post(initialize(1))).status_code(), 204);
+    assert!(backend.next().is_none());
+}
+
+#[test]
 fn repeated_questions_stop_at_the_round_limit() {
     let backend = scripted_agent(vec![
         asks("Which city?"),
@@ -1849,8 +2475,10 @@ fn auth_required_and_task_less_questions_are_never_elicited() {
 
 #[test]
 fn a_question_without_context_resumes_with_the_task_only() {
+    let mut question = agent_task("TASK_STATE_INPUT_REQUIRED", "t9", None, "Which city?");
+    question["result"]["task"]["metadata"] = json!({ "p4a.elicitationSafe": true });
     let backend = scripted_agent(vec![
-        agent_task("TASK_STATE_INPUT_REQUIRED", "t9", None, "Which city?"),
+        question,
         agent_task("TASK_STATE_COMPLETED", "t9", None, "Done"),
     ]);
     let mut tester = tester_for(elicit_config(json!({})), &backend);

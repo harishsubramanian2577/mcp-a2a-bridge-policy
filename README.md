@@ -1,6 +1,6 @@
 # MCP A2A Bridge Policy
 
-A custom [Omni Gateway (Flex Gateway)](https://docs.mulesoft.com/gateway/latest/) policy, built with the [PDK](https://docs.mulesoft.com/pdk/latest/), that puts an MCP front on an A2A agent: MCP clients see it as a server with one tool. The agent can be a single A2A agent or a broker such as MuleSoft Agent Broker, and it needs no changes. MCP-only clients such as ChatGPT, Claude and Cursor can then use it.
+A custom [Omni Gateway (Flex Gateway)](https://docs.mulesoft.com/gateway/latest/) policy, built with the [PDK](https://docs.mulesoft.com/pdk/latest/), that puts an MCP front on an A2A agent: MCP clients see it as a server with one tool. The agent can be a single A2A agent or a broker such as MuleSoft Agent Broker, and needs no changes for client-managed conversations. MCP-only clients such as ChatGPT, Claude and Cursor can then use it.
 
 It is a **single-tool adapter**, not a full MCP↔A2A protocol translation: each `tools/call` becomes one A2A `SendMessage`. Polling, cancel, push notifications, streaming delivery and authentication flows are not mapped. MCP elicitation is an experimental opt-in, off by default. See [Limitations](docs/MCP-A2A-Bridge-Policy.md#8-limitations).
 
@@ -13,6 +13,8 @@ It is a **single-tool adapter**, not a full MCP↔A2A protocol translation: each
 | PDK | 1.8.0 |
 | Flex Gateway | 1.11.0 or later (1.10.x can't load 1.1.0 or later) |
 
+Behavior described below includes the Nov 16 PR #15 worktree changes based on source HEAD `53cdc2d0a1c647653ab4b36eb210932f3480d952`; no final commit identifier is available precommit. **Verified 2026-11-16:** `make test` passed 137 unit tests and one Docker integration test; the final `make test-shared-storage` log records 46 passing checks (32 shared-storage, 12 official Python SDK, 2 official TypeScript SDK). The fixtures default to Flex 1.11.0, Python MCP SDK 2.3.0 and TypeScript SDK 1.32.2. Managed-gateway testing and live configuration migration were not run. The version above identifies the original release, not a claim that these changes are published or merged. See [the evidence and boundaries](docs/P4A-Issue-Resolutions.md#nov-16-follow-up-2026-11-16).
+
 ## What it does
 
 | MCP client sends | Policy does |
@@ -23,11 +25,15 @@ It is a **single-tool adapter**, not a full MCP↔A2A protocol translation: each
 
 **Multi-turn conversations.** Every tool result carries `structuredContent.state`, plus `contextId` and `taskId` when the broker sent them, and a text hint saying how to continue.
 - To continue a conversation, the client passes `context_id`.
-- To answer an `input-required` question from the broker, the client passes `task_id`, plus `context_id` when one was returned. By default the client collects the answer from the user, and the policy never sends elicitation requests ([example](docs/MCP-A2A-Bridge-Policy.md#31-client-managed-follow-up-questions)). This is how ChatGPT works. With the experimental `enableElicitation` setting, clients that declare elicitation get the question as an `elicitation/create` form on a resumable SSE stream instead ([details](docs/MCP-A2A-Bridge-Policy.md#32-experimental-mcp-elicitation-enableelicitation)).
+- To answer an `input-required` question from the broker, the client passes `task_id`, plus `context_id` when one was returned. By default the client collects the answer from the user, and the policy never sends elicitation requests ([example](docs/MCP-A2A-Bridge-Policy.md#31-client-managed-follow-up-questions)). This is how ChatGPT works. Experimental `enableElicitation` additionally requires an elicitation-capable client, SSE acceptance and a trusted upstream's boolean `Task.metadata["p4a.elicitationSafe"]: true` for **every** question. Missing or false markers keep the question client-managed; the marker is an upstream safety assertion, not secret detection ([details](docs/MCP-A2A-Bridge-Policy.md#32-experimental-mcp-elicitation-enableelicitation)).
 - `auth-required` is completed by the user outside the conversation. Never send secrets in a message.
 - An optional session store (`local`, or `remote` through the gateway's shared storage, which managed Omni Gateways have built in and self-managed ones get from Redis) can remember the last context and pending task for each `Mcp-Session-Id`. This helps clients that never send IDs back. Session IDs are random, issued at `initialize`, scoped to the API instance and policy, and bound to `sessionKeyHeader` when it is set. An unknown, expired, ended or other caller's session ID gets `404`, so the client starts again with `initialize`.
 
-**Size limit.** Converted answers always fit the gateway's 1 MB body limit. The policy drops duplicated data, truncates the text, or as a last resort returns a tool error, so the client never gets the raw A2A reply.
+**Session upgrade and retention (PR #15).** Continuation, generation and pending elicitation now share one CAS-protected `mcp-a2a-sessions-v2` entry. Upgrades from the old namespace, or changes to `sessionTtlSeconds` or `enableElicitation` that change the retention namespace, require clients to `initialize` again. Logical idle expiry is `sessionTtlSeconds`; an open question retains state through its deadline plus that TTL for replay. With elicitation enabled, remote physical retention is TTL + 1800 seconds, not a longer idle lifetime. Completed streams are retained for one TTL; a new question during that window stays client-managed to preserve the old result. Once an answer is accepted, the input deadline no longer times it out; the upstream response timeout applies. `DELETE` returns `204` only after storing the termination tombstone, or `503` on a failed write (retry it).
+
+**Persistence failures.** Session transitions use bounded CAS retries. An elicitation answer claim or result settlement that still needs persistence after retries are exhausted returns `503`, not a success acknowledgement. Do not blindly resend an accepted answer: it may already have reached the agent. `Answering` has a separate 1800-second processing/recovery deadline from acceptance; resuming an unresolved stream after that deadline attempts to store a tool error instructing the client to start a new call, not resend the accepted answer. Failure to persist that recovery also returns `503`.
+
+**Size limit and encoding.** Converted answers always fit the gateway's 1 MB body limit. The policy drops duplicated data, truncates the text, or as a last resort returns a tool error, so the client never gets the raw A2A reply. Rewritten responses remove `Content-Encoding`; the bridge does not decompress compressed upstream bodies, so configure the upstream to return uncompressed JSON/SSE. Native pass-through is unchanged.
 
 ## Deployment modes
 
@@ -55,10 +61,10 @@ The full guide, with diagrams, every property, policy-order tables, limitations 
 | `a2aPath` | empty | Path, relative to the upstream URL, that converted calls are sent to (native A2A traffic is never rewritten) |
 | `includeStructuredContent` | `true` | Add `state`, `contextId`, `taskId` (when present) and data parts to tool results |
 | `sessionStoreMode` | `disabled` | `disabled`, `local` or `remote`. Use `remote` on managed gateways (always 2+ replicas) and with elicitation |
-| `sessionTtlSeconds` | `1800` | Session store TTL (60–86400) |
+| `sessionTtlSeconds` | `1800` | Logical idle TTL and completed-stream replay window (60–86400); changing retention requires reinitialization |
 | `sessionKeyHeader` | empty | Header hashed into the session key, for example `client_id`. Enforced: without it, a request gets no session |
-| `enableElicitation` | `false` | Experimental: ask `input-required` questions through MCP elicitation. Needs a session store; leave off for ChatGPT |
-| `elicitationTimeoutSeconds` | `300` | Time to answer an elicited question (30–1800) before the conversation ends |
+| `enableElicitation` | `false` | Experimental: elicit only upstream-marked safe `input-required` questions. Needs a session store; leave off for ChatGPT |
+| `elicitationTimeoutSeconds` | `300` | Time to answer each elicited question (30–1800, independent of idle TTL); not an upstream-response timeout |
 | `maxElicitationRounds` | `3` | Elicited questions per call (1–10); more come back as a normal tool result |
 
 ## Repository layout
