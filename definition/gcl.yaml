@@ -55,7 +55,12 @@ spec:
         - local
         - remote
       default: disabled
-      description: Optional server-side map from MCP session to A2A contextId/taskId, used only when the client omits context_id. Session ids are random, issued at initialize and scoped to this API instance and policy. local is per-replica in-memory; remote shares sessions across replicas and requires Flex Gateway Shared Storage (Redis) and will fail policy startup if it is not configured.
+      description: >-
+        Optional server-side continuation when the client omits both context_id and task_id.
+        Session ids are random, issued at initialize and scoped to this API instance and policy.
+        local is per-replica in-memory; remote shares sessions through the gateway's shared storage:
+        built in on managed Omni Gateway; on self-managed gateways configure Shared Storage.
+        Changing the TTL or elicitation setting requires clients to initialize again.
     sessionTtlSeconds:
       type: integer
       default: 1800
@@ -66,6 +71,22 @@ spec:
       type: string
       default: ""
       description: Optional request header (for example client_id or authorization) whose value is hashed into the session key, binding a stored conversation to the caller identity as well as the Mcp-Session-Id. When set, the binding is enforced - a request without this header gets no session and cannot use or end one.
+    enableElicitation:
+      type: boolean
+      default: false
+      description: "Experimental, off by default. Form elicitation requires a session store, negotiated client support, SSE resumption, and trusted Task metadata p4a.elicitationSafe=true asserting the question requests no sensitive information. Otherwise return a client-managed result. Never mark credential requests as safe. Leave off for ChatGPT."
+    elicitationTimeoutSeconds:
+      type: integer
+      default: 300
+      minimum: 30
+      maximum: 1800
+      description: How long the bridge waits for the user's answer to one elicitation. Accepted answers are governed by the upstream request timeout, not this input deadline. Pending questions retain the session until their deadline plus a result replay window.
+    maxElicitationRounds:
+      type: integer
+      default: 3
+      minimum: 1
+      maximum: 10
+      description: How many follow-up questions one tool call may ask through elicitation. A further question from the agent is returned as a normal tool result with continuation ids.
   required:
     - toolName
     - a2aProtocolVersion

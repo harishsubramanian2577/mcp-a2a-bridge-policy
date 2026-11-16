@@ -2,13 +2,16 @@
 
 This document tracks the fixes for the P4A review findings on the MCP A2A Bridge Policy.
 
+**Evidence scope:** release-era test counts, PASS transcripts and deployment reports below are historical evidence for the named original builds. Final integrated PR15 verification on 2026-11-16 is recorded in [Nov 16 follow-up](#nov-16-follow-up-2026-11-16): 146 unit tests, one Docker integration test and 46 shared-storage/official-SDK checks passed, along with definition validation, formatting and host/WASM clippy. The verified tree combines `9226547` + `dc7e00d` before the final merge commit; this is not a publication or server-side PR merge claim. PR14's separate 70-unit/one-integration/18-shared-storage history is retained below. Current v2 behavior supersedes PR14's namespace descriptions; managed-gateway testing and live configuration migration were not run for these follow-ups.
+
 | | |
 |---|---|
 | Reviewed version | 1.0.3 (commit `3d61a41`) |
-| Fixed in | 1.1.0, branch `fix/p4a-priority-issues` |
+| Fixed in | 1.1.0, branch `fix/p4a-priority-issues` (priority issues)<br>1.3.0, branch `fix/p4a-remaining-issues` (remaining issues; the interim 1.2.0 was never published) |
 | Priority issues | [#1](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/1), [#4](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/4), [#12](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/12) |
-| Test baseline | 32 unit tests on 1.0.3; 70 passing on the PR14 follow-up (61 before the follow-up) |
-| Minimum gateway | Flex Gateway 1.11.0 (1.1.0 uses PDK stop-iteration, which 1.10.x doesn't support) |
+| Remaining issues | [#2](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/2), [#3](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/3), [#5](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/5), [#6](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/6), [#7](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/7), [#8](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/8), [#9](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/9), [#10](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/10), [#11](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/11), [#13](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/13) |
+| Test baseline | Historical: 32 unit tests on 1.0.3, 61 on 1.1.0, 105 on 1.3.0, 112 after the original PR #15 review follow-up. Nov 16 separate PR14 worktree: 70 unit tests and one Docker integration passed. PR15 had 137 unit tests before ancestry integration; final integrated verification passed 146 unit tests, one Docker integration and 46 shared-storage/SDK checks. |
+| Minimum gateway | Flex Gateway 1.11.0 (1.1.0 and later use PDK stop-iteration, which 1.10.x doesn't support) |
 
 ## Status
 
@@ -17,8 +20,20 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 | #1 | Failed response rewrite returns raw A2A payload instead of an MCP error | Fixed in 1.1.0 |
 | #4 | Classify native A2A before MCP dispatch and preserve native version semantics | Fixed in 1.1.0 |
 | #12 | Session isolation, identity binding and token generation | Fixed in 1.1.0. Verified live on two Flex replicas sharing Redis. Private reporting is enabled. |
+| #2 | Validate MCP envelopes and initialization before dispatching agent calls | Fixed in 1.3.0 |
+| #3 | Reject unsupported MCP-Protocol-Version headers on subsequent requests | Fixed in 1.3.0 |
+| #5 | Terminated MCP sessions remain usable and can be restored by late responses | Fixed in 1.3.0. Late answer after `DELETE` verified live on two replicas. |
+| #6 | Malformed upstream results are reported as successful completed tool calls | Fixed in 1.3.0 |
+| #7 | SSE artifact folding ignores replacement versus append semantics | Fixed in 1.3.0 |
+| #8 | SSE parser hides corrupt events and mishandles valid framing | Fixed in 1.3.0 |
+| #9 | Input-required tasks without contextId lose task continuation hints | Fixed in 1.3.0 |
+| #10 | Correct MCP policy ordering and state the adapter limitations | Fixed in 1.3.0 (documentation) |
+| #11 | Validate and correct the A2A v1 Exchange asset-type token | Resolved in 1.3.0. The token stays `a2a_v1`, which Exchange accepts; `a2av1` is rejected. |
+| #13 | Configurable MCP elicitation for A2A input-required | Fixed in 1.3.0. Experimental `enableElicitation`, **off by default** (the customer's client, ChatGPT, doesn't support elicitation). Client-managed mode is unchanged. Verified live on two replicas. |
 
 ## How the fixes were verified
+
+This section distinguishes original 1.1.0 runs from the separate Nov 16 PR14 follow-up results. For original 1.3.0 evidence, see [Verification of 1.3.0](#verification-of-130). Final integrated PR15 results are recorded separately in [Nov 16 follow-up](#nov-16-follow-up-2026-11-16).
 
 1. **Unit and filter tests.**
    - The tests drive the real policy entrypoint through the PDK 1.8.0 `pdk-unit` harness.
@@ -136,11 +151,11 @@ The detailed reproductions in the issue were withheld pending a private channel.
 - [x] **Unambiguous session keys.** The key is a hex SHA-256 over a versioned, length-prefixed encoding of (scope, session ID, identity-or-none). This replaces `"<sid>:<DefaultHasher(identity)>"`, which could collide and used a non-cryptographic hash.
 - [x] **Unpredictable, globally unique session IDs.** They are random v4 UUIDs from the host's secure random source (`getrandom`, which is WASI `random_get`) and do not depend on `x-request-id` or any other caller-controlled data. If randomness is unavailable, no session is issued. A2A `messageId` values are random too.
 - [x] **Only issued sessions are honoured.** `initialize` registers the new session (`StoreMode::Absent`). `tools/call` and `DELETE` act only on a live, registered entry for the same caller, so a caller can't plant a chosen session ID.
-- [x] **Delete-safe updates.** Both updates and termination use compare-and-swap (`StoreMode::Cas`). Termination writes the existing `SessionEntry` layout with empty IDs and `touched_at: 0`; liveness excludes this tombstone. PDK 1.8 remote `delete` swallows errors, so it is not used. `204` requires a successful tombstone write; a failed or conflicting write returns `503`, which the caller can retry. Stale CAS updates cannot overwrite the tombstone, and later updates ignore it.
-- [x] **Scoped shared storage.** The base scope is `mcp-a2a-sessions/<api-id>/<policy-name>.<policy-namespace>`, falling back to the base path when the API ID is unknown in local mode. The same scope is hashed into each key. Remote storage adds `/ttl-<effective-seconds>` to the namespace. Two API instances that share Redis are isolated; replicas of one instance with the same effective TTL share sessions.
+- [x] **Delete-safe updates.** The response side uses compare-and-swap (`StoreMode::Cas`). Current PR #15 transitions re-read the live unified entry and recheck generation and pending stream/round ownership as applicable before CAS, with bounded retries; they do not rely on a CAS token captured at request start. A successfully stored termination tombstone blocks late updates. This also covers #5.
+- [x] **Scoped shared storage.** The original namespace was `mcp-a2a-sessions/<api-id>/<policy-name>.<policy-namespace>`. PR #15 now uses `mcp-a2a-sessions-v2/<api-id>/<policy-name>.<policy-namespace>/retention-<seconds>`, falling back to the base path when the API ID is unknown in local mode. API/policy scope is hashed into each key. Two API instances that share Redis are isolated, while consistently configured replicas of one instance share sessions. Old sessions are not migrated.
 - [x] **Configured expiry.**
-  - The TTL is clamped to 60–86400 seconds. The same value sets the Redis TTL (`remote_ttl_millis`) and the liveness check.
-  - Entries store `touched_at`, and local liveness checks use the current configured TTL. The PDK 1.8 high-level API only sets remote TTL when a store is first created, with no supported TTL-update method. A changed remote TTL therefore selects a new namespace and requires reinitialization; it does not preserve existing sessions seamlessly. Old entries expire under their original TTL, and rollback to that TTL can expose unexpired old sessions again. Unit tests cover both lower and higher TTL namespace changes; live reconfiguration has not been tested.
+  - Logical idle TTL is clamped to 60–86400 seconds. Current remote physical retention is TTL + 1800 seconds with `enableElicitation`, otherwise TTL. Pending questions retain state through their deadline plus a replay window of one TTL; completed streams remain for one TTL after settlement. This does not lengthen ordinary idle expiry.
+  - The liveness check uses `touched_at` and pending retention. Physical retention is part of the namespace, so changing `sessionTtlSeconds` or `enableElicitation` so that retention changes requires clients to reinitialize, not an in-place TTL change to old sessions. The original lower-TTL unit test is historical evidence, not a live configuration-migration test.
 - [x] **Logs** carry only a short prefix of the hashed key, never the session ID or identity.
 - [x] **Two-replica shared Redis test added** (`make test-shared-storage`, in `tests/shared-storage/`). `pdk-test` 1.8.0 has no Redis service and its service traits are private, so this is a Docker Compose harness: Redis, two Flex Gateway replicas, two API instances (`hr`, bound to `x-client-id`, and `finance`) and a mock A2A agent that records what it receives. `check.py` verifies:
   - a session issued on flex-1 continues on flex-2;
@@ -189,7 +204,7 @@ The detailed reproductions in the issue were withheld pending a private channel.
   All shared-storage checks passed.
   ```
 
-  Each session entry is stored under `<namespace>:<SHA-256 key>` with the Redis TTL set to `sessionTtlSeconds`. The two `index` keys are Flex's own per-namespace key index, which the gateway manages and which has no TTL. In local mode the API ID and base path are not known, so the namespace is told apart by the policy instance name (`hr-agent-p1.default` and `finance-agent-p1.default`).
+  In that original run, each entry used `<namespace>:<SHA-256 key>` with Redis TTL equal to `sessionTtlSeconds`. The two `index` keys were Flex's own per-namespace key index, with no TTL. The current namespace and physical/logical retention contract are described above; these old TTL values do not verify it. In local mode the policy instance name distinguished `hr-agent-p1.default` and `finance-agent-p1.default` when the API ID and base path were unavailable.
 - [x] **Private security reporting channel.** GitHub private vulnerability reporting is enabled, and [`SECURITY.md`](../SECURITY.md) describes how to report. The repository visibility is unchanged.
 
 ### Files
@@ -199,7 +214,7 @@ The detailed reproductions in the issue were withheld pending a private channel.
 | Test | What it proves | 1.0.3 | 1.1.0 |
 |---|---|---|---|
 | `tests::identity_binding_is_enforced_not_relaxed` | No session without identity. Omitted or changed identity can't read the session; the owner can. | Fails | Passes |
-| `tests::unissued_session_ids_are_ignored` | A caller-chosen `Mcp-Session-Id` is not stored or used | Fails | Passes |
+| `tests::unissued_session_ids_are_ignored` | A caller-chosen `Mcp-Session-Id` is not stored or used. Renamed to `unissued_session_ids_are_not_found` in 1.3.0, where such an ID gets `404` (#5). | Fails | Passes |
 | `tests::delete_ends_a_session_only_for_its_owner` | `DELETE` by another or anonymous caller gets `404` and the session survives; the owner gets `204` | Fails | Passes |
 | `tests::session_ids_are_random_and_ignore_tracing_headers` | 50 IDs with a fixed `x-request-id` are all different and don't contain it; same for `messageId` | Fails | Passes |
 | `tests::local_store_remembers_context_per_session` | Continuity still works for a valid session | Passes | Passes |
@@ -214,16 +229,460 @@ The detailed reproductions in the issue were withheld pending a private channel.
 ### Upgrade note
 1.1.0 uses a new store namespace and key format. Sessions remembered by 1.0.x are not read after the upgrade, so clients start a new MCP session the next time they call `initialize`. Conversations that pass `context_id` explicitly are not affected.
 
-The PR14 follow-up also adds a TTL suffix to remote namespaces, so sessions from the earlier
-unsuffixed PR14 revision are not read. The serialized `SessionEntry` fields are unchanged.
-Follow-up regressions cover gzip error encoding, successful rewrite/native header isolation,
-percent-encoded version query names, failed/conflicting termination CAS, stale and later updates
-after termination, and remote namespace changes on TTL reconfiguration. Docker integration has
-now passed for this follow-up; live configuration migration has not been run.
+PR #15 introduces the unified v2 namespace and retention suffix. Sessions from earlier builds are not read after this upgrade either. Clients must reinitialize after the upgrade or a retention-changing TTL/elicitation configuration update. Explicit continuation IDs can be used in a new session, but pending forms and replay state are not migrated.
+
+---
+
+## Verification of 1.3.0
+
+These are the original 1.3.0 verification results, not a rerun of the Nov 16 worktree.
+
+1. **Unit and filter tests.**
+   - Command: `cargo test --lib`.
+   - Result: 105 passed, 0 failed. The run is stable both in parallel and with `--test-threads=1`. That is 86 for #2–#11 and 19 for #13 (8 module tests and 11 filter tests).
+2. **Baseline check.**
+   - The 13 new or changed filter-level tests in `src/tests.rs` were run unchanged on the 1.1.0 code (`3196f89`).
+   - 12 of the 13 failed, each with the bug its issue reports.
+   - The 13th, `session_ids_are_ignored_without_a_session_store`, is a guard test. It is expected to pass on both versions.
+3. **Integration tests.**
+   - `make test` passes on Flex 1.11.0: 105 unit tests and the `tools_call_round_trip` integration test.
+   - The policy reference name includes the minor version (`mcp-atoa-bridge-policy-flex-v1-3`), so `tests/common/mod.rs` was updated for 1.3.0. Before that update, Flex reported `Extension ... not found` and the request reached the mock agent untranslated.
+   - The integration test now uses the fixture's JSON-RPC id (`broker-1`), because 1.3.0 rejects an agent answer whose id doesn't match the request (#6). It also sends `MCP-Protocol-Version: 2025-06-18`.
+4. **Shared-storage test.**
+   - `make test-shared-storage` passes on Flex 1.11.0 with two replicas sharing Redis. That covers the 1.1.0 checks, updated for `404` (#5), plus a new "Late answer after delete" section and the elicitation sections shown under #13:
+
+   ```
+   Identity binding across replicas
+     PASS  another client with the same session id gets 404  (404, agent called 0 times)
+     PASS  a request without x-client-id gets 404  (404, agent called 0 times)
+   Isolation between API instances on the same Redis
+     PASS  hr's session id is unknown to finance  (404, agent called 0 times)
+     PASS  finance's session id is unknown to hr  (404, agent called 0 times)
+   Delete across replicas
+     PASS  another client cannot delete the session  (404)
+     PASS  the owner deletes the session on flex-2  (204)
+     PASS  flex-1 returns 404 for the deleted session  (404, agent called 0 times)
+   Late answer after delete
+     PASS  the owner deletes the session while a call is in flight  (204)
+     PASS  the in-flight call still gets its answer  (200)
+     PASS  the late answer does not revive the session  (404, agent called 0 times)
+   All shared-storage checks passed.
+   ```
+
+5. **Definition check.** `make validate-definition` passes on `a2a_v1` and fails on `a2av1`, which Exchange rejects.
+6. **Exchange release.** 1.3.0 (definition and implementation) was released to Exchange on 2026-11-11 and is published.
+
+---
+
+## Issue #2: Validate MCP envelopes and initialization
+
+### Problem
+- A `tools/call` with `jsonrpc: "1.0"` still reached the agent.
+- A `ping` without an id got a reply with `id: null`.
+- `initialize` with `params: {}` succeeded.
+- Object ids and scalar params were accepted.
+- Notifications were recognised by the `notifications/` prefix alone, so a `notifications/initialized` that carried an id was acknowledged without a JSON-RPC reply.
+
+### Resolution steps
+- [x] Added `mcp::classify`, which tells messages apart by structure:
+  - a request has a method and an id;
+  - a notification has a `notifications/*` method and no id;
+  - a response has an id and exactly one of `result` or `error`.
+
+  Any other method sent without an id is treated as a request with a missing id.
+- [x] Every MCP message is validated before dispatch: `jsonrpc` must be `"2.0"`, the id must be a string or an integer (not `null`, an object or a fraction), and params, when present, must be an object.
+- [x] `initialize` requires `protocolVersion` (a string), `capabilities` (an object) and `clientInfo` (an object with `name` and `version`). A well-formed but unknown version is still negotiated down to a supported one. Missing or mistyped fields get `-32602`.
+- [x] Accepted notifications and client responses get a bodyless `202`.
+- [x] Invalid input never reaches the agent:
+  - when the id can be read, the error is in-band (`200`) and carries that id;
+  - when it can't, the reply is HTTP `400` with an error body that has no id.
+
+### Files
+`src/mcp.rs` (`classify`, `classify_json`, `initialize_protocol_version`, `error_body`), `src/lib.rs` (`request_filter`, `http_error`, `invalid_message`).
+
+### Tests
+| Test | What it proves | 1.1.0 | 1.3.0 |
+|---|---|---|---|
+| `tests::invalid_envelopes_get_errors_and_never_reach_the_agent` | Table of bad versions, ids, params and missing ids. Each gets the right error and status, and the agent is never called. | Fails | Passes |
+| `tests::notifications_and_responses_are_told_apart_by_structure` | Notifications and client responses get a bodyless `202`. A `notifications/*` method that carries an id gets a reply. | Fails | Passes |
+| `tests::initialize_requires_well_formed_params_but_negotiates_unknown_versions` | Malformed `initialize` is rejected; an unknown version is negotiated | Fails | Passes |
+| `mcp::tests::classifies_requests_notifications_and_responses_structurally` | Classification rules | n/a | Passes |
+| `mcp::tests::rejects_invalid_envelopes_ids_and_params` | Envelope, id and params validation | n/a | Passes |
+| `mcp::tests::initialize_params_are_validated` | `initialize` field checks | n/a | Passes |
+| `mcp::tests::error_body_omits_a_missing_id` | The `400` body has no id | n/a | Passes |
+
+---
+
+## Issue #3: Reject unsupported MCP-Protocol-Version headers
+
+### Problem
+`tools/list` with `MCP-Protocol-Version: 1999-01-01` got `200`. The header was never checked.
+
+### Resolution steps
+- [x] On MCP traffic (POST and `DELETE`), an `MCP-Protocol-Version` header that isn't `2025-06-18`, `2025-03-26` or `2024-11-05` gets HTTP `400`. A missing header is accepted, as Streamable HTTP allows. `initialize` keeps its own negotiation, which is based on the params.
+- [x] Native A2A pass-through traffic is not checked.
+- [x] The rejection has no side effects, so the client can retry with a supported version.
+- [x] Documented that negotiating `2024-11-05` doesn't add that revision's legacy HTTP+SSE transport.
+
+### Files
+`src/mcp.rs` (`check_protocol_version_header`), `src/lib.rs`, docs.
+
+### Tests
+| Test | What it proves | 1.1.0 | 1.3.0 |
+|---|---|---|---|
+| `tests::unsupported_protocol_version_header_is_rejected_and_the_client_can_recover` | Unsupported and malformed headers get `400` without calling the agent. Supported and absent headers work. A retry succeeds. | Fails | Passes |
+| `tests::delete_checks_the_protocol_version_header` | `DELETE` with a bad header gets `400` and the session survives | Fails | Passes |
+| `mcp::tests::protocol_version_header_must_be_supported_when_present` | Header rules | n/a | Passes |
+
+---
+
+## Issue #5: Terminated sessions remain usable
+
+### Problem
+After `DELETE` (`204`), a call with the same session ID still reached the agent and got `200`. A late answer to a call in flight could also store the context again.
+
+### Resolution steps
+- [x] **Session lifecycle is separate from context fallback.** When a session store is configured, an `Mcp-Session-Id` that is unknown, expired, deleted or bound to another identity gets HTTP `404` with JSON-RPC `-32001` "Session not found", and the agent is not called. The client starts a new session with `initialize`, as the MCP session rules require.
+- [x] **Late answers can't revive a session.** Current PR #15 updates re-read the live entry and recheck generation/pending ownership before CAS, rather than reuse the entry's CAS token from request start. `DELETE` returns `204` only after a checked CAS stores the termination tombstone; a failed write returns `503` for the client to retry. An unknown or unauthorized session gets `404`. After successful termination, an in-flight plain call can still deliver its answer but cannot restore the session.
+- [x] Without a session store, session IDs are ignored as before. The bridge issues none, so none can end.
+
+### Files
+`src/lib.rs` (`session_not_found`, `request_filter`, `transcode_tool_call`), `src/session.rs`, `tests/shared-storage/`.
+
+### Tests
+| Test | What it proves | 1.1.0 | 1.3.0 |
+|---|---|---|---|
+| `tests::terminated_session_gets_404_and_initialize_starts_a_new_one` | initialize, call, `DELETE`, call: the last call gets `404` without calling the agent, and a new `initialize` works | Fails | Passes |
+| `tests::unissued_session_ids_are_not_found` | A caller-chosen session ID gets `404` | Fails | Passes |
+| `tests::identity_binding_is_enforced_not_relaxed` (updated) | Omitted or changed identity gets `404`; the owner is unaffected | Fails | Passes |
+| `tests::session_ids_are_ignored_without_a_session_store` | Guard: without a store, session IDs don't cause `404` | Passes | Passes |
+| `session::tests::expiry_follows_the_configured_ttl` | Expired entries are not live | Passes | Passes |
+| `make test-shared-storage`, "Late answer after delete" | Live, two replicas: `DELETE` on flex-2 while a call is in flight on flex-1; the call gets `200`, and the session then gets `404` | n/a | Passes |
+
+The pdk-unit harness runs a call to completion in one step, so it can't run a `DELETE` in the middle of one. The late-answer case is therefore tested live.
+
+---
+
+## Issue #6: Malformed upstream results reported as success
+
+### Problem
+`result: null`, `result: 42`, `{"message": null}` and `{"task": null}` all became successful MCP results. The envelope version and the response id weren't checked, so another request's answer could be relabelled with the current MCP id.
+
+### Resolution steps
+- [x] `a2a::rpc_result` checks the agent's envelope. `jsonrpc` must be `"2.0"`, the response must have exactly one of `result` or `error`, and the id must match the one the bridge sent. An error may carry a `null` id, as JSON-RPC allows.
+- [x] The result must be a valid Task or Message, wrapped (`{task}`, `{message}`) or bare, in v1.0 or v0.3 form. Current validation enforces exactly one supported result/part variant (oneof), validates every history message even when other content supplies the answer, and requires non-empty artifact IDs and streamed update task/context IDs. Update IDs must correlate across the stream. A v1.0 data part accepts any JSON value, including `null`; v0.3 `kind: "data"` requires an object.
+- [x] Anything invalid becomes an MCP tool error (`isError: true`), "The A2A agent returned an invalid response: ...", and the session is not updated.
+- [x] Test fixtures and mocks now answer with the request's id instead of a fixed one.
+
+### Files
+`src/a2a.rs` (`rpc_result`, `result_snapshot`, `task_snapshot`, `message_snapshot`, `parts`), `src/tests.rs`, `tests/requests.rs`.
+
+### Tests
+| Test | What it proves | 1.1.0 | 1.3.0 |
+|---|---|---|---|
+| `tests::malformed_or_uncorrelated_agent_answers_are_tool_errors` | The cases from the issue, plus a wrong id, through the filter. Each is a tool error and nothing is remembered. | Fails | Passes |
+| `a2a::tests::malformed_envelopes_are_invalid_responses` | Wrong version, wrong id, both or neither of result and error | n/a | Passes |
+| `a2a::tests::malformed_results_are_invalid_responses` | Null, scalar and empty results, null wrappers, missing or mistyped status and parts | n/a | Passes |
+| `a2a::tests::task_state_accepts_both_spellings_and_rejects_others` | Unknown states, and v1.0 `TASK_STATE_UNSPECIFIED`, are invalid | n/a | Passes |
+
+---
+
+## Issue #7: SSE artifact folding ignores replace versus append
+
+### Problem
+Two artifact updates for the same `artifactId` with `append: false` both stayed in the final answer.
+
+### Resolution steps
+- [x] Artifacts are folded by `artifactId`, starting from the artifacts in the initial Task:
+  - an update replaces the artifact, unless `append` is `true`, in which case it extends it;
+  - an artifact not seen before is added;
+  - artifacts keep the order in which they were first seen.
+- [x] A status update replaces the status, including its message.
+- [x] The final answer is flattened only after folding, so superseded output never appears in it.
+- [x] Both v1.0 (`artifactUpdate`, `statusUpdate`) and v0.3 (`artifact-update`, `status-update`) events are handled.
+
+### Files
+`src/a2a.rs` (`apply_artifact`, `apply_status`, `parse_sse_body`).
+
+### Tests
+| Test | What it proves |
+|---|---|
+| `a2a::tests::artifact_updates_replace_unless_appending` | Replacement of the initial snapshot, repeated replacements, true append and interleaved ids, in v1.0 and v0.3 |
+| `a2a::tests::status_update_replaces_the_status_message` | The latest status message wins |
+
+---
+
+## Issue #8: SSE parser hides corrupt events and mishandles framing
+
+### Problem
+- A malformed event after a valid one was dropped, and the earlier content was returned as a success.
+- A leading BOM hid a valid event.
+- CR-only line ends weren't split correctly.
+- An unterminated last event was still processed.
+
+### Resolution steps
+- [x] `a2a::sse_event_data` follows the WHATWG event-stream parsing rules:
+  - LF, CRLF and CR line ends;
+  - one leading BOM is stripped;
+  - `:` comment lines are skipped;
+  - multi-line `data` is joined;
+  - an event is dispatched only at a blank line.
+- [x] A stream that ends in the middle of an event is an error.
+- [x] Empty events and comments are ignored. Any other corrupt event fails the whole stream: malformed JSON, a non-JSON-RPC envelope, an event without a result or error, another request's id, or a malformed update. The result is a tool error, and nothing from the stream is remembered.
+
+### Files
+`src/a2a.rs` (`sse_event_data`, `parse_sse_body`).
+
+### Tests
+| Test | What it proves |
+|---|---|
+| `a2a::tests::sse_accepts_every_line_ending_bom_comments_and_multiline_data` | All three line-end forms with several events, the BOM case from the issue, comments and multi-line data |
+| `a2a::tests::corrupt_or_truncated_streams_are_errors` | A valid snapshot followed by each kind of corrupt event, an unterminated EOF, an event without its blank line, and an agent error |
+
+---
+
+## Issue #9: Input-required tasks without contextId lose the continuation
+
+### Problem
+A Task with `id: t9`, state `input-required` and no `contextId` produced only the question. The state and `t9` were missing, because the hint returned early when there was no context.
+
+### Resolution steps
+- [x] A continuation hint is produced whenever an interrupted task has a task ID. `context_id` is added only when the agent returned one.
+- [x] On the next call, the bridge sends `taskId` alone, and the agent infers the context, as A2A v1.0 allows.
+- [x] The `auth-required` hint asks the user to complete authorization outside the conversation. It says that replying doesn't grant authorization and that passwords, tokens and other secrets must never be sent.
+- [x] Documented task-only continuation and the `auth-required` wording.
+
+### Files
+`src/a2a.rs` (`continuation_hint`, `into_reply`), docs.
+
+### Tests
+| Test | What it proves | 1.1.0 | 1.3.0 |
+|---|---|---|---|
+| `tests::input_required_task_without_context_keeps_its_continuation` | With structured content on and off, the result carries the state and `t9`, and the next call sends `taskId: t9` with no `contextId` | Fails | Passes |
+| `tests::auth_required_task_without_context_is_not_answered_with_secrets` | `auth-required` wording, without structured content | Fails | Passes |
+| `a2a::tests::input_required_without_context_keeps_the_task_hint` | Hint with task ID only | n/a | Passes |
+| `a2a::tests::builds_task_only_continuation` | Outbound message with `taskId` only | n/a | Passes |
+| `a2a::tests::auth_required_hint_never_implies_the_reply_authorizes` | `auth-required` wording | n/a | Passes |
+| `a2a::tests::hints_for_running_and_finished_tasks` | No hint for finished tasks | n/a | Passes |
+
+---
+
+## Issue #10: Policy ordering and adapter limitations
+
+### Resolution steps
+- [x] **Deployment table corrected.** In Mode 1 (MCP instance), MCP Support comes first, then authentication, then the bridge. The table notes that MCP Support isn't available in Local Mode, so the local test setup doesn't use it. The Mode 1 diagram and the README ordering paragraph match.
+- [x] **Purpose.** The purpose statement is agent-first, with MuleSoft Agent Broker as one example. It calls the policy a single-tool adapter, not full protocol transcoding, and links to Limitations.
+- [x] **New "8. Limitations" section** in the customer guide. It covers:
+  - polling, cancel and push not supported;
+  - buffered rather than streamed MCP delivery;
+  - client-managed questions by default, experimental gated elicitation, and no auth orchestration;
+  - lossy artifact and file projection;
+  - supported bindings and versions;
+  - session fallback;
+  - retry risk for calls with side effects;
+  - client responsibilities for interrupted tasks.
+- [x] **New "9. Verification checklist"**, including auth-protected discovery and a real client continuation.
+
+### Files
+`docs/MCP-A2A-Bridge-Policy.md`, `README.md`.
+
+---
+
+## Issue #11: A2A v1 Exchange asset-type token
+
+### Resolution steps
+- [x] `definition/gcl.yaml`: `metadata/capabilities/assetTypes` stays `mcp,a2a,a2a_v1`. The issue proposed `a2av1`, but Exchange rejects that token (see the evidence below), so the original token was correct.
+- [x] Added `scripts/validate-definition.py` and `make validate-definition`. The script checks:
+  - every token is on the Exchange allow-list, as Exchange reports it: `http`, `mcp`, `a2a`, `a2a_v1`, `rest`, `wsdl`, `llm`, `grpc`, `websocket`, `sse`, `graphql`;
+  - there are no duplicates;
+  - the list is exactly `mcp,a2a,a2a_v1`;
+  - a title is present;
+  - the descriptions in `gcl.yaml` and `Cargo.toml` are 256 characters or fewer.
+- [x] `make publish` and `make release` run the check first, so a bad token stops before upload.
+
+**Evidence (2026-11-11):**
+- A release with `mcp,a2a,a2av1` was rejected by Exchange with HTTP `400`: "/capabilities/assetTypes/2 must be equal to one of the allowed values (http, mcp, a2a, a2a_v1, rest, wsdl, llm, grpc, websocket, sse, graphql)". Nothing was published.
+- The 1.3.0 release with `mcp,a2a,a2a_v1` was accepted. The published definition's `metadata.yaml` lists `mcp`, `a2a` and `a2a_v1`.
+- The validator passes on `a2a_v1` and fails on `a2av1`.
+
+- In API Manager (2026-11-11), 1.3.0 is offered on MCP and A2A v1 instances, and the elicitation fields show their defaults (off, 300 seconds, 3 rounds).
+
+**Verification boundary:** no A2A v0.3 instance was available, so the `a2a` token was not checked in API Manager.
+
+### Files
+`definition/gcl.yaml`, `scripts/validate-definition.py`, `Makefile`.
+
+---
+
+## Issue #13: Elicitation for input-required, with client-managed fallback
+
+### Decisions
+| Question | Decision |
+|---|---|
+| Target clients | The customer's primary MCP client is ChatGPT, which doesn't support MCP elicitation. So `enableElicitation` is **off by default**, and the client-managed mode (`structuredContent` with `contextId`/`taskId`, guide 3.1) stays the default and is unchanged. Elicitation is experimental, for clients that declare it. |
+| Form and answers | One required free-text field, `answer`, with the agent's question as the message. Every question requires a trusted upstream boolean `Task.metadata["p4a.elicitationSafe"]: true`; streamed status updates must opt in afresh. Missing/false markers fall back to client-managed handling, while malformed metadata is an invalid response. The answer is sent as a plain text part of the same task (`taskId`, plus `contextId` when known). The warning tells users never to enter secrets and `auth-required` never elicits, but the bridge does not detect secrets in arbitrary text: the marker is an upstream assertion, not a full no-secrets guarantee. |
+| Timeout | `elicitationTimeoutSeconds`, default **300**, range 30–1800, independent of `sessionTtlSeconds`. Only unanswered questions are input-timed-out. Once accepted, the answer waits under the upstream response timeout. Pending state is retained through its deadline plus a replay window of one session TTL. |
+| Repeated questions | `maxElicitationRounds`, default **3**, range 1–10, per `tools/call`. A further question comes back as an ordinary `input-required` result with the IDs, so a looping agent can't keep the user in forms. |
+| Decline, cancel, disconnect | The question's conversation ends with `structuredContent: {state: "ended", reason}`. Context/task are cleared only while that question owns the session generation; newer independent context is preserved. A disconnect is not cancellation: an unanswered question eventually times out, whereas an accepted answer waits under the upstream timeout. `notifications/cancelled` ends the question. A JSON-RPC error from the client falls back to client-managed handling rather than refuse the conversation. |
+
+### Resolution steps
+- [x] **Opt-in and gating.** `enableElicitation` (default `false`) is honoured only with a session store, a client that negotiated `2025-06-18` or later and declared `capabilities.elicitation`, a `tools/call` that accepts `text/event-stream`, and a fresh trusted upstream safety marker on each `input-required` question. An open or retained completed stream is not replaced; a new question during completed-stream retention falls back to client-managed handling.
+- [x] **Resumable stream instead of a held connection.** A policy can't keep a response open while waiting for the user, so the bridge uses Streamable HTTP resumption:
+  - the `tools/call` gets an SSE stream with one `elicitation/create` (event `id: <stream>-<n>`) and a `retry` hint, and the stream ends;
+  - the client POSTs its response and gets `202`;
+  - an accepted answer goes to the agent;
+  - the client resumes with `GET` and `Last-Event-ID`, and gets the next question or the final result under the original request ID.
+- [x] **State in the session store.** Continuation, generation, negotiated elicitation capability and pending question/result now share a single CAS-protected v2 session entry, bound to the session's identity. Consistently configured replicas can answer/resume it. Sessions stored by earlier builds are not readable after the upgrade; clients must reinitialize. Retention-changing configuration updates also require reinitialization.
+- [x] **At-most-once answer forwarding.** The question is claimed with compare-and-swap before the answer is forwarded. A duplicate or concurrent answer, an answer to another or an old question ID, and a late answer after timeout or decline are acknowledged with `202` and never reach the agent. A malformed answer gets `400` and the question stays open. This deduplicates the answer claim; it is not guaranteed delivery or exactly-once execution at the upstream.
+- [x] **Open questions are protected.** A `tools/call` that would continue the waiting conversation gets a tool error asking the user to answer or cancel first, and the question and its stream stay intact. An independent call (`new_conversation`, or other explicit IDs) runs without eliciting. `notifications/cancelled` with the call's `requestId` ends the question and clears the context, if it still belongs to that conversation. (Changed in the PR #15 review follow-up; 1.3.0 dropped the open question on any new call.)
+- [x] **Configuration and docs.** New `gcl.yaml` properties: `enableElicitation`, `elicitationTimeoutSeconds` and `maxElicitationRounds`. Updated the customer guide (new "3.2 Experimental: MCP elicitation", configuration table, Limitations, checklist item 9) and the README.
+
+### Files
+`src/elicitation.rs`, `src/lib.rs` (`resume_stream`, `answer_elicitation`, `cancel_elicitation`, `start_elicitation`, `settle_answer`), `src/session.rs` (unified v2 entry, generation, CAS updates and retention namespace), `src/a2a.rs` (upstream safety marker and validation), `definition/gcl.yaml`, `tests/shared-storage/`, docs.
+
+### Tests
+The following list and transcript record the original elicitation coverage. They do not establish current Nov 16 results or safety-marker fixture coverage.
+
+| Test | What it proves |
+|---|---|
+| `tests::elicitation_is_off_by_default_and_questions_stay_tool_results` | ChatGPT path: with the default config, even a client that declares elicitation gets the JSON result with `taskId` and `contextId` |
+| `tests::elicitation_needs_the_capability_a_session_store_and_an_sse_capable_call` | No capability, a pre-2025-06-18 revision, a JSON-only `Accept`, or no session store: no elicitation |
+| `tests::accepted_answer_resumes_the_task_and_the_result_arrives_on_the_resumed_stream` | Full round trip: the question on SSE, waiting on resume, the answer is `202` and goes to the agent with `taskId`/`contextId`, the result arrives under the original ID, a repeat answer isn't forwarded, and the context continues |
+| `tests::repeated_questions_stop_at_the_round_limit` | New request and event IDs per round, and the extra question comes back client-managed |
+| `tests::decline_cancel_and_timeout_end_the_conversation` | Each ends with its reason, nothing is sent to the agent, a late answer is ignored, and the next call has no `contextId`/`taskId` |
+| `tests::a_client_that_cannot_show_the_form_gets_the_question_as_a_tool_result` | A JSON-RPC error answer falls back to the client-managed result |
+| `tests::answers_and_streams_are_bound_to_the_session_and_the_question` | Another identity gets `404`, a wrong question ID is ignored, a malformed answer gets `400`, and an unknown stream gets `400` |
+| `tests::auth_required_and_task_less_questions_are_never_elicited` | `auth-required` and plain messages are answered directly |
+| `tests::a_question_without_context_resumes_with_the_task_only` | Works with #9's task-only continuation |
+| `tests::an_agent_failure_after_the_answer_is_a_tool_error_on_the_resumed_stream` | Agent errors after an answer become a tool error |
+| `tests::cancelling_the_call_ends_the_question_but_another_call_does_not` | `notifications/cancelled` ends the question; a new `tools/call` does not |
+| `elicitation::tests::*` (8) | Settings bounds, capability and version gating, form schema, strict answer parsing, event IDs, stream framing, ended results |
+| `make test-shared-storage`, elicitation sections | Live, two replicas on Redis (below) |
+
+```
+Elicitation across replicas (support, experimental)
+  PASS  the question arrives as elicitation/create on SSE  (200 text/event-stream)
+  PASS  flex-2 resumes the stream and waits for the answer  (200)
+  PASS  another client cannot answer  (404)
+  PASS  both replicas acknowledge the answer  ([202, 202])
+  PASS  the answer reaches the agent once, on the same task and context  (1 answers)
+  PASS  the result arrives on flex-2 under the original call id
+Elicitation decline
+  PASS  declining ends the conversation  ({'reason': 'declined', 'state': 'ended'})
+  PASS  the next call starts a new context  (agent got None)
+Client-managed fallback on the same API (ChatGPT-style client)
+  PASS  a client without the capability gets a JSON tool result with the ids
+```
+
+**Original verification boundary:** these initial live checks used a scripted MCP client. Later historical SDK and MCP Inspector checks are recorded below. They do not verify the current safety-marker, CAS and retention changes. ChatGPT remains on client-managed handling because it does not declare the capability and elicitation defaults off.
+
+## PR #15 review follow-up
+
+The second review of PR #15 (at `9dff842`) found seven more problems. It also flagged lint failures and the inherited `minRuntimeVersion` blocker. The branch now contains `fix/p4a-priority-issues` (PR #14). That merge brings in the `minRuntimeVersion` 1.11.0 fix and its build-time check (`scripts/check-min-runtime.py`).
+
+**Merge order:** PR #15 targets `main`, and it includes all of PR #14. Merge #14 first, then #15. Once #14 is in `main`, the #15 diff contains only the remaining-issue fixes.
+
+| # | Finding | Fix | Regression test |
+|---|---|---|---|
+| 1 | A second tool call destroys the outstanding elicitation | A call that continues the waiting conversation is refused with a tool error, and the question and its stream are kept. An independent call runs without eliciting. `start_elicitation` never replaces a question that is still open. | `tests::review_second_call_must_preserve_first_stream` |
+| 2 | A completed task-only response keeps a stale continuation | When a reply has no context and no awaiting task, the stored task is cleared. | `tests::review_completed_task_only_must_clear_continuation` (completed, failed, rejected, canceled) |
+| 3 | An explicit `task_id` inherits an unrelated stored context | If the call passes `context_id` or `task_id`, only the IDs it passes are used. | `tests::review_explicit_task_must_not_inherit_unrelated_context` |
+| 4 | A new call reuses an expired elicitation conversation | A question past its deadline is ended as timed out, and its conversation is forgotten before the call is built. | `tests::review_expired_question_must_not_resume_on_new_call` |
+| 5 | Mixed request/response envelopes still execute | A request or notification that carries `result` or `error` is rejected as `-32600`. Notifications get `400`. Nothing reaches the agent. | `tests::review_mixed_envelope_must_not_execute` |
+| 6 | Malformed A2A Message/Part bodies become successful results | Messages must have a known `role` and a non-empty `messageId`. Each part must carry well-typed `text`, `data`, `file`, `url` or `raw` content. Anything else is a tool error. | `tests::review_invalid_message_must_be_tool_error` |
+| 7 | SSE folding combines different tasks | A stream whose events name a different task or context than the earlier events is rejected. | `tests::review_sse_task_ids_must_match` |
+| 8 | Inherited runtime metadata blocker | Merged from PR #14. `make build` writes `minRuntimeVersion: 1.11.0` and checks it. | `scripts/check-min-runtime.py` (runs in `make build`) |
+
+**How the original follow-up fixes were verified (historical):**
+
+- All eight regression tests were copied unchanged onto the pre-fix code and run there. The rewritten cancel test is one of the eight. All of them fail there, and all pass after the fixes.
+- `cargo test --lib`: 112 passed.
+- `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean. So is `cargo clippy --lib --target wasm32-wasip1 -- -D warnings`.
+- `make build` passes its runtime-version check.
+
+**Superseded limitation:** the original follow-up could replace an answered question's unfetched result. The Nov 16 changes retain completed streams for one session TTL after settlement, including after fetching; a new question during that window is client-managed and cannot replace the retained result.
+
+### End-to-end test with a real MCP SDK client
+
+The original `make test-shared-storage` follow-up added the official MCP Python SDK (`mcp` 2.3.0, pinned), after `check.py`. The script is `tests/shared-storage/sdk_check.py`. It runs in a `python:3.12-slim` container on the compose network and installs the SDK from PyPI; `SKIP_SDK=1` skips it. The SDK handles handshake, Streamable HTTP transport, elicitation callbacks and SSE resumption (GET with `Last-Event-ID` after the question stream ends); the test supplies scripted scenarios and answers:
+
+| Scenario | Checks |
+|---|---|
+| No elicitation (ChatGPT-style, the default path) | The SDK negotiates `2025-06-18`. `tools/list` lists `ask_agent`. A question comes back as an `input-required` result with `taskId` and `contextId`. Passing them back continues the same task. |
+| Elicitation, accept | The SDK gets one `elicitation/create` with the agent's question and an `answer` field. The call resumes and returns the agent's final answer. The answer reaches the agent once, on the asking task. The next call continues the same context, without the finished task. |
+| Elicitation, decline | The call ends with `{"state":"ended","reason":"declined"}`. The next call starts a new context. |
+
+**Bug found and fixed.** The SDK closes the connection as soon as it receives the `202` for its answer. The response filter committed the `202` headers before reading the agent's reply, so Envoy tore the stream down while the filter was still writing the session:
+
+- If the teardown came before the reply was stored, the question stayed in `Answering`, and the resumed stream waited until the SDK timed out.
+- If it came after, the result arrived, but the session still held the finished task. The next call sent that task to the agent.
+
+The scripted client reads the whole body, so `check.py` never saw this. Now the answer leg holds its headers (the combined headers+body state) until the reply is settled and the session is updated, and only then sends the `202` (`response_filter` in `src/lib.rs`). The other modes keep the split flow. The PDK notes report the combined state hanging on the response leg on Flex 1.12.1. That doesn't happen here: the full suite, SDK checks included, passes on 1.11.0 (3 runs), 1.12.1 (2 runs) and 1.13.0 (1 run). Before the fix, the accept scenario failed on every run. `tests::accepted_answer_resumes_the_task_and_the_result_arrives_on_the_resumed_stream` now also checks the next call, but `pdk-unit` doesn't model a client disconnect, so the SDK scenario is the regression test for this bug.
+
+### Release 1.3.1
+
+1.3.1 is this branch: the PR #15 fixes, the SDK test and the answer-leg fix above, with `minRuntimeVersion: 1.11.0`. It replaces 1.3.0, which was published with `minRuntimeVersion: 1.6.1` and without these fixes. Exchange versions can't be overwritten, so 1.3.0 is left in place; use 1.3.1.
+
+### MCP Inspector / TypeScript SDK: an answer given after the first resume never arrived
+
+Found in manual testing with MCP Inspector against 1.3.1. After a question, the client resumes the stream (GET with `Last-Event-ID`) after the 2 s `retry`. If the user hasn't answered yet, the gateway sends a short "waiting" stream and closes it. That stream had no event id. The TypeScript SDK (the client in Inspector) resumes with the last id seen on the *latest* stream, so it came back without `Last-Event-ID`, got `405`, and stopped. The answer reached the agent and the result was stored, but the call timed out on the client. The Python SDK keeps the original id, and its callback had answered before the first resume, so the Python test didn't catch this.
+
+**Fix:** the waiting stream now repeats the client's `Last-Event-ID` as a priming event (`id:` with empty `data:`), which both SDKs record without treating it as a message (`waiting_stream` in `src/elicitation.rs`).
+
+**Regression tests:**
+- `tests/shared-storage/ts_check.mjs` runs the MCP TypeScript SDK (`@modelcontextprotocol/sdk` 1.32.2, pinned, in `node:22-slim`). It answers once at once and once after 5 s. On the unfixed build the 5 s case times out with `-32001`, the same error as in Inspector. With the fix, it returns the result.
+- `sdk_check.py` adds the same slow-answer scenario for the Python SDK.
+- The unit tests that resume while a question is open now check that the waiting stream repeats the event id.
+
+`make test-shared-storage` (44 checks, both SDKs included) passes on Flex 1.11.0 (2 runs), 1.12.1 and 1.13.0. `cargo test --lib`: 112 passed.
+
+### Release 1.3.3
+
+1.3.3 adds the waiting-stream fix above to 1.3.1. Use 1.3.3 with MCP Inspector or any client built on the MCP TypeScript SDK; 1.3.1 times out there when the user answers after the client's first resume.
+
+1.3.3 has the same code as 1.3.2. Only half of the 1.3.2 release reached Exchange: the definition published, then the CLI failed on the implementation (`TypeError: Cannot read properties of undefined (reading 'data')`). Exchange versions can't be replaced, so the release went out again as 1.3.3. Don't use definition 1.3.2; it has no implementation.
+
+### Managed Omni Gateway: `local` sessions get `404`, `remote` works without Redis
+
+Found in manual testing with MCP Inspector on a managed (CloudHub) Omni Gateway with `sessionStoreMode: local`. After a working elicitation, later requests on the same session often got `404` "Session not found". A managed gateway always runs at least two replicas across availability zones and balances requests across them, and Runtime Manager doesn't show the count. Each replica's `local` store only knows the sessions it issued. On that gateway, 33 of 50 `tools/list` calls on one session got `404`. The same policy on one local Flex replica returned 100 of 100.
+
+Managed replicas share storage with each other, with nothing to configure, and PDK `remote` storage uses it. No Redis is needed. A second API instance on the same gateway with `sessionStoreMode: remote` passed:
+- 50 of 50 `tools/list` calls on one session, and 20 new sessions each used immediately after `initialize`;
+- the client-managed flow (guide 3.1) from curl and Postman, with and without `context_id`;
+- elicitation in MCP Inspector: accept, decline or cancel, and two tabs at once;
+- an elicitation answered 70 s after the form appeared, with the MCP TypeScript SDK resuming the stream about every 2 s across replicas.
+
+No code change. The guide now has "5.3 Session store and gateway replicas", says `remote` uses the gateway's shared storage rather than only Redis, describes the remembered conversation and `new_conversation`, says which requests extend `sessionTtlSeconds`, notes Inspector's 60 s per-server request timeout, and adds checklist item 10. The `sessionStoreMode` description in `gcl.yaml` was updated the same way and ships with the next release. The guide's 3.2 table also now describes what a new `tools/call` does while a question is open, as changed in the PR #15 follow-up.
+
+### Nov 16 follow-up (2026-11-16)
+
+Integrated PR #15 behavior, not a publication or server-side PR merge claim:
+
+| Area | Current resolution |
+|---|---|
+| Trusted elicitation | Still off by default. Every `input-required` question requires boolean `Task.metadata["p4a.elicitationSafe"]: true`; status updates do not inherit approval. Missing/false markers return a client-managed result, malformed markers fail validation, and `auth-required` never elicits. Trust the upstream assertion; no arbitrary-text secret detection is promised. |
+| Atomic session transitions | Continuation, generation and pending state share a v2 entry. CAS attempts re-read current state and guard generation plus stream/round ownership as applicable, so stale settlements cannot clear newer context. Earlier namespaces are not migrated: reinitialize. |
+| Retention and configuration | Remote physical retention is TTL + 1800 seconds when elicitation is enabled, otherwise TTL. Logical idle expiry remains TTL, except pending state survives through deadline + replay TTL. Completed streams remain for one TTL after settlement; new questions during retained `Done` state fall back to client-managed results. TTL/`enableElicitation` changes that alter the retention namespace require reinitialization and consistent replica configuration. |
+| Accepted answers and termination | Accepted answers are not input-timed-out; the upstream response timeout applies. `Answering` gets a separate 1800-second processing/recovery deadline from acceptance; an unresolved resume after that deadline attempts to persist an error directing the client to start a new call, not resend the accepted answer. CAS updates retry at most three times; an answer claim/settlement still needing persistence after exhaustion returns `503`, as does failed recovery persistence. `DELETE` acknowledges `204` only after a checked CAS tombstone write, returns `503` on failure (retry), and prevents late revival after successful termination. |
+| Encoding and query keys | Rewritten responses remove `Content-Encoding`; compressed upstream bodies are not decompressed by the bridge. Native pass-through remains unchanged. Version query keys are percent-decoded exactly once before case-insensitive matching, not recursively decoded. |
+| Strict upstream validation | History messages are all validated; result and part oneofs are enforced; artifacts require `artifactId`, and streamed updates require task/context IDs with consistent correlation. Valid v1.0 `data: null` remains accepted; v0.3 data parts require objects. |
+
+**Final integrated verification (2026-11-16):** PR15 tree combining commits `9226547` + `dc7e00d`, before the final merge commit. The parent session reports the unit/integration and static-check results below; the integrated shared-storage log records all three suite completions. The pair identifies the tested integration, not a final merge commit, publication or server-side PR merge.
+
+| Check | Verified evidence |
+|---|---|
+| Unit/filter and Docker integration | Integrated `make test`: 146 unit tests and one `tools_call_round_trip` Docker integration test passed. The integration fixture pins Flex 1.11.0. Coverage includes marker gates, accepted-answer deadline, retained results, short TTL, stale CAS owners, termination/persistence failures, query decoding, history/oneof/update IDs and v1 null data. |
+| Rebuilt WASM and runtime metadata | Integrated `make test-shared-storage` rebuilt the release WASM successfully; its log reports `minRuntimeVersion 1.11.0` passing the `enable_stop_iteration` runtime check. |
+| Definition and static checks | `make validate-definition`, formatting, host clippy and WASM-target clippy passed on the integrated tree, as reported by the parent session. |
+| Shared storage and official SDK clients | Integrated `make test-shared-storage`: all 46 logged PASS checks succeeded: 32 scripted shared-storage checks, 12 official Python SDK checks and 2 official TypeScript SDK checks. The two-replica Local Mode compose fixtures default to Flex 1.11.0 and Redis `7-alpine`, Python `mcp` 2.3.0 on `python:3.12-slim`, and `@modelcontextprotocol/sdk` 1.32.2 on `node:22-slim`. The log does not print version overrides; these version values come from the fixture defaults. It verifies v2 retention namespaces, completed-stream preservation/replay, and SDK accept, slow-answer and decline paths with upstream marker fixtures on the integrated tree. |
+| Evidence log | `pr15-integrated-shared-storage.log` from `make test-shared-storage`: build/runtime check and all three suite completion messages, with 46 PASS lines. |
+| Not run | Current managed-gateway testing, manual target-client/MCP Inspector verification, and live configuration migration, including reinitialization after TTL/elicitation namespace changes. Unit namespace/retention checks and Local Mode continuity tests do not establish live migration behavior. |
 
 ## Nov 16 follow-up verification
 
-Evidence recorded on 2026-11-16 for the PR14 Nov 16 worktree based on source HEAD `e1b5d0921c158922abc0d71e057ca46fbb7cc18c`, including the uncommitted follow-up changes. A final commit identifier is unavailable precommit; these results do not claim publication or merge.
+Separate PR14 history: its follow-up added `/ttl-<effective-seconds>` to remote namespaces without changing the serialized session layout. PR15 supersedes that with a unified v2 entry and `/retention-<seconds>`; do not apply the PR14 namespace description to current PR15 behavior.
+
+Evidence recorded on 2026-11-16 for the separate PR14 Nov 16 worktree based on source HEAD `e1b5d0921c158922abc0d71e057ca46fbb7cc18c`, including its follow-up changes before ancestry integration. These results verify PR14 separately, not the integrated PR15 tree, and do not claim publication or completed merge.
 
 | Check | Verified evidence |
 |---|---|

@@ -17,10 +17,13 @@ use pdk::data_storage::{
     DataStorage, DataStorageBuilder, LocalDataStorage, RemoteDataStorage, StoreMode,
 };
 use pdk::logger;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const NAMESPACE_PREFIX: &str = "mcp-a2a-sessions";
+use crate::elicitation::Pending;
+
+const NAMESPACE_PREFIX: &str = "mcp-a2a-sessions-v2";
 const KEY_FORMAT: &[u8] = b"mcp-a2a-session-key/v1";
 /// Local storage has no TTL, so expired entries are swept every this many writes.
 const LOCAL_SWEEP_INTERVAL: u32 = 256;
@@ -31,23 +34,134 @@ pub const MAX_TTL_SECONDS: u64 = 86_400;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEntry {
-    /// `None` until the agent returned the first context of this session.
+    /// `None` until the agent returned a context in this session.
     pub context_id: Option<String>,
     /// Only set while the agent is waiting on the caller (input-required / auth-required).
     pub task_id: Option<String>,
     /// Last write, in Unix seconds. Zero is a termination tombstone, never a live session.
     pub touched_at: u64,
+    pub generation: u64,
+    pub elicitation: bool,
+    pub pending: Option<Pending>,
 }
 
-impl SessionEntry {
-    pub fn is_live(&self, now: u64, ttl_seconds: u64) -> bool {
-        self.touched_at != 0 && now < self.touched_at.saturating_add(ttl_seconds)
+/// Elicitation view of the CAS-protected session. Its presence means the client declared
+/// elicitation at `initialize`; pending state and continuation are stored atomically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElicitationEntry {
+    pub pending: Option<Pending>,
+    pub touched_at: u64,
+}
+
+/// Stored entries carry their last write time. Expiry is judged against the TTL configured now,
+/// so lowering `sessionTtlSeconds` also shortens the life of entries written before the change.
+pub trait Touched {
+    fn touched_at(&self) -> u64;
+    fn touch(&mut self);
+
+    fn is_live(&self, now: u64, ttl_seconds: u64) -> bool {
+        now < self.touched_at().saturating_add(ttl_seconds)
+    }
+}
+
+impl Touched for SessionEntry {
+    fn is_live(&self, now: u64, ttl_seconds: u64) -> bool {
+        self.touched_at != 0
+            && now
+                < self
+                    .pending
+                    .as_ref()
+                    .map_or(self.touched_at.saturating_add(ttl_seconds), |p| {
+                        let retention = if p.is_open() {
+                            p.deadline.saturating_add(ttl_seconds)
+                        } else {
+                            p.deadline
+                        };
+                        self.touched_at.saturating_add(ttl_seconds).max(retention)
+                    })
+    }
+    fn touched_at(&self) -> u64 {
+        self.touched_at
+    }
+    fn touch(&mut self) {
+        self.touched_at = now_seconds();
     }
 }
 
 enum Backend {
     Local(LocalDataStorage),
     Remote(RemoteDataStorage),
+}
+
+impl Backend {
+    fn new(
+        builder: &DataStorageBuilder,
+        mode: &str,
+        ttl_seconds: u64,
+        namespace: &str,
+    ) -> Option<Self> {
+        match mode {
+            "local" => Some(Backend::Local(builder.local(namespace))),
+            "remote" => Some(Backend::Remote(
+                builder.remote(namespace, remote_ttl_millis(ttl_seconds)),
+            )),
+            _ => None,
+        }
+    }
+
+    async fn get<T: Touched + DeserializeOwned>(
+        &self,
+        key: &str,
+        ttl_seconds: u64,
+    ) -> Option<(T, String)> {
+        let found = match self {
+            Backend::Local(s) => s.get::<T>(key).await,
+            Backend::Remote(s) => s.get::<T>(key).await,
+        };
+        match found {
+            Ok(Some((entry, cas))) if entry.is_live(now_seconds(), ttl_seconds) => {
+                Some((entry, cas))
+            }
+            Ok(_) => None,
+            Err(err) => {
+                // Fail open: losing the remembered context only starts a new conversation.
+                logger::warn!("Session store read failed for {}: {}", key_hint(key), err);
+                None
+            }
+        }
+    }
+
+    async fn put<T: Serialize>(&self, key: &str, mode: &StoreMode, entry: &T) -> bool {
+        let stored = match self {
+            Backend::Local(s) => s.store(key, mode, entry).await,
+            Backend::Remote(s) => s.store(key, mode, entry).await,
+        };
+        match stored {
+            Ok(()) => true,
+            Err(err) => {
+                logger::warn!("Session store write failed for {}: {}", key_hint(key), err);
+                false
+            }
+        }
+    }
+
+    /// Local storage has no TTL, so expired entries are deleted here.
+    async fn sweep<T: Touched + DeserializeOwned>(&self, ttl_seconds: u64) {
+        let Backend::Local(storage) = self else {
+            return;
+        };
+        let Ok(keys) = storage.get_keys().await else {
+            return;
+        };
+        let now = now_seconds();
+        for key in keys {
+            if let Ok(Some((entry, _))) = storage.get::<T>(&key).await {
+                if !entry.is_live(now, ttl_seconds) {
+                    let _ = storage.delete(&key).await;
+                }
+            }
+        }
+    }
 }
 
 pub struct SessionStore {
@@ -64,16 +178,17 @@ impl SessionStore {
         mode: &str,
         ttl_seconds: u64,
         namespace: &str,
+        elicitation: bool,
     ) -> Option<Self> {
         let ttl_seconds = clamp_ttl(ttl_seconds);
-        let backend = match mode {
-            "local" => Backend::Local(builder.local(namespace)),
-            "remote" => Backend::Remote(builder.remote(
-                remote_namespace(namespace, ttl_seconds),
-                remote_ttl_millis(ttl_seconds),
-            )),
-            _ => return None,
+        let retention = if elicitation {
+            ttl_seconds.saturating_add(crate::elicitation::MAX_TIMEOUT_SECONDS)
+        } else {
+            ttl_seconds
         };
+        // Remote storage shares namespace-level TTL configuration across instances.
+        let namespace = remote_namespace(namespace, retention);
+        let backend = Backend::new(builder, mode, retention, &namespace)?;
         Some(SessionStore {
             backend,
             ttl_seconds,
@@ -82,50 +197,30 @@ impl SessionStore {
     }
 
     async fn get(&self, key: &str) -> Option<(SessionEntry, String)> {
-        let found = match &self.backend {
-            Backend::Local(s) => s.get::<SessionEntry>(key).await,
-            Backend::Remote(s) => s.get::<SessionEntry>(key).await,
-        };
-        match found {
-            Ok(Some((entry, cas))) if entry.is_live(now_seconds(), self.ttl_seconds) => {
-                Some((entry, cas))
-            }
-            Ok(_) => None,
-            Err(err) => {
-                // Fail open: losing the remembered context only starts a new conversation.
-                logger::warn!("Session store read failed for {}: {}", key_hint(key), err);
-                None
-            }
-        }
+        self.backend.get(key, self.ttl_seconds).await
     }
 
     async fn put(&self, key: &str, mode: &StoreMode, entry: &SessionEntry) -> bool {
-        let stored = match &self.backend {
-            Backend::Local(s) => s.store(key, mode, entry).await,
-            Backend::Remote(s) => s.store(key, mode, entry).await,
-        };
+        let stored = self.backend.put(key, mode, entry).await;
         self.sweep_if_due().await;
-        match stored {
-            Ok(()) => true,
-            Err(err) => {
-                logger::warn!("Session store write failed for {}: {}", key_hint(key), err);
-                false
-            }
-        }
-    }
-
-    fn fresh_entry(&self, context_id: Option<String>, task_id: Option<String>) -> SessionEntry {
-        SessionEntry {
-            context_id,
-            task_id,
-            touched_at: now_seconds(),
-        }
+        stored
     }
 
     /// Records a newly issued session id. Only registered sessions are ever read or updated.
-    pub async fn register(&self, key: &str) -> bool {
-        self.put(key, &StoreMode::Absent, &self.fresh_entry(None, None))
-            .await
+    /// `elicitation` marks a client that declared elicitation, when it is enabled.
+    pub async fn register(&self, key: &str, elicitation: bool) -> bool {
+        let entry = SessionEntry {
+            context_id: None,
+            task_id: None,
+            touched_at: now_seconds(),
+            generation: 0,
+            elicitation,
+            pending: None,
+        };
+        if !self.put(key, &StoreMode::Absent, &entry).await {
+            return false;
+        }
+        true
     }
 
     /// The live entry of a registered session; `None` for unknown, expired or deleted sessions.
@@ -133,54 +228,93 @@ impl SessionStore {
         self.get(key).await.map(|(entry, _)| entry)
     }
 
-    /// Remembers the latest context. A session deleted (or expired) while the call was in flight
-    /// stays deleted: the compare-and-swap only updates the entry that is still there.
-    pub async fn update(&self, key: &str, context_id: String, task_id: Option<String>) {
-        let Some((_, cas)) = self.get(key).await else {
-            logger::debug!(
-                "Session {} ended before the agent answered; not remembered.",
-                key_hint(key)
-            );
-            return;
-        };
-        let entry = self.fresh_entry(Some(context_id), task_id);
-        self.put(key, &StoreMode::Cas(cas), &entry).await;
+    pub fn ttl_seconds(&self) -> u64 {
+        self.ttl_seconds
     }
 
-    /// A checked CAS write ends the session without PDK 1.8's remote delete swallowing errors.
-    /// Keeping the versioned tombstone also prevents an in-flight update from resurrecting it.
+    /// Remembers the latest context and pending task. A session deleted (or expired) while the
+    /// call was in flight stays deleted: the compare-and-swap only updates the entry that is still
+    /// there, so a late answer cannot bring a terminated session back.
+    /// Changes the live entry with `change`, which returns `false` to leave it as it is. The
+    /// Each of at most three CAS attempts re-reads the entry and rechecks the guard. The closure
+    /// must be retry-safe; captured outputs are valid only when this method returns `true`.
+    /// Returns `true` when the change was stored.
+    pub async fn update_with(
+        &self,
+        key: &str,
+        mut change: impl FnMut(&mut SessionEntry) -> bool,
+    ) -> bool {
+        for _ in 0..3 {
+            let Some((mut entry, cas)) = self.get(key).await else {
+                return false;
+            };
+            if !change(&mut entry) {
+                return false;
+            }
+            entry.touch();
+            if self.put(key, &StoreMode::Cas(cas), &entry).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The elicitation state of a session whose client declared elicitation; `None` otherwise.
+    /// Callers check that the session itself is live first.
+    pub async fn load_elicitation(&self, key: &str) -> Option<ElicitationEntry> {
+        let entry = self.load(key).await?;
+        entry.elicitation.then_some(ElicitationEntry {
+            pending: entry.pending,
+            touched_at: entry.touched_at,
+        })
+    }
+
+    /// Like [`update_with`](Self::update_with), for the elicitation state.
+    pub async fn update_elicitation(
+        &self,
+        key: &str,
+        mut change: impl FnMut(&mut ElicitationEntry) -> bool,
+    ) -> bool {
+        self.update_with(key, |entry| {
+            if !entry.elicitation {
+                return false;
+            }
+            let mut state = ElicitationEntry {
+                pending: entry.pending.clone(),
+                touched_at: entry.touched_at,
+            };
+            if !change(&mut state) {
+                return false;
+            }
+            entry.pending = state.pending;
+            true
+        })
+        .await
+    }
+
     pub async fn remove(&self, key: &str) -> bool {
-        let Some((_, cas)) = self.get(key).await else {
+        let Some((mut entry, cas)) = self.get(key).await else {
             return false;
         };
-        let tombstone = SessionEntry {
-            context_id: None,
-            task_id: None,
-            touched_at: 0,
-        };
-        self.put(key, &StoreMode::Cas(cas), &tombstone).await
+        entry.context_id = None;
+        entry.task_id = None;
+        entry.pending = None;
+        entry.elicitation = false;
+        entry.touched_at = 0;
+        // Do not touch the tombstone: a late CAS writer must observe the termination.
+        self.put(key, &StoreMode::Cas(cas), &entry).await
     }
 
     async fn sweep_if_due(&self) {
-        let Backend::Local(storage) = &self.backend else {
+        if !matches!(self.backend, Backend::Local(_)) {
             return;
-        };
+        }
         let writes = self.writes.get().wrapping_add(1);
         self.writes.set(writes);
         if !writes.is_multiple_of(LOCAL_SWEEP_INTERVAL) {
             return;
         }
-        let Ok(keys) = storage.get_keys().await else {
-            return;
-        };
-        let now = now_seconds();
-        for key in keys {
-            if let Ok(Some((entry, _))) = storage.get::<SessionEntry>(&key).await {
-                if !entry.is_live(now, self.ttl_seconds) {
-                    let _ = storage.delete(&key).await;
-                }
-            }
-        }
+        self.backend.sweep::<SessionEntry>(self.ttl_seconds).await;
     }
 }
 
@@ -188,15 +322,23 @@ pub fn clamp_ttl(ttl_seconds: u64) -> u64 {
     ttl_seconds.clamp(MIN_TTL_SECONDS, MAX_TTL_SECONDS)
 }
 
-/// The Redis TTL matches the configured TTL that `is_live` checks, so both expire together.
+/// Physical retention also leaves a window to deliver expired questions and replay results.
 pub fn remote_ttl_millis(ttl_seconds: u64) -> u32 {
-    u32::try_from(clamp_ttl(ttl_seconds) * 1000).unwrap_or(u32::MAX)
+    let retention = ttl_seconds.clamp(
+        MIN_TTL_SECONDS,
+        MAX_TTL_SECONDS + crate::elicitation::MAX_TIMEOUT_SECONDS,
+    );
+    u32::try_from(retention * 1000).unwrap_or(u32::MAX)
 }
 
-/// PDK 1.8 sets TTL only when creating a remote store. A changed TTL must use a new store;
-/// replicas with the same effective TTL share it, but reconfiguration does not preserve sessions.
-pub fn remote_namespace(namespace: &str, ttl_seconds: u64) -> String {
-    format!("{}/ttl-{}", namespace, clamp_ttl(ttl_seconds))
+/// PDK 1.8 sets TTL only when creating a remote store. Scope stores by physical retention,
+/// including the question-processing window, rather than only the idle session TTL.
+pub fn remote_namespace(namespace: &str, retention_seconds: u64) -> String {
+    format!(
+        "{}/retention-{}",
+        namespace,
+        remote_ttl_millis(retention_seconds) / 1000
+    )
 }
 
 /// One namespace per API instance and policy. Replicas of the same instance share it; other
@@ -262,10 +404,27 @@ fn key_hint(key: &str) -> String {
 }
 
 pub fn now_seconds() -> u64 {
-    SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    #[cfg(test)]
+    let now = now + test_clock::OFFSET.with(Cell::get);
+    now
+}
+
+/// Lets filter tests move time forward; pdk-unit runs the filters on the test's thread.
+#[cfg(test)]
+pub mod test_clock {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub static OFFSET: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub fn advance(seconds: u64) {
+        OFFSET.with(|offset| offset.set(offset.get() + seconds));
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +432,54 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn remote_tombstone_rejects_stale_and_later_updates() {
+        use pdk::hl::*;
+
+        async fn check(launcher: Launcher, builder: DataStorageBuilder) -> anyhow::Result<()> {
+            let store = SessionStore::from_config(&builder, "remote", 60, "test-v2", true).unwrap();
+            launcher
+                .launch(on_request(|_: RequestState| async {
+                    assert!(store.register("session", true).await);
+                    let (mut stale, cas) = store.get("session").await.unwrap();
+                    assert!(store.remove("session").await);
+                    let Backend::Remote(storage) = &store.backend else {
+                        panic!("remote expected")
+                    };
+                    let (tombstone, _) = storage
+                        .get::<SessionEntry>("session")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(tombstone.touched_at, 0);
+                    assert_eq!(tombstone.context_id, None);
+                    assert_eq!(tombstone.task_id, None);
+                    assert_eq!(tombstone.pending, None);
+                    stale.context_id = Some("late".into());
+                    assert!(!store.put("session", &StoreMode::Cas(cas), &stale).await);
+                    assert!(!store.update_with("session", |_| true).await);
+                    assert!(store.load("session").await.is_none());
+                    assert!(!store.remove("session").await);
+                    Flow::Break::<()>(Response::new(204))
+                }))
+                .await?;
+            Ok(())
+        }
+
+        let mut tester = pdk_unit::UnitTestBuilder::default()
+            .with_http_upstream(
+                "x-flex-keyvalue-store",
+                crate::tests::RemoteStorage::default(),
+            )
+            .with_entrypoint(check);
+        assert_eq!(
+            tester
+                .request(pdk_unit::UnitHttpRequest::post())
+                .status_code(),
+            204
+        );
+    }
 
     #[test]
     fn session_key_binds_scope_session_and_identity() {
@@ -315,11 +522,14 @@ mod tests {
     #[test]
     fn namespace_is_per_api_instance_and_policy() {
         let a = namespace(Some("api-1"), Some("/hr"), "bridge.default");
-        assert_eq!(a, "mcp-a2a-sessions/api-1/bridge.default");
+        assert_eq!(a, "mcp-a2a-sessions-v2/api-1/bridge.default");
         assert_ne!(a, namespace(Some("api-2"), Some("/hr"), "bridge.default"));
         assert_ne!(a, namespace(Some("api-1"), Some("/hr"), "other.default"));
-        assert_eq!(namespace(None, Some("/hr"), "p"), "mcp-a2a-sessions//hr/p");
-        assert_eq!(namespace(Some(""), None, "p"), "mcp-a2a-sessions/-/p");
+        assert_eq!(
+            namespace(None, Some("/hr"), "p"),
+            "mcp-a2a-sessions-v2//hr/p"
+        );
+        assert_eq!(namespace(Some(""), None, "p"), "mcp-a2a-sessions-v2/-/p");
     }
 
     #[test]
@@ -328,7 +538,7 @@ mod tests {
         assert_eq!(clamp_ttl(1800), 1800);
         assert_eq!(clamp_ttl(1_000_000), 86_400);
         assert_eq!(remote_ttl_millis(1800), 1_800_000);
-        assert_eq!(remote_ttl_millis(1_000_000), 86_400_000);
+        assert_eq!(remote_ttl_millis(1_000_000), 88_200_000);
     }
 
     #[test]
@@ -342,7 +552,7 @@ mod tests {
         assert_eq!(remote_namespace(&scope, 0), remote_namespace(&scope, 60));
         assert_eq!(
             remote_namespace(&scope, 1800),
-            format!("{}/ttl-1800", scope)
+            format!("{}/retention-1800", scope)
         );
     }
 
@@ -352,6 +562,9 @@ mod tests {
             context_id: None,
             task_id: None,
             touched_at: 0,
+            generation: 0,
+            elicitation: false,
+            pending: None,
         };
         for now in [0, 1, 60, u64::MAX] {
             assert!(!tombstone.is_live(now, MAX_TTL_SECONDS));
@@ -363,11 +576,12 @@ mod tests {
         builder: DataStorageBuilder,
     ) -> anyhow::Result<()> {
         let store =
-            SessionStore::from_config(&builder, "remote", 1800, "termination-test").unwrap();
+            SessionStore::from_config(&builder, "remote", 1800, "termination-test", false).unwrap();
         launcher
             .launch(pdk::hl::on_request(|_: pdk::hl::RequestState| async {
-                assert!(store.register("session").await);
-                let (_, stale_cas) = store.get("session").await.unwrap();
+                assert!(store.register("session", false).await);
+                let (mut stale, stale_cas) = store.get("session").await.unwrap();
+                stale.context_id = Some("late".into());
                 assert!(store.remove("session").await);
                 let Backend::Remote(storage) = &store.backend else {
                     panic!("remote backend expected");
@@ -381,14 +595,10 @@ mod tests {
                 assert_eq!(tombstone.context_id, None);
                 assert!(
                     !store
-                        .put(
-                            "session",
-                            &StoreMode::Cas(stale_cas),
-                            &store.fresh_entry(Some("late".into()), None)
-                        )
+                        .put("session", &StoreMode::Cas(stale_cas), &stale)
                         .await
                 );
-                store.update("session", "later".into(), None).await;
+                assert!(!store.update_with("session", |_| true).await);
                 assert!(store.load("session").await.is_none());
                 assert!(!store.remove("session").await);
                 pdk::hl::Flow::Break::<()>(pdk::hl::Response::new(204))
@@ -398,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_tombstone_rejects_stale_and_later_updates() {
+    fn pr14_remote_tombstone_rejects_stale_and_later_updates() {
         let mut tester = pdk_unit::UnitTestBuilder::default()
             .with_http_upstream(
                 "x-flex-keyvalue-store",
@@ -419,6 +629,9 @@ mod tests {
             context_id: None,
             task_id: None,
             touched_at: 1_000,
+            generation: 0,
+            elicitation: false,
+            pending: None,
         };
         assert!(entry.is_live(1_000 + 1_799, 1_800));
         assert!(!entry.is_live(1_000 + 1_800, 1_800));

@@ -82,9 +82,10 @@ async fn tools_call_round_trip() -> anyhow::Result<()> {
         .post(format!("{flex_url}/a2a/my-agent"))
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2025-06-18")
         .body(
             json!({
-                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "jsonrpc": "2.0", "id": "broker-1", "method": "tools/call",
                 "params": { "name": "ask_agent", "arguments": { "message": "Find the page" } }
             })
             .to_string(),
@@ -92,9 +93,11 @@ async fn tools_call_round_trip() -> anyhow::Result<()> {
         .send()
         .await?;
 
-    assert_eq!(response.status(), 200);
-    let body: Value = response.json().await?;
-    assert_eq!(body["id"], 1);
+    let status = response.status();
+    let text = response.text().await?;
+    assert_eq!(status, 200, "{}", text);
+    let body: Value = serde_json::from_str(&text)?;
+    assert_eq!(body["id"], "broker-1");
     assert_eq!(body["result"]["isError"], false);
     assert_eq!(
         body["result"]["structuredContent"]["contextId"],
