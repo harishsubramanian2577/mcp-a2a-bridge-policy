@@ -7,3 +7,5 @@ certificate.yaml
 blog/
 playground/config/custom-policies/*
 !playground/config/custom-policies/note.txt
+tests/shared-storage/config/custom-policies/
+tests/shared-storage/config/api.yaml

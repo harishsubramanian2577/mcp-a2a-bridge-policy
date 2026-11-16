@@ -18,7 +18,9 @@ const FLEX_PORT: Port = 8081;
 const SAMPLE_RESPONSE: &str = include_str!("fixtures/a2a_v1_send_message_response.json");
 
 // A real Flex instance in front of a mocked A2A agent: the MCP tools/call must reach the agent
-// as an A2A SendMessage on the configured a2aPath, and come back as an MCP tool result.
+// as an A2A SendMessage and come back as an MCP tool result. Local mode has no API base path, so
+// a2aPath cannot be applied here; the client calls the agent's path and the unit tests cover the
+// rewrite.
 #[pdk_test]
 async fn tools_call_round_trip() -> anyhow::Result<()> {
     let httpmock_config = HttpMockConfig::builder()
@@ -33,20 +35,20 @@ async fn tools_call_round_trip() -> anyhow::Result<()> {
             "toolName": "ask_agent",
             "a2aProtocolVersion": "1.0",
             "passThroughA2A": false,
-            "a2aPath": "/a2a/my-agent",
+            "a2aPath": "",
         }))
         .build();
 
     let api_config = ApiConfig::builder()
         .name("mcpBridge")
         .upstream(&httpmock_config)
-        .path("/agents-mcp")
+        .path("/")
         .port(FLEX_PORT)
         .policies([policy_config])
         .build();
 
     let flex_config = FlexConfig::builder()
-        .version("1.10.0")
+        .version("1.11.0")
         .hostname("local-flex")
         .with_api(api_config)
         .config_mounts([(POLICY_DIR, "policy"), (COMMON_CONFIG_DIR, "common")])
@@ -77,7 +79,7 @@ async fn tools_call_round_trip() -> anyhow::Result<()> {
 
     let client = reqwest::Client::new();
     let response = client
-        .post(format!("{flex_url}/agents-mcp/mcp"))
+        .post(format!("{flex_url}/a2a/my-agent"))
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
         .body(
