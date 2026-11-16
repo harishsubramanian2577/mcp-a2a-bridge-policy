@@ -10,8 +10,10 @@ It is a **single-tool adapter**, not a full MCP↔A2A protocol translation: each
 | Version | 1.3.3 |
 | Category | Transformation |
 | API instance types | MCP, A2A (v0.3), A2A (v1.0) |
-| PDK | 1.8.0 |
+| PDK | 1.10.0 |
 | Flex Gateway | 1.11.0 or later (1.10.x can't load 1.1.0 or later) |
+
+**PDK upgrade verification, 2026-11-16:** PDK, pdk-unit, pdk-test and cargo-anypoint target stable 1.10.0. The upgraded worktree passes the WASM build, 146 unit tests, one Docker integration test, all 46 shared-storage/SDK checks, definition validation, formatting and host/WASM clippy. Policy version 1.3.3 and minimum Flex runtime 1.11.0 are unchanged; the upgrade is not a new published release.
 
 **Integrated verification, 2026-11-16:** the PR15 tree combining commits `9226547` + `dc7e00d` passed `make test` with 146 unit tests and one Docker integration test, and `make test-shared-storage` with 46 checks (32 shared-storage, 12 official Python SDK, 2 official TypeScript SDK; log `pr15-integrated-shared-storage.log`). Definition validation, formatting, host clippy and WASM clippy passed. The fixtures default to Flex 1.11.0, Python MCP SDK 2.3.0 and TypeScript SDK 1.32.2. Managed-gateway testing and live configuration migration were not run. The commit pair identifies the verified integrated tree before the final merge commit; this is not a publication or server-side PR merge claim. The version above identifies the original release. See [the evidence and boundaries](docs/P4A-Issue-Resolutions.md#nov-16-follow-up-2026-11-16).
 
@@ -93,7 +95,7 @@ postman/           Postman collection for MCP calls with context_id/task_id foll
 docs/              Customer guide (Markdown, Word, PDF)
 ```
 
-This is a PDK 1.8 single-project (unified) layout: one `make release` publishes both the definition and the implementation.
+This is a PDK 1.10 single-project (unified) layout: the definition and implementation are packaged together. Use the approved P4A workflow to publish or release the policy.
 
 ## Build and test
 
