@@ -12,7 +12,7 @@ implementation_asset_id = "mcp-atoa-bridge-policy-flex"
 
 [dependencies]
 # enable_stop_iteration: the request filter classifies the body before it touches any header (issue #4).
-pdk = { version = "1.8.0", features = ["enable_stop_iteration"] }
+pdk = { version = "=1.10.0", features = ["enable_stop_iteration"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -29,7 +29,7 @@ opt-level = 'z'
 strip = "debuginfo"
 
 [dev-dependencies]
-pdk-unit = { version = "=1.8.0", features = ["enable_stop_iteration"] }
-pdk-test = { version = "=1.8.0" }
+pdk-unit = { version = "=1.10.0", features = ["enable_stop_iteration"] }
+pdk-test = { version = "=1.10.0" }
 httpmock = "0.6"
 reqwest = { version = "0.11", features = ["json"] }
