@@ -2,7 +2,7 @@
 
 This document tracks the fixes for the P4A review findings on the MCP A2A Bridge Policy.
 
-**Evidence scope:** release-era test counts, PASS transcripts and deployment reports below are historical evidence for the named original builds. Current PR #15 results are recorded separately in [Nov 16 follow-up](#nov-16-follow-up-2026-11-16): 137 unit tests, one Docker integration test and 46 shared-storage/official-SDK checks passed. Current behavior supersedes older implementation descriptions where noted; managed-gateway testing and live configuration migration were not run for this follow-up.
+**Evidence scope:** release-era test counts, PASS transcripts and deployment reports below are historical evidence for the named original builds. Final integrated PR15 verification on 2026-11-16 is recorded in [Nov 16 follow-up](#nov-16-follow-up-2026-11-16): 146 unit tests, one Docker integration test and 46 shared-storage/official-SDK checks passed, along with definition validation, formatting and host/WASM clippy. The verified tree combines `9226547` + `dc7e00d` before the final merge commit; this is not a publication or server-side PR merge claim. PR14's separate 70-unit/one-integration/18-shared-storage history is retained below. Current v2 behavior supersedes PR14's namespace descriptions; managed-gateway testing and live configuration migration were not run for these follow-ups.
 
 | | |
 |---|---|
@@ -10,7 +10,7 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 | Fixed in | 1.1.0, branch `fix/p4a-priority-issues` (priority issues)<br>1.3.0, branch `fix/p4a-remaining-issues` (remaining issues; the interim 1.2.0 was never published) |
 | Priority issues | [#1](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/1), [#4](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/4), [#12](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/12) |
 | Remaining issues | [#2](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/2), [#3](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/3), [#5](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/5), [#6](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/6), [#7](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/7), [#8](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/8), [#9](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/9), [#10](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/10), [#11](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/11), [#13](https://github.com/harishsubramanian2577/mcp-a2a-bridge-policy/issues/13) |
-| Test baseline | Historical: 32 unit tests on 1.0.3, 61 on 1.1.0, 105 on 1.3.0, 112 after the original PR #15 review follow-up. Current Nov 16 worktree: 137 unit tests and one Docker integration test passed; final shared-storage/SDK run passed 46 checks (evidence below). |
+| Test baseline | Historical: 32 unit tests on 1.0.3, 61 on 1.1.0, 105 on 1.3.0, 112 after the original PR #15 review follow-up. Nov 16 separate PR14 worktree: 70 unit tests and one Docker integration passed. PR15 had 137 unit tests before ancestry integration; final integrated verification passed 146 unit tests, one Docker integration and 46 shared-storage/SDK checks. |
 | Minimum gateway | Flex Gateway 1.11.0 (1.1.0 and later use PDK stop-iteration, which 1.10.x doesn't support) |
 
 ## Status
@@ -33,12 +33,12 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 
 ## How the fixes were verified
 
-This section records the original 1.1.0 runs. For original 1.3.0 evidence, see [Verification of 1.3.0](#verification-of-130); neither section verifies the Nov 16 changes.
+This section distinguishes original 1.1.0 runs from the separate Nov 16 PR14 follow-up results. For original 1.3.0 evidence, see [Verification of 1.3.0](#verification-of-130). Final integrated PR15 results are recorded separately in [Nov 16 follow-up](#nov-16-follow-up-2026-11-16).
 
 1. **Unit and filter tests.**
    - The tests drive the real policy entrypoint through the PDK 1.8.0 `pdk-unit` harness.
    - Command: `cargo test --lib`.
-   - Result: 61 passed, 0 failed.
+    - PR14 follow-up result (2026-11-16): 70 passed, 0 failed. `make build`, `cargo fmt --all -- --check`, and `cargo clippy --lib --tests -- -D warnings` also passed. The Docker integration test passed too; see the current verification summary below.
 2. **Baseline check.**
    - The new filter-level regression tests were copied unchanged onto the 1.0.3 code (`main` at `3d61a41`) and run there.
    - 13 of the 14 failed, each with the bug the issue reports.
@@ -48,10 +48,10 @@ This section records the original 1.1.0 runs. For original 1.3.0 evidence, see [
    - Command: `make build`.
    - Result: succeeded. The only new host import is WASI `random_get`, which Flex Gateway/Envoy provides.
 4. **Integration tests.**
-   - `make test` passes on Flex 1.11.0: 61 unit tests and the `tools_call_round_trip` integration test.
+    - Current PR14 follow-up (2026-11-16): 70 unit tests and the one `tools_call_round_trip` Docker integration test passed on Flex 1.11.0. The historical pre-follow-up run had 61 passing unit tests plus that integration test.
    - The first live run found a bug in the test itself. pdk-test puts the API path in the upstream `destinationPath`, so the gateway has no base path in local mode and `a2aPath` can't be applied. The test now calls the agent's path with `a2aPath` empty. The `a2aPath` rewrite is covered by unit tests.
    - `make test` needs a Flex registration: put a local-mode `registration.yaml` in `tests/config/` (gitignored), which is mounted into the gateway.
-5. **Shared-storage test.** `make test-shared-storage` passes on Flex 1.11.0, 1.12.0 and 1.13.0 (see issue #12 below).
+5. **Shared-storage test.** The prior-session PR14 follow-up run passed all 18 checks on two Flex 1.11.0 replicas sharing Redis. The older 1.11.0/1.12.0/1.13.0 transcript under #12 remains historical, not evidence of rerunning the current follow-up on all three versions.
 6. **Minimum gateway version.** The same harness on Flex 1.10.6 fails at load time with `FlexAbiHandler: command 'flex_enable_stop_iteration' unknown`. The request filter needs PDK's stop-iteration feature (the #4 fix), so 1.1.0 requires Flex Gateway 1.11.0 or later. The README and customer guide say so, and both integration tests and the playground are pinned to 1.11.0.
 7. **Published runtime metadata.**
    - PDK's `build-asset-files` always writes `minRuntimeVersion: 1.6.1` into `target/implementation/metadata.yaml` and `target/implementation-dev/metadata.yaml`, and `publish`/`release` upload those files as they are.
@@ -81,6 +81,7 @@ The policy logged the error, but it had already changed the headers to `200` / `
   3. Replace the result with a small tool error.
 - [x] Added `mcp::deliver_result`. If the write still fails, it writes a minimal tool-error envelope, so the original A2A body is never released.
 - [x] Moved the session update so it runs only after a successful delivery of the real answer (full or reduced), never after a replacement or a failure.
+- [x] Rewritten responses drop upstream `Content-Encoding` along with `Content-Length`. Compressed, unparseable responses become plain JSON tool errors, not plain JSON mislabeled as gzip. Native A2A responses keep their headers.
 - [x] On the request side, a generated A2A request that would exceed the limit now gets `-32602` before any rewrite. Previously it got a `-32603` after a failed write.
 
 ### Files
@@ -163,7 +164,7 @@ The detailed reproductions in the issue were withheld pending a private channel.
   - Redis keys contain neither the session ID nor the identity, and their TTL matches `sessionTtlSeconds`;
   - the session survives a restart of flex-1;
   - only the owner can `DELETE` it, and once deleted on flex-2 it is gone on flex-1 too.
-- [x] **Original live run of that test: passed.** It ran on 2026-11-11 against Flex Gateway 1.11.0, 1.12.0 and 1.13.0 in local mode, with a local-mode registration mounted read-only (`REGISTRATION=<path>`). The harness refuses to run if Flex starts in connected mode. All 18 checks passed on that build; the following old-namespace transcript is not a current retention check:
+- [x] **Historical live run of that test: passed.** It ran on 2026-11-11, before the checked-tombstone and TTL-qualified-namespace follow-up, against Flex Gateway 1.11.0, 1.12.0 and 1.13.0 in local mode, with a local-mode registration mounted read-only (`REGISTRATION=<path>`). The harness refuses to run if Flex starts in connected mode. All 18 checks passed at that revision; this is not live evidence for the follow-up:
 
   ```
   Replica continuity (hr, bound to x-client-id)
@@ -655,7 +656,7 @@ No code change. The guide now has "5.3 Session store and gateway replicas", says
 
 ### Nov 16 follow-up (2026-11-16)
 
-Current PR #15 changes, not a release or live-verification claim:
+Integrated PR #15 behavior, not a publication or server-side PR merge claim:
 
 | Area | Current resolution |
 |---|---|
@@ -666,12 +667,26 @@ Current PR #15 changes, not a release or live-verification claim:
 | Encoding and query keys | Rewritten responses remove `Content-Encoding`; compressed upstream bodies are not decompressed by the bridge. Native pass-through remains unchanged. Version query keys are percent-decoded exactly once before case-insensitive matching, not recursively decoded. |
 | Strict upstream validation | History messages are all validated; result and part oneofs are enforced; artifacts require `artifactId`, and streamed updates require task/context IDs with consistent correlation. Valid v1.0 `data: null` remains accepted; v0.3 data parts require objects. |
 
-**Current verified evidence (2026-11-16):** PR15 Nov 16 worktree based on source HEAD `53cdc2d0a1c647653ab4b36eb210932f3480d952`, including the uncommitted follow-up changes. A final commit identifier is unavailable precommit. These checks do not claim that the changes are published or merged.
+**Final integrated verification (2026-11-16):** PR15 tree combining commits `9226547` + `dc7e00d`, before the final merge commit. The parent session reports the unit/integration and static-check results below; the integrated shared-storage log records all three suite completions. The pair identifies the tested integration, not a final merge commit, publication or server-side PR merge.
 
 | Check | Verified evidence |
 |---|---|
-| Unit/filter and Docker integration | `make test`: 137 unit tests and one `tools_call_round_trip` Docker integration test passed. The integration fixture pins Flex 1.11.0. Coverage includes marker gates, accepted-answer deadline, retained results, short TTL, stale CAS owners, termination/persistence failures, query decoding, history/oneof/update IDs and v1 null data. |
-| Rebuilt WASM and runtime metadata | Final `make test-shared-storage` rebuilt the release WASM successfully; its log reports `minRuntimeVersion 1.11.0` passing the `enable_stop_iteration` runtime check. No additional current PR15 formatting/clippy or separate definition-validation run is asserted here. |
-| Shared storage and official SDK clients | Final `make test-shared-storage`: all 46 logged PASS checks succeeded: 32 scripted shared-storage checks, 12 official Python SDK checks and 2 official TypeScript SDK checks. The two-replica Local Mode compose fixtures default to Flex 1.11.0 and Redis `7-alpine`, Python `mcp` 2.3.0 on `python:3.12-slim`, and `@modelcontextprotocol/sdk` 1.32.2 on `node:22-slim`. The log does not print version overrides; these version values come from the fixture defaults. It verifies v2 retention namespaces, completed-stream preservation/replay, and SDK accept, slow-answer and decline paths with upstream marker fixtures. |
-| Evidence log | `/var/folders/sg/yy2zqfr95mz46qt8pm8kd8yw0000gn/T/opencode/pr15-shared-storage.log`: build/runtime check and all three suite completion messages, with 46 PASS lines. |
+| Unit/filter and Docker integration | Integrated `make test`: 146 unit tests and one `tools_call_round_trip` Docker integration test passed. The integration fixture pins Flex 1.11.0. Coverage includes marker gates, accepted-answer deadline, retained results, short TTL, stale CAS owners, termination/persistence failures, query decoding, history/oneof/update IDs and v1 null data. |
+| Rebuilt WASM and runtime metadata | Integrated `make test-shared-storage` rebuilt the release WASM successfully; its log reports `minRuntimeVersion 1.11.0` passing the `enable_stop_iteration` runtime check. |
+| Definition and static checks | `make validate-definition`, formatting, host clippy and WASM-target clippy passed on the integrated tree, as reported by the parent session. |
+| Shared storage and official SDK clients | Integrated `make test-shared-storage`: all 46 logged PASS checks succeeded: 32 scripted shared-storage checks, 12 official Python SDK checks and 2 official TypeScript SDK checks. The two-replica Local Mode compose fixtures default to Flex 1.11.0 and Redis `7-alpine`, Python `mcp` 2.3.0 on `python:3.12-slim`, and `@modelcontextprotocol/sdk` 1.32.2 on `node:22-slim`. The log does not print version overrides; these version values come from the fixture defaults. It verifies v2 retention namespaces, completed-stream preservation/replay, and SDK accept, slow-answer and decline paths with upstream marker fixtures on the integrated tree. |
+| Evidence log | `pr15-integrated-shared-storage.log` from `make test-shared-storage`: build/runtime check and all three suite completion messages, with 46 PASS lines. |
 | Not run | Current managed-gateway testing, manual target-client/MCP Inspector verification, and live configuration migration, including reinitialization after TTL/elicitation namespace changes. Unit namespace/retention checks and Local Mode continuity tests do not establish live migration behavior. |
+
+## Nov 16 follow-up verification
+
+Separate PR14 history: its follow-up added `/ttl-<effective-seconds>` to remote namespaces without changing the serialized session layout. PR15 supersedes that with a unified v2 entry and `/retention-<seconds>`; do not apply the PR14 namespace description to current PR15 behavior.
+
+Evidence recorded on 2026-11-16 for the separate PR14 Nov 16 worktree based on source HEAD `e1b5d0921c158922abc0d71e057ca46fbb7cc18c`, including its follow-up changes before ancestry integration. These results verify PR14 separately, not the integrated PR15 tree, and do not claim publication or completed merge.
+
+| Check | Verified evidence |
+|---|---|
+| Build and static checks | `make build`, `cargo fmt --all -- --check`, and `cargo clippy --lib --tests -- -D warnings` passed. |
+| Unit and Docker integration | 70 unit tests and one `tools_call_round_trip` Docker integration test passed; the integration fixture uses Flex 1.11.0. |
+| Shared storage | Prior-session `make test-shared-storage`: all 18 checks passed on two Flex 1.11.0 replicas sharing Redis in Local Mode. |
+| Not run | Managed-gateway testing and live configuration migration, including TTL changes on a running deployment. Namespace-change regressions are unit evidence, not live migration evidence. |

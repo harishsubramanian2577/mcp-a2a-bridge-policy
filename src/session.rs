@@ -38,7 +38,7 @@ pub struct SessionEntry {
     pub context_id: Option<String>,
     /// Only set while the agent is waiting on the caller (input-required / auth-required).
     pub task_id: Option<String>,
-    /// Last write, in Unix seconds.
+    /// Last write, in Unix seconds. Zero is a termination tombstone, never a live session.
     pub touched_at: u64,
     pub generation: u64,
     pub elicitation: bool,
@@ -187,7 +187,7 @@ impl SessionStore {
             ttl_seconds
         };
         // Remote storage shares namespace-level TTL configuration across instances.
-        let namespace = format!("{}/retention-{}", namespace, retention);
+        let namespace = remote_namespace(namespace, retention);
         let backend = Backend::new(builder, mode, retention, &namespace)?;
         Some(SessionStore {
             backend,
@@ -329,6 +329,16 @@ pub fn remote_ttl_millis(ttl_seconds: u64) -> u32 {
         MAX_TTL_SECONDS + crate::elicitation::MAX_TIMEOUT_SECONDS,
     );
     u32::try_from(retention * 1000).unwrap_or(u32::MAX)
+}
+
+/// PDK 1.8 sets TTL only when creating a remote store. Scope stores by physical retention,
+/// including the question-processing window, rather than only the idle session TTL.
+pub fn remote_namespace(namespace: &str, retention_seconds: u64) -> String {
+    format!(
+        "{}/retention-{}",
+        namespace,
+        remote_ttl_millis(retention_seconds) / 1000
+    )
 }
 
 /// One namespace per API instance and policy. Replicas of the same instance share it; other
@@ -529,6 +539,88 @@ mod tests {
         assert_eq!(clamp_ttl(1_000_000), 86_400);
         assert_eq!(remote_ttl_millis(1800), 1_800_000);
         assert_eq!(remote_ttl_millis(1_000_000), 88_200_000);
+    }
+
+    #[test]
+    fn remote_namespace_follows_the_effective_ttl() {
+        let scope = namespace(Some("api-1"), None, "p");
+        assert_eq!(
+            remote_namespace(&scope, 1800),
+            remote_namespace(&scope, 1800)
+        );
+        assert_ne!(remote_namespace(&scope, 1800), remote_namespace(&scope, 60));
+        assert_eq!(remote_namespace(&scope, 0), remote_namespace(&scope, 60));
+        assert_eq!(
+            remote_namespace(&scope, 1800),
+            format!("{}/retention-1800", scope)
+        );
+    }
+
+    #[test]
+    fn tombstones_are_never_live_even_near_the_epoch() {
+        let tombstone = SessionEntry {
+            context_id: None,
+            task_id: None,
+            touched_at: 0,
+            generation: 0,
+            elicitation: false,
+            pending: None,
+        };
+        for now in [0, 1, 60, u64::MAX] {
+            assert!(!tombstone.is_live(now, MAX_TTL_SECONDS));
+        }
+    }
+
+    async fn check_remote_tombstone(
+        launcher: pdk::hl::Launcher,
+        builder: DataStorageBuilder,
+    ) -> anyhow::Result<()> {
+        let store =
+            SessionStore::from_config(&builder, "remote", 1800, "termination-test", false).unwrap();
+        launcher
+            .launch(pdk::hl::on_request(|_: pdk::hl::RequestState| async {
+                assert!(store.register("session", false).await);
+                let (mut stale, stale_cas) = store.get("session").await.unwrap();
+                stale.context_id = Some("late".into());
+                assert!(store.remove("session").await);
+                let Backend::Remote(storage) = &store.backend else {
+                    panic!("remote backend expected");
+                };
+                let (tombstone, _) = storage
+                    .get::<SessionEntry>("session")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(tombstone.touched_at, 0);
+                assert_eq!(tombstone.context_id, None);
+                assert!(
+                    !store
+                        .put("session", &StoreMode::Cas(stale_cas), &stale)
+                        .await
+                );
+                assert!(!store.update_with("session", |_| true).await);
+                assert!(store.load("session").await.is_none());
+                assert!(!store.remove("session").await);
+                pdk::hl::Flow::Break::<()>(pdk::hl::Response::new(204))
+            }))
+            .await?;
+        Ok(())
+    }
+
+    #[test]
+    fn pr14_remote_tombstone_rejects_stale_and_later_updates() {
+        let mut tester = pdk_unit::UnitTestBuilder::default()
+            .with_http_upstream(
+                "x-flex-keyvalue-store",
+                crate::tests::RemoteStorage::default(),
+            )
+            .with_entrypoint(check_remote_tombstone);
+        assert_eq!(
+            tester
+                .request(pdk_unit::UnitHttpRequest::post())
+                .status_code(),
+            204
+        );
     }
 
     #[test]

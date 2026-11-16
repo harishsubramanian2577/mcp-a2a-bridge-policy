@@ -1724,4 +1724,26 @@ mod tests {
         assert_eq!(strip_version_query("/a?x=1"), "/a?x=1");
         assert_eq!(strip_version_query("/a"), "/a");
     }
+
+    #[test]
+    fn version_query_decodes_names_once_and_preserves_other_parameters() {
+        assert_eq!(
+            strip_version_query(
+                "/a?%412A%2dVersion=0.3&x=%26%3D&%61%32%61-version=1.0&A2A-Version"
+            ),
+            "/a?x=%26%3D"
+        );
+        for query in [
+            "A2A%252DVersion=1.0",
+            "A2A+Version=1.0",
+            "A2A-Version%=1.0",
+            "A2A-Version%2=1.0",
+            "A2A-Version%GG=1.0",
+            "%FF=1.0",
+            "x=A2A-Version",
+        ] {
+            let path = format!("/a?{}", query);
+            assert_eq!(strip_version_query(&path), path);
+        }
+    }
 }

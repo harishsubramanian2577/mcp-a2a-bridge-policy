@@ -13,7 +13,9 @@ It is a **single-tool adapter**, not a full MCP↔A2A protocol translation: each
 | PDK | 1.8.0 |
 | Flex Gateway | 1.11.0 or later (1.10.x can't load 1.1.0 or later) |
 
-Behavior described below includes the Nov 16 PR #15 worktree changes based on source HEAD `53cdc2d0a1c647653ab4b36eb210932f3480d952`; no final commit identifier is available precommit. **Verified 2026-11-16:** `make test` passed 137 unit tests and one Docker integration test; the final `make test-shared-storage` log records 46 passing checks (32 shared-storage, 12 official Python SDK, 2 official TypeScript SDK). The fixtures default to Flex 1.11.0, Python MCP SDK 2.3.0 and TypeScript SDK 1.32.2. Managed-gateway testing and live configuration migration were not run. The version above identifies the original release, not a claim that these changes are published or merged. See [the evidence and boundaries](docs/P4A-Issue-Resolutions.md#nov-16-follow-up-2026-11-16).
+**Integrated verification, 2026-11-16:** the PR15 tree combining commits `9226547` + `dc7e00d` passed `make test` with 146 unit tests and one Docker integration test, and `make test-shared-storage` with 46 checks (32 shared-storage, 12 official Python SDK, 2 official TypeScript SDK; log `pr15-integrated-shared-storage.log`). Definition validation, formatting, host clippy and WASM clippy passed. The fixtures default to Flex 1.11.0, Python MCP SDK 2.3.0 and TypeScript SDK 1.32.2. Managed-gateway testing and live configuration migration were not run. The commit pair identifies the verified integrated tree before the final merge commit; this is not a publication or server-side PR merge claim. The version above identifies the original release. See [the evidence and boundaries](docs/P4A-Issue-Resolutions.md#nov-16-follow-up-2026-11-16).
+
+**PR14 history, verified 2026-11-16:** its Nov 16 worktree based on source HEAD `e1b5d0921c158922abc0d71e057ca46fbb7cc18c` passed `make build`, formatting, clippy, 70 unit tests and one Docker integration test on Flex 1.11.0. The prior-session shared-storage run passed all 18 checks on two Flex 1.11.0 replicas with Redis. These verify the separate PR14 worktree, not integrated PR15. Managed-gateway testing and live configuration migration were not run. See [verification details](docs/P4A-Issue-Resolutions.md#nov-16-follow-up-verification).
 
 ## What it does
 
@@ -66,6 +68,15 @@ The full guide, with diagrams, every property, policy-order tables, limitations 
 | `enableElicitation` | `false` | Experimental: elicit only upstream-marked safe `input-required` questions. Needs a session store; leave off for ChatGPT |
 | `elicitationTimeoutSeconds` | `300` | Time to answer each elicited question (30–1800, independent of idle TTL); not an upstream-response timeout |
 | `maxElicitationRounds` | `3` | Elicited questions per call (1–10); more come back as a normal tool result |
+
+Sessions share the v2 retention namespace only across replicas with the same API/policy scope
+and effective retention configuration (`sessionTtlSeconds` plus the `enableElicitation` retention
+allowance). A retention-changing update selects a new namespace and requires `initialize` again.
+Old entries are not migrated; returning to an earlier retention namespace can expose old state
+only while it remains logically live. This is not seamless session preservation.
+Session `DELETE` returns `204` only after a conditional tombstone write succeeds, `404` for an
+unknown/expired/terminated session or the wrong caller, and `503` if termination cannot be
+confirmed (including a concurrent update). Retry `DELETE` after `503`.
 
 ## Repository layout
 

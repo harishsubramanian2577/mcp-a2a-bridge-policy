@@ -10,7 +10,9 @@ A custom Omni Gateway (Flex Gateway) policy that lets MCP clients use an A2A age
 | Applies to API instance types | MCP, A2A (v0.3), A2A (v1.0) |
 | Gateway | Omni Gateway / Flex Gateway (managed or self-managed), **1.11.0 or later** for policy 1.1.0 and later |
 
-This guide includes the Nov 16 PR #15 worktree behavior based on source HEAD `53cdc2d0a1c647653ab4b36eb210932f3480d952`; a final commit identifier is unavailable precommit. Verified on 2026-11-16: `make test` passed 137 unit tests and one Docker integration test, and the final shared-storage run passed 46 checks including both official MCP SDK clients. These Local Mode results are not a claim of publication, merge, managed-gateway testing or live configuration migration. See [the current evidence](P4A-Issue-Resolutions.md#nov-16-follow-up-2026-11-16).
+This guide describes the integrated PR15 tree combining commits `9226547` + `dc7e00d`, verified on 2026-11-16 before the final merge commit. `make test` passed 146 unit tests and one Docker integration test; `make test-shared-storage` passed 46 checks including both official MCP SDK clients (log `pr15-integrated-shared-storage.log`). Definition validation, formatting, host clippy and WASM clippy passed. These Local Mode results are not a claim of publication, server-side PR merge, managed-gateway testing or live configuration migration. See [the evidence](P4A-Issue-Resolutions.md#nov-16-follow-up-2026-11-16).
+
+**PR14 history, verified 2026-11-16:** its Nov 16 worktree based on source HEAD `e1b5d0921c158922abc0d71e057ca46fbb7cc18c` passed `make build`, formatting, clippy, 70 unit tests and one Docker integration test on Flex 1.11.0. The prior-session shared-storage run passed 18 checks on two Flex 1.11.0 replicas with Redis. This verifies the separate PR14 worktree, not the integrated PR15 tree. Managed-gateway testing and live configuration migration were not run. See [verification details](P4A-Issue-Resolutions.md#nov-16-follow-up-verification).
 
 ---
 
@@ -166,7 +168,7 @@ How the policy decides what to do with each request:
 1. **The request is MCP**, for example `initialize`, `tools/list` or `tools/call`. The policy answers it itself or converts it, as in section 3.
 2. **The request is native A2A**, for example a `SendMessage` or `message/send` JSON-RPC call, an HTTP+JSON call such as `POST /message:send`, or the agent card. With `passThroughA2A: true`, the policy recognises it before any MCP handling and forwards it to the broker untouched. It does not add or change the `A2A-Version` header, the path or the body, and the broker's response goes back unchanged.
 
-Only translated `tools/call` requests are changed. Their `A2A-Version` header and query parameter always match the configured `a2aProtocolVersion`: `1.0` sets the header to `1.0`, and `0.3` removes it.
+Only translated `tools/call` requests are changed. Their version follows the configured `a2aProtocolVersion`: `1.0` sets the `A2A-Version` header to `1.0`, and `0.3` removes it. Both remove all `A2A-Version` query parameters, including percent-encoded names, while preserving unrelated query parameters.
 
 - **When to use:** you want a single endpoint for every client, or you can't create a second API instance.
 - **Key settings:** `passThroughA2A: true` and `a2aPath` left empty. MCP clients call the A2A base URL, with the trailing slash.
