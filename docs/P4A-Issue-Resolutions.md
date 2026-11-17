@@ -17,6 +17,7 @@ This document tracks the fixes for the P4A review findings on the MCP A2A Bridge
 
 | Issue | Title | Status |
 |---|---|---|
+| #16 | Add optional cached Agent Card-derived MCP discovery | Added in 1.4.0 |
 | #1 | Failed response rewrite returns raw A2A payload instead of an MCP error | Fixed in 1.1.0 |
 | #4 | Classify native A2A before MCP dispatch and preserve native version semantics | Fixed in 1.1.0 |
 | #12 | Session isolation, identity binding and token generation | Fixed in 1.1.0. Verified live on two Flex replicas sharing Redis. Private reporting is enabled. |
@@ -690,3 +691,40 @@ Evidence recorded on 2026-11-16 for the separate PR14 Nov 16 worktree based on s
 | Unit and Docker integration | 70 unit tests and one `tools_call_round_trip` Docker integration test passed; the integration fixture uses Flex 1.11.0. |
 | Shared storage | Prior-session `make test-shared-storage`: all 18 checks passed on two Flex 1.11.0 replicas sharing Redis in Local Mode. |
 | Not run | Managed-gateway testing and live configuration migration, including TTL changes on a running deployment. Namespace-change regressions are unit evidence, not live migration evidence. |
+
+## Issue #16: Agent Card-derived MCP discovery
+
+Released as 1.4.0 on 2026-11-17. Enhancement, not a review finding: `manual` stays the default and behaves exactly like 1.3.3.
+
+### Decisions
+
+| Question | Decision |
+|---|---|
+| Modes | `metadataMode`: `manual` (default, no fetch, no timer) or `agent-card`. |
+| Mapping | Tool description = card `description` + `Skills:` list (`name: description`, card order, up to 20) + the fixed continuation note. `serverInfo.title` = card `name`. Text is whitespace/control-flattened and length-capped, so the mapping is deterministic. Nothing else is read. |
+| Contract | Tool name, `inputSchema`, `serverInfo.name`, `instructions`, routing and security never come from the card. No tool per skill and no typed inputs from skill text. |
+| Precedence | A valid cached card replaces `toolDescription`; `toolDescription` is the fallback on a cold cache, an invalid card, or a cache older than refresh + max stale. Never empty. |
+| Fetching | `GET agentCardUrl` through the PDK HTTP client from a `format: service` property (registered at Flex init), optional `Authorization`, configurable timeout. Runs in one background task per worker, at startup then every `agentCardRefreshSeconds`; failures retry after min(30 s, refresh). Requests never fetch, so refreshes are deduplicated by construction. |
+| Cache | One validated entry per policy instance per worker, in instance memory (bounded: one card, ≤256 KB parsed, bounded output). Isolated by policy instance and upstream; never shared through the session store. |
+| Trust | Card content is untrusted display data; it cannot grant access, change routing or override gateway controls. Operators point `agentCardUrl` at a trusted upstream. |
+
+### Files
+
+`src/agent_card.rs` (parse, map, cache, refresh loop), `src/lib.rs` (entrypoint timer/HTTP client, `initialize`/`tools/list` lookups), `src/mcp.rs` (`serverInfo.title`), `definition/gcl.yaml` (six new properties), `src/tests.rs`, `README.md`, `docs/MCP-A2A-Bridge-Policy.md` (5.4, limitations, checklist item 11).
+
+### Tests
+
+| Acceptance criterion | Evidence |
+|---|---|
+| Manual mode performs no fetch | Unit: `manual_mode_never_fetches_the_card` (URL configured, 10 min simulated, 0 fetches). Local Flex: manual instance with its own card path, 0 requests logged. |
+| Deterministic, documented mapping | Unit: `maps_description_and_skills_in_card_order`, `mapping_is_deterministic`, `card_text_is_flattened_and_bounded`; guide section 5.4. |
+| Overrides | Unit: `agent_card_mode_derives_description_and_title_but_keeps_the_contract` (card replaces description; `serverName`, name and schema unchanged), `agent_card_mode_without_url_uses_manual_metadata`. |
+| Malformed cards | Unit: `rejects_malformed_and_empty_cards`, cold-cache cases in `cold_cache_failures_advertise_the_manual_metadata_and_retry`. Local Flex: truncated JSON rejected and logged. |
+| Timeout / unreachable | Unit: `unreachable_card_upstream_falls_back_like_a_timeout`. Local Flex: card server stopped → `status 504`, fallback to manual. |
+| Cache hit and expiry | Unit: `cached_card_serves_requests_without_refetching_until_refresh`, `stale_card_is_kept_within_the_bound_then_dropped`, `cache_expires_only_after_max_age`. Local Flex: with refresh 30 s + max stale 60 s, a broken card kept the last good card for ~90 s, then fell back. |
+| Concurrent refresh | Unit: 20 discovery requests cause no fetch; 10 refresh periods cause exactly 10 fetches. Local Flex: one fetch per worker per period. |
+| Scope isolation | Unit: `each_policy_instance_keeps_its_own_card`. Local Flex: agent-card and manual instances on one gateway advertise their own metadata. |
+| Card change keeps discovery and execution consistent | Unit: `refreshed_card_changes_discovery_but_not_tool_execution`. Local Flex: new card text visible within one refresh period; name and schema unchanged. Managed gateway: `tools/call` succeeds in agent-card mode. |
+
+**Verification (2026-11-17):** `make test` (161 unit tests and one Docker integration test on Flex 1.11.0), `make test-shared-storage` (46 checks: 32 shared-storage on two replicas with Redis, 12 official Python SDK, 2 official TypeScript SDK), release WASM build and `make validate-definition` passed. On a managed Omni Gateway, an MCP instance switched to `agent-card` advertised the broker card's description, 4 skills and title within one refresh; 30 consecutive `tools/list` calls across replicas returned an identical description and schema; `tools/call` completed. A Mode 2 A2A instance left in `manual` was unchanged and still passed the native agent card through. A Connected-mode Flex Gateway 1.11.0 verified card change, malformed card, outage, stale bound and recovery. Not run: an authenticated card endpoint (`agentCardAuthorization`).
+

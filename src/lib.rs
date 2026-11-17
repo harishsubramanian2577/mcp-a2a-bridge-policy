@@ -12,6 +12,7 @@
 //! through MCP elicitation instead; see [`elicitation`].
 
 mod a2a;
+mod agent_card;
 mod elicitation;
 mod generated;
 mod mcp;
@@ -20,9 +21,11 @@ mod session;
 mod tests;
 
 use std::cell::Cell;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use pdk::data_storage::DataStorageBuilder;
+use pdk::hl::timer::Clock;
 use pdk::hl::*;
 use pdk::logger;
 use pdk::metadata::Metadata;
@@ -36,12 +39,16 @@ use crate::session::{SessionEntry, SessionStore};
 
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const JSON_CONTENT_TYPE: &str = "application/json";
+/// Timer granularity of the Agent Card refresh loop.
+const CARD_TICK_SECONDS: u64 = 5;
 
 struct Bridge {
     tool_name: String,
     tool_description: String,
     server_name: String,
     server_instructions: Option<String>,
+    /// Card-derived discovery metadata; stays empty in manual mode.
+    card: agent_card::Cache,
     a2a_version: A2aVersion,
     pass_through_a2a: bool,
     structured_content: bool,
@@ -102,6 +109,7 @@ impl Bridge {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "mcp-a2a-bridge".to_string()),
             server_instructions: config.server_instructions.filter(|s| !s.is_empty()),
+            card: agent_card::Cache::default(),
             a2a_version: A2aVersion::from_config(&config.a_2_a_protocol_version),
             pass_through_a2a: config.pass_through_a_2_a.unwrap_or(false),
             structured_content: config.include_structured_content.unwrap_or(true),
@@ -510,7 +518,11 @@ async fn request_filter(request_state: RequestState, bridge: &Bridge) -> Flow<Op
             &id,
             mcp::tools_list_result(mcp::tool_definition(
                 &bridge.tool_name,
-                &bridge.tool_description,
+                bridge
+                    .card
+                    .current()
+                    .map_or(bridge.tool_description.clone(), |m| m.tool_description)
+                    .as_str(),
                 bridge.sessions.is_some(),
             )),
         ),
@@ -560,9 +572,11 @@ async fn initialize(
     headers: &RequestHeaders,
     elicit: bool,
 ) -> Flow<Option<Transcoded>> {
+    let title = bridge.card.current().and_then(|m| m.title);
     let result = mcp::initialize_result(
         Some(requested),
         &bridge.server_name,
+        title.as_deref(),
         SERVER_VERSION,
         bridge.server_instructions.as_deref(),
     );
@@ -1331,6 +1345,8 @@ async fn configure(
     Configuration(bytes): Configuration,
     store_builder: DataStorageBuilder,
     metadata: Metadata,
+    client: HttpClient,
+    clock: Clock,
 ) -> Result<()> {
     let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
         anyhow!(
@@ -1339,10 +1355,20 @@ async fn configure(
             err
         )
     })?;
+    let card_source = agent_card::Source::from_config(&config);
     let bridge = Bridge::new(config, &store_builder, &metadata);
 
     let filter = on_request(|rs| request_filter(rs, &bridge))
         .on_response(|rs, request_data| response_filter(rs, request_data, &bridge));
-    launcher.launch(filter).await?;
+    match card_source {
+        // Manual mode: no timer and no card fetch.
+        None => launcher.launch(filter).await?,
+        Some(source) => {
+            let timer = clock.period(Duration::from_secs(CARD_TICK_SECONDS));
+            let refresh = agent_card::refresh_loop(&source, &bridge.card, &client, &timer);
+            let (launched, ()) = futures::join!(launcher.launch(filter), refresh);
+            launched?;
+        }
+    }
     Ok(())
 }

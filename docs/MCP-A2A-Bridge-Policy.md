@@ -5,10 +5,12 @@ A custom Omni Gateway (Flex Gateway) policy that lets MCP clients use an A2A age
 | | |
 |---|---|
 | Exchange asset | `mcp-a2a-bridge-policy` (definition), `mcp-atoa-bridge-policy-flex` (implementation) |
-| Original release version | 1.3.3 |
+| Version | 1.4.0 (adds optional Agent Card discovery, issue #16; 1.3.3 was the original release) |
 | Category | Transformation |
 | Applies to API instance types | MCP, A2A (v0.3), A2A (v1.0) |
 | Gateway | Omni Gateway / Flex Gateway (managed or self-managed), **1.11.0 or later** for policy 1.1.0 and later |
+
+**What's new in 1.4.0 (issue #16):** optional discovery metadata from the upstream Agent Card (`metadataMode: agent-card`, section 5.4). The default, `manual`, behaves exactly like 1.3.3 and never fetches the card; existing configurations need no change. Verified on 2026-11-17: 161 unit tests, a managed Omni Gateway (agent-card and manual instances side by side) and a Flex Gateway 1.11.0 in Connected mode (card change, malformed card, outage, stale window and recovery). See [Agent Card discovery verification](P4A-Issue-Resolutions.md#issue-16-agent-card-derived-mcp-discovery).
 
 This guide describes the integrated PR15 tree combining commits `9226547` + `dc7e00d`, verified on 2026-11-16 before the final merge commit. `make test` passed 146 unit tests and one Docker integration test; `make test-shared-storage` passed 46 checks including both official MCP SDK clients (log `pr15-integrated-shared-storage.log`). Definition validation, formatting, host clippy and WASM clippy passed. These Local Mode results are not a claim of publication, server-side PR merge, managed-gateway testing or live configuration migration. See [the evidence](P4A-Issue-Resolutions.md#nov-16-follow-up-2026-11-16).
 
@@ -194,6 +196,12 @@ Only translated `tools/call` requests are changed. Their version follows the con
 | `enableElicitation` | No | `false` | **Experimental.** Ask only trusted upstream-marked safe `input-required` questions through MCP elicitation (3.2). Needs a session store and a client that declared elicitation. Leave it off for ChatGPT. | `false` |
 | `elicitationTimeoutSeconds` | No | `300` | How long the user has to answer each elicited question (30–1800, independent of `sessionTtlSeconds`). Once accepted, the answer waits under the upstream response timeout instead. | `300` |
 | `maxElicitationRounds` | No | `3` | Questions asked through elicitation per `tools/call` (1–10). A further question is returned as an ordinary tool result with the IDs. | `3` |
+| `metadataMode` | No | `manual` | Where the discovery metadata comes from (5.4). `manual` advertises `toolDescription` and `serverName` as configured and never fetches anything. `agent-card` builds the tool description and `serverInfo.title` from the upstream Agent Card. | `agent-card` |
+| `agentCardUrl` | With `agent-card` | empty | Full URL of the agent's own card, reached directly (not through this API's public URL). | `https://<broker-host>/.well-known/agent-card.json` |
+| `agentCardAuthorization` | No | empty | `Authorization` header value for a card that requires authentication. Stored as a sensitive value. | `Bearer <token>` |
+| `agentCardRefreshSeconds` | No | `300` | How often each gateway worker refreshes the card (30–86400). A failed fetch is retried after 30 s, or sooner if this is lower. | `300` |
+| `agentCardMaxStaleSeconds` | No | `3600` | How long a cached card may still be used after refreshes start failing, on top of the refresh period (0–604800). | `3600` |
+| `agentCardTimeoutSeconds` | No | `5` | Timeout of one card fetch (1–30). | `5` |
 
 **Limits, sessions and protocol checks**
 - **Gateway version.** 1.1.0 and later need Flex Gateway **1.11.0 or later**. It reads the request body before choosing which headers to change, and Flex 1.10.x doesn't support that: the gateway logs `FlexAbiHandler: command 'flex_enable_stop_iteration' unknown` and doesn't start the API. Stay on policy 1.0.x until the gateway is upgraded.
@@ -252,6 +260,40 @@ The API Manager form shows this field on a single line, so write the rules inlin
 - **Why `local` fails with several replicas.** Requests are load-balanced across replicas, and each replica's `local` store holds only the sessions it issued. A request that lands on another replica gets `404` "Session not found". On a managed gateway that is most requests: on a three-replica gateway, 33 of 50 `tools/list` calls on one session got `404` with `local`, and 50 of 50 succeeded with `remote`.
 - **`remote` without shared storage.** On a self-managed gateway with no Shared Storage configured, PDK stops the policy at startup, so the misconfiguration shows up at deployment rather than at runtime.
 - **Historical verification on a managed gateway (released policy 1.3.3, `remote`):** 50 `tools/list` calls on one session, 20 new sessions each used immediately after `initialize`, the client-managed flow (3.1) with and without `context_id`, and an elicitation answered 70 s after the form appeared, while the client resumed the stream about every 2 s across replicas. These are original release results, not verification of the Nov 16 PR #15 changes; current evidence is tracked in [the review resolutions](P4A-Issue-Resolutions.md#nov-16-follow-up-2026-11-16).
+
+### 5.4 Discovery metadata from the Agent Card (`metadataMode`)
+
+By default (`manual`) the tool description and server name are exactly what you configure, and the policy never fetches the Agent Card. With `metadataMode: agent-card` the policy keeps the advertised description in step with the agent's own card.
+
+**Mapping.** It is deterministic and documented here:
+
+| Card field | MCP field | Rule |
+|---|---|---|
+| `description` | `tools[0].description` | First paragraph. Whitespace and control characters are collapsed into single spaces; capped at 2000 characters. |
+| `skills[]` | `tools[0].description` | A `Skills:` list in card order, one line per skill: `name: description` (`id` when there is no `name`). Up to 20 skills, then `(and N more)`; each part capped at 300 characters. |
+| (fixed) | `tools[0].description` | Always ends with the instruction to pass back `context_id` and `task_id`. |
+| `name` | `serverInfo.title` | Capped at 100 characters. Omitted when the card has no name. |
+
+Nothing else is taken from the card. The tool name, the argument schema, `serverInfo.name` (`serverName`), `instructions` (`serverInstructions`), routing and security never change, so `tools/call` behaves the same whatever the card says, and a client that cached `tools/list` keeps working after the card changes. The policy does not create a tool per skill.
+
+**Precedence.** While a valid card is cached, the card-derived description replaces `toolDescription`. `toolDescription` and the absence of a title are the fallback: they are used before the first successful fetch, when the card is invalid, and after the cache has gone stale beyond the bound. `toolDescription` should therefore still be a good description on its own.
+
+**Fetching and caching.**
+- Each gateway worker fetches the card once at startup, in the background, then every `agentCardRefreshSeconds`. Requests never fetch the card and never wait for it, so there is a single refresh in flight per worker and no extra latency on `initialize` or `tools/list`.
+- A failed fetch (timeout, non-200 status, a body that is not a JSON object, larger than 256 KB, or with neither a description nor a described skill) keeps the previous card and is retried after 30 s. A card older than `agentCardRefreshSeconds + agentCardMaxStaleSeconds` is dropped and the manual metadata is advertised until a fetch succeeds. The policy never advertises an empty description.
+- The cache holds one card per policy instance, in that instance's memory. Two APIs, or two policy instances, never share a card.
+
+**Multiple replicas and workers.** Each worker on each replica keeps its own copy, so for up to one refresh period after the card changes, different replicas can advertise different descriptions. Only the description and title can differ; the tool contract is identical, and `capabilities.tools.listChanged` stays `false`. Expect about one fetch per worker per refresh period from every replica, and size `agentCardRefreshSeconds` for that.
+
+**Authenticated cards.** If the agent protects its card, set `agentCardAuthorization` to the full header value, for example `Bearer <token>` or `Basic <credentials>`. It is sent only to `agentCardUrl`. A static token must outlive the deployment; the policy does not obtain or refresh tokens. Prefer a card that can be read without credentials on the internal network.
+
+**Operating notes.**
+- **Card URL.** Use an address the gateway can reach directly, normally the agent's internal URL (for example the upstream service address of the broker's API instance followed by `.well-known/agent-card.json`). The public URL of an API protected by Client ID enforcement needs `client_id`/`client_secret` headers, which the policy does not send.
+- **Startup.** The first fetch happens as soon as the policy loads; until it completes (normally well under a second), `tools/list` returns `toolDescription`.
+- **Logs.** A failed refresh logs `Agent Card refresh failed: <reason>` (for example `status 504` or `card is not JSON`) as a warning. When the cache passes its bound, the policy logs `Cached Agent Card is too old; advertising the manual metadata.`
+- **Turning it off.** Set `metadataMode` back to `manual` (or remove it). The cache and the background fetch go away with the policy update.
+
+**Trust.** Point `agentCardUrl` at the agent itself, an upstream you trust, not at a public URL that clients control. Card text is treated as untrusted display data: it only reaches the client's model as description text, it is flattened so it can't add structure, and it never grants access, changes routing or overrides gateway policies. A card that tells the model to do something is still only a description, so review the card as you would review `toolDescription`.
 
 ---
 
@@ -341,6 +383,7 @@ The policy is a single-tool adapter. It covers the common case, where one questi
 | **Bindings and versions** | Translated calls use A2A JSON-RPC, v1.0 or v0.3 (configured). Native HTTP+JSON, JSON-RPC and gRPC are passed through unchanged in Mode 2. MCP revisions 2025-06-18, 2025-03-26 and 2024-11-05, over Streamable HTTP only. | The broker must accept JSON-RPC for translated calls. Clients that need the legacy HTTP+SSE transport (pre-2025-03-26) aren't supported. |
 | **Sessions** | Optional gateway memory of continuation, generation and pending elicitation in one v2 entry. `local` is per replica; `remote` is shared. Idle expiry is `sessionTtlSeconds`, with pending-question and completed-stream retention as in section 5. | Use `remote` with several replicas (5.3), or pass IDs explicitly without a store. Idle discovery/ping traffic does not renew the session. The v2 upgrade and retention-changing configuration updates require `initialize` again; physical storage retention is not an idle-lifetime guarantee. |
 | **Retries** | Does not retry upstream calls or deduplicate ordinary `tools/call` retries. Session CAS updates retry at most three times; elicitation answer claims are deduplicated. Unpersisted answer claims/settlements return `503` after exhaustion. | A retried `tools/call` may act twice. Do not blindly resend an accepted elicitation answer after `503`: resume its stream, observe recovery, and heed the instruction not to resend. Be careful with agents that take actions (payments, record changes). |
+| **Discovery metadata** | `manual` (default) advertises the configured `toolDescription`. `agent-card` derives the description and `serverInfo.title` from the card, cached per worker and refreshed in the background (5.4). One tool only; card skills never become separate tools or typed arguments. | After a card change, replicas can advertise different descriptions for up to one refresh period. `listChanged` notifications are not sent; clients see the new description on their next `tools/list`. Only an `Authorization` header can be sent to a protected card. |
 | **Client responsibilities** | Returns interrupted states (`input-required`, `auth-required`, `working`) as normal results with instructions. | The client must show them to the user and continue with the returned IDs. It must not invent IDs, or treat an interrupted result as final. |
 
 ## 9. Verification checklist
@@ -357,3 +400,4 @@ Run these against the deployed proxy before sharing it with clients.
 8. **Timeout.** A long multi-agent question completes within the response timeout.
 9. **Elicitation (only if `enableElicitation` is on).** Use a trusted broker that marks each safe question with `Task.metadata["p4a.elicitationSafe"]: true`. Confirm the client shows a form, answering continues the same task, and declining ends the conversation. Missing/false markers, including on later questions, must fall back to 3.1; `auth-required` must never elicit. Verify an accepted answer is not input-timed-out while waiting for the broker, a short idle TTL still allows question timeout delivery/replay, and a new question cannot replace a retained completed stream. With ChatGPT, confirm the 3.1 result with `taskId`. For MCP Inspector, first raise its per-server request timeout (server card **Settings** → Timeouts → Request Timeout, while disconnected; default 60 s); Inspector doesn't extend it while the form is open.
 10. **Replicas (session store on).** On one session, run 50 `tools/list` calls with the same `Mcp-Session-Id`. All must return `200`; any `404` means the store isn't shared across replicas (5.3).
+11. **Agent Card discovery (only if `metadataMode` is `agent-card`).** Within one refresh period of applying the policy, `tools/list` shows the card's description and a `Skills:` list, and `initialize` shows `serverInfo.title` set to the card's name. The tool name, `inputSchema` and `serverInfo.name` are the same as in `manual` mode, and a `tools/call` still succeeds. If the description stays at `toolDescription`, the gateway can't read `agentCardUrl`: check the URL from the gateway's network, the card's authentication, and the gateway log for `Agent Card refresh failed`.

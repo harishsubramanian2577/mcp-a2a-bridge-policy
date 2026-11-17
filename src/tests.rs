@@ -2973,3 +2973,279 @@ fn review_sse_task_ids_must_match() {
     let message = json_body(&backend.next().unwrap())["params"]["message"].clone();
     assert!(message.get("contextId").is_none(), "{}", message);
 }
+
+// ---- Agent Card discovery (issue #16) ----
+
+const CARD_HOST: &str = "cards.example.com";
+
+/// A card upstream that serves `responses` in order (the last one repeats) and counts fetches.
+struct CardUpstream {
+    responses: std::cell::RefCell<std::collections::VecDeque<UnitHttpResponse>>,
+    last: std::cell::RefCell<UnitHttpResponse>,
+    calls: std::cell::RefCell<Vec<UnitHttpRequest>>,
+}
+
+impl CardUpstream {
+    fn new(responses: Vec<UnitHttpResponse>) -> Rc<Self> {
+        Rc::new(CardUpstream {
+            last: std::cell::RefCell::new(responses.last().cloned().unwrap()),
+            responses: std::cell::RefCell::new(responses.into()),
+            calls: Default::default(),
+        })
+    }
+
+    fn fetches(&self) -> usize {
+        self.calls.borrow().len()
+    }
+}
+
+impl pdk_unit::Backend for CardUpstream {
+    fn call(&self, request: UnitHttpRequest) -> UnitHttpResponse {
+        self.calls.borrow_mut().push(request);
+        let next = self.responses.borrow_mut().pop_front();
+        match next {
+            Some(response) => {
+                *self.last.borrow_mut() = response.clone();
+                response
+            }
+            None => self.last.borrow().clone(),
+        }
+    }
+}
+
+fn card(body: Value) -> UnitHttpResponse {
+    UnitHttpResponse::new(200)
+        .with_header("content-type", "application/json")
+        .with_body(body.to_string())
+}
+
+fn hr_card() -> UnitHttpResponse {
+    card(json!({
+        "name": "HR Agent",
+        "description": "Answers HR questions.",
+        "skills": [{ "id": "pto", "name": "Time off", "description": "Balances and requests." }]
+    }))
+}
+
+fn card_config(extra: Value) -> String {
+    let mut config = json!({
+        "toolName": "ask_agent",
+        "toolDescription": "Ask the agent",
+        "serverName": "hr-bridge",
+        "a2aProtocolVersion": "1.0",
+        "metadataMode": "agent-card",
+        "agentCardUrl": format!("https://{}/.well-known/agent-card.json", CARD_HOST),
+        "agentCardRefreshSeconds": 60,
+        "agentCardMaxStaleSeconds": 120,
+    });
+    config
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    config.to_string()
+}
+
+fn card_tester(config: String, cards: &Rc<CardUpstream>, backend: &Agent) -> pdk_unit::UnitTest {
+    UnitTestBuilder::default()
+        .with_config(config)
+        .with_backend(Rc::clone(backend))
+        .with_http_upstream_from_authority(CARD_HOST, Rc::clone(cards))
+        .with_entrypoint(crate::configure)
+}
+
+fn listed_tool(tester: &mut pdk_unit::UnitTest) -> Value {
+    let response = tester.request(mcp_post(
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    ));
+    json_body(&response)["result"]["tools"][0].clone()
+}
+
+fn server_info(tester: &mut pdk_unit::UnitTest) -> Value {
+    json_body(&tester.request(mcp_post(initialize(1))))["result"]["serverInfo"].clone()
+}
+
+#[test]
+fn manual_mode_never_fetches_the_card() {
+    let cards = CardUpstream::new(vec![hr_card()]);
+    let backend = agent("{}");
+    let mut tester = card_tester(
+        card_config(json!({ "metadataMode": "manual" })),
+        &cards,
+        &backend,
+    );
+    tester.sleep(std::time::Duration::from_secs(600));
+
+    assert_eq!(listed_tool(&mut tester)["description"], "Ask the agent");
+    assert!(server_info(&mut tester).get("title").is_none());
+    assert_eq!(cards.fetches(), 0);
+}
+
+#[test]
+fn agent_card_mode_derives_description_and_title_but_keeps_the_contract() {
+    let cards = CardUpstream::new(vec![hr_card()]);
+    let backend = agent(SAMPLE_RESPONSE);
+    let mut tester = card_tester(
+        card_config(json!({ "agentCardAuthorization": "Bearer card-token" })),
+        &cards,
+        &backend,
+    );
+    tester.tick();
+
+    let tool = listed_tool(&mut tester);
+    assert_eq!(tool["name"], "ask_agent");
+    assert_eq!(
+        tool["description"],
+        format!(
+            "Answers HR questions.\n\nSkills:\n- Time off: Balances and requests.\n\n{}",
+            crate::agent_card::CONTINUATION_NOTE
+        )
+    );
+    let manual = crate::mcp::tool_definition("ask_agent", "x", false);
+    assert_eq!(tool["inputSchema"], manual["inputSchema"]);
+
+    let info = server_info(&mut tester);
+    assert_eq!(
+        info["name"], "hr-bridge",
+        "serverName is never taken from the card"
+    );
+    assert_eq!(info["title"], "HR Agent");
+
+    let fetch = &cards.calls.borrow()[0];
+    assert_eq!(fetch.header(":method"), Some("GET"));
+    assert_eq!(fetch.header(":path"), Some("/.well-known/agent-card.json"));
+    assert_eq!(fetch.header("authorization"), Some("Bearer card-token"));
+
+    let call = tester.request(mcp_post(tools_call(2, json!({ "message": "hi" }))));
+    assert_eq!(json_body(&call)["result"]["isError"], false);
+}
+
+#[test]
+fn cold_cache_failures_advertise_the_manual_metadata_and_retry() {
+    for failure in [
+        UnitHttpResponse::new(503),
+        card(json!({ "name": "No description" })),
+        UnitHttpResponse::new(200).with_body("<html>"),
+    ] {
+        let cards = CardUpstream::new(vec![failure, hr_card()]);
+        let backend = agent("{}");
+        let mut tester = card_tester(card_config(json!({})), &cards, &backend);
+        tester.tick();
+
+        assert_eq!(listed_tool(&mut tester)["description"], "Ask the agent");
+        assert!(server_info(&mut tester).get("title").is_none());
+
+        // agentCardRefreshSeconds 60 -> a failed fetch is retried after 30 s.
+        tester.sleep(std::time::Duration::from_secs(30));
+        assert_eq!(cards.fetches(), 2);
+        assert!(listed_tool(&mut tester)["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("Answers HR questions."));
+    }
+}
+
+#[test]
+fn unreachable_card_upstream_falls_back_like_a_timeout() {
+    let backend = agent("{}");
+    // No upstream registered for the card host: the request fails before any response, the
+    // same path a timed-out fetch takes.
+    let mut tester = UnitTestBuilder::default()
+        .with_config(card_config(json!({ "agentCardTimeoutSeconds": 1 })))
+        .with_backend(Rc::clone(&backend))
+        .with_entrypoint(crate::configure);
+    tester.sleep(std::time::Duration::from_secs(90));
+    assert_eq!(listed_tool(&mut tester)["description"], "Ask the agent");
+}
+
+#[test]
+fn cached_card_serves_requests_without_refetching_until_refresh() {
+    let cards = CardUpstream::new(vec![hr_card()]);
+    let backend = agent("{}");
+    let mut tester = card_tester(card_config(json!({})), &cards, &backend);
+    tester.tick();
+    for _ in 0..20 {
+        listed_tool(&mut tester);
+        server_info(&mut tester);
+    }
+    assert_eq!(cards.fetches(), 1, "requests never fetch the card");
+
+    // Ten refresh periods give exactly ten more fetches: refreshes never overlap.
+    tester.sleep(std::time::Duration::from_secs(600));
+    assert_eq!(cards.fetches(), 11);
+}
+
+#[test]
+fn refreshed_card_changes_discovery_but_not_tool_execution() {
+    let changed = card(json!({ "name": "People Agent", "description": "Now covers payroll." }));
+    let cards = CardUpstream::new(vec![hr_card(), changed]);
+    let backend = agent(SAMPLE_RESPONSE);
+    let mut tester = card_tester(card_config(json!({})), &cards, &backend);
+    tester.tick();
+    let before = listed_tool(&mut tester);
+
+    tester.sleep(std::time::Duration::from_secs(60));
+    let after = listed_tool(&mut tester);
+    assert!(after["description"]
+        .as_str()
+        .unwrap()
+        .starts_with("Now covers payroll."));
+    assert_eq!(server_info(&mut tester)["title"], "People Agent");
+    assert_eq!(before["name"], after["name"]);
+    assert_eq!(before["inputSchema"], after["inputSchema"]);
+
+    let call = tester.request(mcp_post(tools_call(2, json!({ "message": "hi" }))));
+    assert_eq!(json_body(&call)["result"]["isError"], false);
+}
+
+#[test]
+fn stale_card_is_kept_within_the_bound_then_dropped() {
+    let cards = CardUpstream::new(vec![hr_card(), UnitHttpResponse::new(500)]);
+    let backend = agent("{}");
+    let mut tester = card_tester(card_config(json!({})), &cards, &backend);
+    tester.tick();
+
+    // Refresh 60 + max stale 120: the card survives failed refreshes up to 180 s old.
+    tester.sleep(std::time::Duration::from_secs(170));
+    assert!(listed_tool(&mut tester)["description"]
+        .as_str()
+        .unwrap()
+        .starts_with("Answers HR questions."));
+
+    tester.sleep(std::time::Duration::from_secs(40));
+    assert_eq!(listed_tool(&mut tester)["description"], "Ask the agent");
+    assert!(server_info(&mut tester).get("title").is_none());
+}
+
+#[test]
+fn each_policy_instance_keeps_its_own_card() {
+    // pdk-unit hosts one instance at a time; the cache lives on the instance, never in a static,
+    // so a later instance sees only its own card (or the manual metadata before it has one).
+    let backend = agent("{}");
+    let hr = CardUpstream::new(vec![hr_card()]);
+    {
+        let mut tester = card_tester(card_config(json!({})), &hr, &backend);
+        tester.tick();
+        assert!(listed_tool(&mut tester)["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("Answers HR questions."));
+    }
+    let it = CardUpstream::new(vec![UnitHttpResponse::new(503)]);
+    let mut tester = card_tester(card_config(json!({})), &it, &backend);
+    tester.tick();
+    assert_eq!(listed_tool(&mut tester)["description"], "Ask the agent");
+    assert!(server_info(&mut tester).get("title").is_none());
+}
+
+#[test]
+fn agent_card_mode_without_url_uses_manual_metadata() {
+    let backend = agent("{}");
+    let mut config: Value = serde_json::from_str(&card_config(json!({}))).unwrap();
+    config.as_object_mut().unwrap().remove("agentCardUrl");
+    let mut tester = UnitTestBuilder::default()
+        .with_config(config.to_string())
+        .with_backend(Rc::clone(&backend))
+        .with_entrypoint(crate::configure);
+    tester.tick();
+    assert_eq!(listed_tool(&mut tester)["description"], "Ask the agent");
+}

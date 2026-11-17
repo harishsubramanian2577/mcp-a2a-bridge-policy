@@ -7,11 +7,13 @@ It is a **single-tool adapter**, not a full MCP↔A2A protocol translation: each
 | | |
 |---|---|
 | Exchange assets | `mcp-a2a-bridge-policy` (definition), `mcp-atoa-bridge-policy-flex` (implementation) |
-| Version | 1.3.3 |
+| Version | 1.4.0 |
 | Category | Transformation |
 | API instance types | MCP, A2A (v0.3), A2A (v1.0) |
 | PDK | 1.10.0 |
 | Flex Gateway | 1.11.0 or later (1.10.x can't load 1.1.0 or later) |
+
+**Release 1.4.0, 2026-11-17 (issue #16):** adds optional Agent Card-derived discovery metadata (`metadataMode: agent-card`); `manual` remains the default and unchanged. Verified with 161 unit tests and one Docker integration test (`make test`), 46 shared-storage and official-SDK checks (`make test-shared-storage`), WASM build and definition validation, on a managed Omni Gateway (agent-card and manual instances) and on a Connected-mode Flex Gateway 1.11.0 (card change, malformed card, outage, stale bound and recovery). See [the verification](docs/P4A-Issue-Resolutions.md#issue-16-agent-card-derived-mcp-discovery).
 
 **PDK upgrade verification, 2026-11-16:** PDK, pdk-unit, pdk-test and cargo-anypoint target stable 1.10.0. The upgraded worktree passes the WASM build, 146 unit tests, one Docker integration test, all 46 shared-storage/SDK checks, definition validation, formatting and host/WASM clippy. Policy version 1.3.3 and minimum Flex runtime 1.11.0 are unchanged; the upgrade is not a new published release.
 
@@ -70,6 +72,12 @@ The full guide, with diagrams, every property, policy-order tables, limitations 
 | `enableElicitation` | `false` | Experimental: elicit only upstream-marked safe `input-required` questions. Needs a session store; leave off for ChatGPT |
 | `elicitationTimeoutSeconds` | `300` | Time to answer each elicited question (30–1800, independent of idle TTL); not an upstream-response timeout |
 | `maxElicitationRounds` | `3` | Elicited questions per call (1–10); more come back as a normal tool result |
+| `metadataMode` | `manual` | `manual` or `agent-card`: derive the tool description and `serverInfo.title` from the upstream Agent Card ([details](docs/MCP-A2A-Bridge-Policy.md#54-discovery-metadata-from-the-agent-card-metadatamode)) |
+| `agentCardUrl` | empty | Agent Card URL on the agent itself, used with `agent-card` |
+| `agentCardAuthorization` | empty | Optional `Authorization` header for an authenticated card (sensitive) |
+| `agentCardRefreshSeconds` | `300` | Card refresh period per worker (30–86400); failures retry after 30 s |
+| `agentCardMaxStaleSeconds` | `3600` | Extra time a cached card may be used while refreshes fail (0–604800); then manual metadata |
+| `agentCardTimeoutSeconds` | `5` | Timeout of one card fetch (1–30) |
 
 Sessions share the v2 retention namespace only across replicas with the same API/policy scope
 and effective retention configuration (`sessionTtlSeconds` plus the `enableElicitation` retention
