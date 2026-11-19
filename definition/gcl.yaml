@@ -87,6 +87,41 @@ spec:
       minimum: 1
       maximum: 10
       description: How many follow-up questions one tool call may ask through elicitation. A further question from the agent is returned as a normal tool result with continuation ids.
+    metadataMode:
+      type: string
+      enum:
+        - manual
+        - agent-card
+      default: manual
+      description: "Where the MCP discovery metadata comes from. manual (default) advertises toolDescription and serverName exactly as configured and never fetches the Agent Card. agent-card fetches the upstream Agent Card from agentCardUrl in the background, caches it, and builds the tool description from the card's description and skills and serverInfo.title from its name. The tool name and arguments never change. Until a card is cached, or after it is older than agentCardRefreshSeconds plus agentCardMaxStaleSeconds, the manual values are used."
+    agentCardUrl:
+      type: string
+      format: service
+      description: "Full URL of the upstream Agent Card, used only when metadataMode is agent-card, for example https://broker.example.com/.well-known/agent-card.json. Point it at the agent itself (a trusted upstream), not at this gateway's public URL."
+    agentCardAuthorization:
+      type: string
+      description: Optional Authorization header value sent when fetching the Agent Card (for example Bearer <token> or Basic <credentials>), for agents whose card requires authentication.
+      "@context":
+        "@characteristics":
+          - "security:sensitive"
+    agentCardRefreshSeconds:
+      type: integer
+      default: 300
+      minimum: 30
+      maximum: 86400
+      description: How often each gateway worker refreshes the cached Agent Card. A failed refresh is retried every 30 seconds (or sooner when this value is lower).
+    agentCardMaxStaleSeconds:
+      type: integer
+      default: 3600
+      minimum: 0
+      maximum: 604800
+      description: How long a cached card may still be used after refreshes start failing, on top of agentCardRefreshSeconds. After that the manual metadata is advertised until a fetch succeeds.
+    agentCardTimeoutSeconds:
+      type: integer
+      default: 5
+      minimum: 1
+      maximum: 30
+      description: Timeout for one Agent Card fetch.
   required:
     - toolName
     - a2aProtocolVersion

@@ -234,6 +234,7 @@ pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
 pub fn initialize_result(
     requested_version: Option<&str>,
     server_name: &str,
+    server_title: Option<&str>,
     server_version: &str,
     instructions: Option<&str>,
 ) -> Value {
@@ -242,6 +243,9 @@ pub fn initialize_result(
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": server_name, "version": server_version },
     });
+    if let Some(title) = server_title {
+        result["serverInfo"]["title"] = Value::String(title.to_string());
+    }
     if let Some(text) = instructions.filter(|t| !t.is_empty()) {
         result["instructions"] = Value::String(text.to_string());
     }
@@ -620,7 +624,7 @@ mod tests {
 
     #[test]
     fn initialize_omits_empty_instructions() {
-        let result = initialize_result(None, "bridge", "1.0.0", Some(""));
+        let result = initialize_result(None, "bridge", None, "1.0.0", Some(""));
         assert!(result.get("instructions").is_none());
         assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
     }
