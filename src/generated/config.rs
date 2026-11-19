@@ -48,13 +48,13 @@ pub struct Config {
 }
 #[pdk::hl::entrypoint_flex]
 fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {
-    let config: Config = serde_json::from_slice(abi.get_configuration())
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "Failed to parse configuration '{}'. Cause: {}",
-                String::from_utf8_lossy(abi.get_configuration()), err
-            )
-        })?;
+    let config: Config = serde_json::from_slice(abi.get_configuration()).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to parse configuration '{}'. Cause: {}",
+            String::from_utf8_lossy(abi.get_configuration()),
+            err
+        )
+    })?;
     if config.agent_card_url.is_some() {
         let service = config.agent_card_url.unwrap();
         abi.service_create(service)?;
